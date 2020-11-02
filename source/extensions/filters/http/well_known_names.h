@@ -12,6 +12,8 @@ namespace HttpFilters {
  */
 class HttpFilterNameValues {
 public:
+  // Golang extention filter
+  const std::string GolangExtention = "envoy.filters.http.golang_extention";
   // Buffer filter
   const std::string Buffer = "envoy.filters.http.buffer";
   // Cache filter
