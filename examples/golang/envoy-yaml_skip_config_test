@@ -37,7 +37,7 @@ static_resources:
                   cluster: web_service
   clusters:
   - name: web_service
-    type: STRICT_DNS
+    type: STATIC
     lb_policy: ROUND_ROBIN
     load_assignment:
       cluster_name: service1
@@ -46,7 +46,7 @@ static_resources:
         - endpoint:
             address:
               socket_address:
-                address: web_service
+                address: 127.0.0.1
                 port_value: 9000
 admin:
   address:
