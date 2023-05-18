@@ -51,7 +51,6 @@ namespace {
 
 using ::testing::_;
 using ::testing::DoAll;
-using ::testing::Eq;
 using ::testing::InSequence;
 using ::testing::Invoke;
 using ::testing::InvokeWithoutArgs;
@@ -808,7 +807,7 @@ public:
 
 // Test initialization of subset load balancer with every possible load balancer policy.
 TEST_P(ClusterManagerSubsetInitializationTest, SubsetLoadBalancerInitialization) {
-  const std::string yamlPattern = R"EOF(
+  constexpr absl::string_view yamlPattern = R"EOF(
  static_resources:
   clusters:
   - name: cluster_1
@@ -845,13 +844,15 @@ TEST_P(ClusterManagerSubsetInitializationTest, SubsetLoadBalancerInitialization)
   }
   const std::string yaml = fmt::format(yamlPattern, cluster_type, policy_name);
 
-  if (GetParam() == envoy::config::cluster::v3::Cluster::CLUSTER_PROVIDED ||
-      GetParam() == envoy::config::cluster::v3::Cluster::LOAD_BALANCING_POLICY_CONFIG) {
+  if (GetParam() == envoy::config::cluster::v3::Cluster::CLUSTER_PROVIDED) {
     EXPECT_THROW_WITH_MESSAGE(
         create(parseBootstrapFromV3Yaml(yaml)), EnvoyException,
         fmt::format("cluster: LB policy {} cannot be combined with lb_subset_config",
                     envoy::config::cluster::v3::Cluster::LbPolicy_Name(GetParam())));
 
+  } else if (GetParam() == envoy::config::cluster::v3::Cluster::LOAD_BALANCING_POLICY_CONFIG) {
+    EXPECT_THROW_WITH_MESSAGE(create(parseBootstrapFromV3Yaml(yaml)), EnvoyException,
+                              "cluster: field load_balancing_policy need to be set");
   } else {
     create(parseBootstrapFromV3Yaml(yaml));
     checkStats(1 /*added*/, 0 /*modified*/, 0 /*removed*/, 1 /*active*/, 0 /*warming*/);
@@ -1024,74 +1025,6 @@ TEST_F(ClusterManagerImplTest, ClusterProvidedLbNotConfigured) {
                             "'cluster_0' provided one. Check cluster documentation.");
 }
 
-// Verify that specifying LOAD_BALANCING_POLICY_CONFIG with CommonLbConfig is an error.
-TEST_F(ClusterManagerImplTest, LbPolicyConfigCannotSpecifyCommonLbConfig) {
-  // envoy.load_balancers.custom_lb is registered by linking in
-  // //test/integration/load_balancers:custom_lb_policy.
-  const std::string yaml = fmt::format(R"EOF(
- static_resources:
-  clusters:
-  - name: cluster_1
-    connect_timeout: 0.250s
-    type: STATIC
-    lb_policy: LOAD_BALANCING_POLICY_CONFIG
-    load_balancing_policy:
-      policies:
-      - typed_extension_config:
-          name: envoy.load_balancers.custom_lb
-    common_lb_config:
-      update_merge_window: 3s
-    load_assignment:
-      cluster_name: cluster_1
-      endpoints:
-      - lb_endpoints:
-        - endpoint:
-            address:
-              socket_address:
-                address: 127.0.0.1
-                port_value: 8000
-        - endpoint:
-            address:
-              socket_address:
-                address: 127.0.0.1
-                port_value: 8001
-  )EOF");
-
-  EXPECT_THROW_WITH_MESSAGE(
-      create(parseBootstrapFromV3Yaml(yaml)), EnvoyException,
-      "cluster: LB policy LOAD_BALANCING_POLICY_CONFIG cannot be combined with common_lb_config");
-}
-
-// Verify that LOAD_BALANCING_POLICY_CONFIG without specifying load balancing policy is an error.
-TEST_F(ClusterManagerImplTest, LbPolicyConfigMustSpecifyLbPolicy) {
-  const std::string yaml = fmt::format(R"EOF(
- static_resources:
-  clusters:
-  - name: cluster_1
-    connect_timeout: 0.250s
-    type: STATIC
-    lb_policy: LOAD_BALANCING_POLICY_CONFIG
-    load_assignment:
-      cluster_name: cluster_1
-      endpoints:
-      - lb_endpoints:
-        - endpoint:
-            address:
-              socket_address:
-                address: 127.0.0.1
-                port_value: 8000
-        - endpoint:
-            address:
-              socket_address:
-                address: 127.0.0.1
-                port_value: 8001
-  )EOF");
-
-  EXPECT_THROW_WITH_MESSAGE(
-      create(parseBootstrapFromV3Yaml(yaml)), EnvoyException,
-      "cluster: LB policy LOAD_BALANCING_POLICY_CONFIG requires load_balancing_policy to be set");
-}
-
 // Verify that multiple load balancing policies can be specified, and Envoy selects the first
 // policy that it has a factory for.
 TEST_F(ClusterManagerImplTest, LbPolicyConfig) {
@@ -1133,43 +1066,6 @@ TEST_F(ClusterManagerImplTest, LbPolicyConfig) {
   const auto& cluster = cluster_manager_->clusters().getCluster("cluster_1");
   EXPECT_NE(cluster, absl::nullopt);
   EXPECT_NE(cluster->get().info()->loadBalancingPolicy(), nullptr);
-}
-
-// Verify that if Envoy does not have a factory for any of the load balancing policies specified in
-// the load balancing policy config, it is an error.
-TEST_F(ClusterManagerImplTest, LbPolicyConfigThrowsExceptionIfNoLbPoliciesFound) {
-  const std::string yaml = fmt::format(R"EOF(
- static_resources:
-  clusters:
-  - name: cluster_1
-    connect_timeout: 0.250s
-    type: STATIC
-    lb_policy: LOAD_BALANCING_POLICY_CONFIG
-    load_balancing_policy:
-      policies:
-      - typed_extension_config:
-          name: envoy.load_balancers.unknown_lb_1
-      - typed_extension_config:
-          name: envoy.load_balancers.unknown_lb_2
-    load_assignment:
-      cluster_name: cluster_1
-      endpoints:
-      - lb_endpoints:
-        - endpoint:
-            address:
-              socket_address:
-                address: 127.0.0.1
-                port_value: 8000
-        - endpoint:
-            address:
-              socket_address:
-                address: 127.0.0.1
-                port_value: 8001
-  )EOF");
-
-  EXPECT_THROW_WITH_MESSAGE(
-      create(parseBootstrapFromV3Yaml(yaml)), EnvoyException,
-      "Didn't find a registered load balancer factory implementation for cluster: 'cluster_1'");
 }
 
 class ClusterManagerImplThreadAwareLbTest : public ClusterManagerImplTest {
@@ -1354,6 +1250,32 @@ TEST_F(ClusterManagerImplTest, ShutdownOrder) {
   // Thread local reference should be gone.
   factory_.tls_.shutdownThread();
   EXPECT_EQ(3U, cluster.info().use_count());
+}
+
+TEST_F(ClusterManagerImplTest, TwoEqualCommonLbConfigSharedPool) {
+  create(defaultConfig());
+
+  envoy::config::cluster::v3::Cluster::CommonLbConfig config_a;
+  envoy::config::cluster::v3::Cluster::CommonLbConfig config_b;
+
+  config_a.mutable_healthy_panic_threshold()->set_value(0.3);
+  config_b.mutable_healthy_panic_threshold()->set_value(0.3);
+  auto common_config_ptr_a = cluster_manager_->getCommonLbConfigPtr(config_a);
+  auto common_config_ptr_b = cluster_manager_->getCommonLbConfigPtr(config_b);
+  EXPECT_EQ(common_config_ptr_a, common_config_ptr_b);
+}
+
+TEST_F(ClusterManagerImplTest, TwoUnequalCommonLbConfigSharedPool) {
+  create(defaultConfig());
+
+  envoy::config::cluster::v3::Cluster::CommonLbConfig config_a;
+  envoy::config::cluster::v3::Cluster::CommonLbConfig config_b;
+
+  config_a.mutable_healthy_panic_threshold()->set_value(0.3);
+  config_b.mutable_healthy_panic_threshold()->set_value(0.5);
+  auto common_config_ptr_a = cluster_manager_->getCommonLbConfigPtr(config_a);
+  auto common_config_ptr_b = cluster_manager_->getCommonLbConfigPtr(config_b);
+  EXPECT_NE(common_config_ptr_a, common_config_ptr_b);
 }
 
 TEST_F(ClusterManagerImplTest, InitializeOrder) {
@@ -2061,6 +1983,65 @@ TEST_F(ClusterManagerImplTest, DynamicAddRemove) {
   EXPECT_TRUE(Mock::VerifyAndClearExpectations(callbacks.get()));
 }
 
+// Validates that a callback can remove itself from the callbacks list.
+TEST_F(ClusterManagerImplTest, ClusterAddOrUpdateCallbackRemovalDuringIteration) {
+  create(defaultConfig());
+
+  InSequence s;
+  ReadyWatcher initialized;
+  EXPECT_CALL(initialized, ready());
+  cluster_manager_->setInitializedCb([&]() -> void { initialized.ready(); });
+
+  std::unique_ptr<MockClusterUpdateCallbacks> callbacks(new NiceMock<MockClusterUpdateCallbacks>());
+  ClusterUpdateCallbacksHandlePtr cb =
+      cluster_manager_->addThreadLocalClusterUpdateCallbacks(*callbacks);
+
+  std::shared_ptr<MockClusterMockPrioritySet> cluster1(new NiceMock<MockClusterMockPrioritySet>());
+  EXPECT_CALL(factory_, clusterFromProto_(_, _, _, _))
+      .WillOnce(Return(std::make_pair(cluster1, nullptr)));
+  EXPECT_CALL(*cluster1, initializePhase()).Times(0);
+  EXPECT_CALL(*cluster1, initialize(_));
+  EXPECT_CALL(*callbacks, onClusterAddOrUpdate(_)).WillOnce(Invoke([&cb](ThreadLocalCluster&) {
+    // This call will remove the callback from the list.
+    cb.reset();
+  }));
+  EXPECT_TRUE(cluster_manager_->addOrUpdateCluster(defaultStaticCluster("fake_cluster"), ""));
+  checkStats(1 /*added*/, 0 /*modified*/, 0 /*removed*/, 0 /*active*/, 1 /*warming*/);
+  EXPECT_EQ(1, cluster_manager_->warmingClusterCount());
+  EXPECT_EQ(nullptr, cluster_manager_->getThreadLocalCluster("fake_cluster"));
+  cluster1->initialize_callback_();
+
+  EXPECT_EQ(cluster1->info_, cluster_manager_->getThreadLocalCluster("fake_cluster")->info());
+  checkStats(1 /*added*/, 0 /*modified*/, 0 /*removed*/, 1 /*active*/, 0 /*warming*/);
+  EXPECT_EQ(0, cluster_manager_->warmingClusterCount());
+
+  // Now do it again with a different hash.
+  auto update_cluster = defaultStaticCluster("fake_cluster");
+  update_cluster.mutable_per_connection_buffer_limit_bytes()->set_value(12345);
+
+  std::shared_ptr<MockClusterMockPrioritySet> cluster2(new NiceMock<MockClusterMockPrioritySet>());
+  cluster2->prioritySet().getMockHostSet(0)->hosts_ = {
+      makeTestHost(cluster2->info_, "tcp://127.0.0.1:80", time_system_)};
+  EXPECT_CALL(factory_, clusterFromProto_(_, _, _, _))
+      .WillOnce(Return(std::make_pair(cluster2, nullptr)));
+  EXPECT_CALL(*cluster2, initializePhase()).Times(0);
+  EXPECT_CALL(*cluster2, initialize(_))
+      .WillOnce(Invoke([cluster1](std::function<void()> initialize_callback) {
+        // Test inline init.
+        initialize_callback();
+      }));
+  // There shouldn't be a call to onClusterAddOrUpdate on the callbacks as the
+  // handler was removed.
+  EXPECT_CALL(*callbacks, onClusterAddOrUpdate(_)).Times(0);
+  EXPECT_TRUE(cluster_manager_->addOrUpdateCluster(update_cluster, ""));
+
+  checkStats(1 /*added*/, 1 /*modified*/, 0 /*removed*/, 1 /*active*/, 0 /*warming*/);
+
+  EXPECT_TRUE(Mock::VerifyAndClearExpectations(cluster1.get()));
+  EXPECT_TRUE(Mock::VerifyAndClearExpectations(cluster2.get()));
+  EXPECT_TRUE(Mock::VerifyAndClearExpectations(callbacks.get()));
+}
+
 TEST_F(ClusterManagerImplTest, AddOrUpdateClusterStaticExists) {
   const std::string json = fmt::sprintf("{\"static_resources\":{%s}}",
                                         clustersJson({defaultStaticClusterJson("fake_cluster")}));
@@ -2423,7 +2404,7 @@ TEST_F(ClusterManagerImplTest, CloseTcpConnectionsOnHealthFailure) {
     outlier_detector.runCallbacks(test_host);
     health_checker.runCallbacks(test_host, HealthTransition::Unchanged);
 
-    EXPECT_CALL(*connection1, close(Network::ConnectionCloseType::NoFlush));
+    EXPECT_CALL(*connection1, close(Network::ConnectionCloseType::NoFlush, _));
     test_host->healthFlagSet(Host::HealthFlag::FAILED_OUTLIER_CHECK);
     outlier_detector.runCallbacks(test_host);
 
@@ -2438,8 +2419,8 @@ TEST_F(ClusterManagerImplTest, CloseTcpConnectionsOnHealthFailure) {
   }
 
   // Order of these calls is implementation dependent, so can't sequence them!
-  EXPECT_CALL(*connection1, close(Network::ConnectionCloseType::NoFlush));
-  EXPECT_CALL(*connection2, close(Network::ConnectionCloseType::NoFlush));
+  EXPECT_CALL(*connection1, close(Network::ConnectionCloseType::NoFlush, _));
+  EXPECT_CALL(*connection2, close(Network::ConnectionCloseType::NoFlush, _));
   test_host->healthFlagSet(Host::HealthFlag::FAILED_ACTIVE_HC);
   health_checker.runCallbacks(test_host, HealthTransition::Changed);
 

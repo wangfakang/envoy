@@ -10,7 +10,7 @@
 namespace Envoy {
 namespace Server {
 
-class ListenerManagerFactory : public Config::UntypedFactory {
+class ListenerManagerFactory : public Config::TypedFactory {
 public:
   virtual std::unique_ptr<ListenerManager>
   createListenerManager(Instance& server, std::unique_ptr<ListenerComponentFactory>&& factory,
@@ -29,6 +29,9 @@ public:
   virtual std::unique_ptr<ConnectionHandler>
   createConnectionHandler(Event::Dispatcher& dispatcher,
                           absl::optional<uint32_t> worker_index) PURE;
+  virtual std::unique_ptr<ConnectionHandler>
+  createConnectionHandler(Event::Dispatcher& dispatcher, absl::optional<uint32_t> worker_index,
+                          OverloadManager& overload_manager) PURE;
 
   std::string category() const override { return "envoy.connection_handler"; }
 };

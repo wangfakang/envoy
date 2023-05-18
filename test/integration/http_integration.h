@@ -144,6 +144,15 @@ public:
 protected:
   void useAccessLog(absl::string_view format = "",
                     std::vector<envoy::config::core::v3::TypedExtensionConfig> formatters = {});
+  std::string waitForAccessLog(const std::string& filename, uint32_t entry = 0,
+                               bool allow_excess_entries = false,
+                               Network::ClientConnection* client_connection = nullptr) {
+    if (client_connection == nullptr && codec_client_) {
+      client_connection = codec_client_->connection();
+    }
+    return BaseIntegrationTest::waitForAccessLog(filename, entry, allow_excess_entries,
+                                                 client_connection);
+  };
 
   IntegrationCodecClientPtr makeHttpConnection(uint32_t port);
   // Makes a http connection object without checking its connected state.
@@ -350,6 +359,9 @@ protected:
   Quic::QuicStatNames quic_stat_names_;
   std::string san_to_match_{"spiffe://lyft.com/backend-team"};
   bool enable_quic_early_data_{true};
+  // Set this to true when sending malformed requests to avoid test client codec rejecting it.
+  // This flag is only valid when UHV build flag is enabled.
+  bool disable_client_header_validation_{false};
 #ifdef ENVOY_ENABLE_QUIC
   quic::DeterministicConnectionIdGenerator connection_id_generator_{
       quic::kQuicDefaultConnectionIdLength};
