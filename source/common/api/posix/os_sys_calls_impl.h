@@ -31,7 +31,7 @@ public:
   bool supportsMmsg() const override;
   bool supportsUdpGro() const override;
   bool supportsUdpGso() const override;
-  bool supportsIpTransparent() const override;
+  bool supportsIpTransparent(Network::Address::IpVersion version) const override;
   bool supportsMptcp() const override;
   SysCallIntResult close(os_fd_t fd) override;
   SysCallIntResult ftruncate(int fd, off_t length) override;
@@ -43,7 +43,7 @@ public:
                               socklen_t optlen) override;
   SysCallIntResult getsockopt(os_fd_t sockfd, int level, int optname, void* optval,
                               socklen_t* optlen) override;
-  SysCallSocketResult socket(int domain, int type, int protocol) override;
+  SysCallSocketResult socket(int domain, int type, int protocol) const override;
   SysCallSizeResult sendmsg(os_fd_t fd, const msghdr* message, int flags) override;
   SysCallIntResult getsockname(os_fd_t sockfd, sockaddr* addr, socklen_t* addrlen) override;
   SysCallIntResult gethostname(char* name, size_t length) override;

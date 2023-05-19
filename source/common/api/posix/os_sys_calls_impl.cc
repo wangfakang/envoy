@@ -138,8 +138,9 @@ bool OsSysCallsImpl::supportsUdpGso() const {
 #endif
 }
 
-bool OsSysCallsImpl::supportsIpTransparent() const {
-#if !defined(__linux__) || !defined(IPV6_TRANSPARENT)
+bool OsSysCallsImpl::supportsIpTransparent(Network::Address::IpVersion IpVersion) const {
+//#if !defined(__linux__) || !defined(IPV6_TRANSPARENT)
+#if !defined(__linux__)
   return false;
 #else
   // The linux kernel supports IP_TRANSPARENT by following patch(starting from v2.6.28) :
@@ -152,26 +153,35 @@ bool OsSysCallsImpl::supportsIpTransparent() const {
   //
   // And these socket options need CAP_NET_ADMIN capability to be applied.
   // The CAP_NET_ADMIN capability should be applied by root user before call this function.
-  static const bool is_supported = [] {
-    // Check ipv4 case
-    int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, IPPROTO_UDP);
-    if (fd < 0) {
-      return false;
+  static const bool is_supported = [&] {
+    int fd = 0;
+    int val = 0;
+    bool result = false;
+    switch (IpVersion) {
+    case Network::Address::IpVersion::v4:
+      // Check ipv4 case
+      fd = this->socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, IPPROTO_UDP).return_value_;
+      if (fd < 0) {
+        return false;
+      }
+      val = 1;
+      result = (0 == ::setsockopt(fd, IPPROTO_IP, IP_TRANSPARENT, &val, sizeof(val)));
+      ::close(fd);
+      if (!result) {
+        return false;
+      }
+      break;
+    case Network::Address::IpVersion::v6:
+     // Check ipv6 case
+     fd = this->socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK, IPPROTO_UDP).return_value_;
+     if (fd < 0) {
+       return false;
+     }
+     val = 1;
+     result = (0 == ::setsockopt(fd, IPPROTO_IPV6, IPV6_TRANSPARENT, &val, sizeof(val)));
+     ::close(fd);
+     break;
     }
-    int val = 1;
-    bool result = (0 == ::setsockopt(fd, IPPROTO_IP, IP_TRANSPARENT, &val, sizeof(val)));
-    ::close(fd);
-    if (!result) {
-      return false;
-    }
-    // Check ipv6 case
-    fd = ::socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK, IPPROTO_UDP);
-    if (fd < 0) {
-      return false;
-    }
-    val = 1;
-    result = (0 == ::setsockopt(fd, IPPROTO_IPV6, IPV6_TRANSPARENT, &val, sizeof(val)));
-    ::close(fd);
     return result;
   }();
   return is_supported;
@@ -225,7 +235,7 @@ SysCallIntResult OsSysCallsImpl::getsockopt(os_fd_t sockfd, int level, int optna
   return {rc, rc != -1 ? 0 : errno};
 }
 
-SysCallSocketResult OsSysCallsImpl::socket(int domain, int type, int protocol) {
+SysCallSocketResult OsSysCallsImpl::socket(int domain, int type, int protocol) const {
   const os_fd_t rc = ::socket(domain, type, protocol);
   return {rc, SOCKET_VALID(rc) ? 0 : errno};
 }

@@ -212,7 +212,7 @@ bool OsSysCallsImpl::supportsUdpGso() const {
   return false;
 }
 
-bool OsSysCallsImpl::supportsIpTransparent() const {
+bool OsSysCallsImpl::supportsIpTransparent(Address::IpVersion) const {
   // Windows doesn't support it.
   return false;
 }
@@ -254,7 +254,7 @@ SysCallIntResult OsSysCallsImpl::getsockopt(os_fd_t sockfd, int level, int optna
   return {rc, rc != -1 ? 0 : ::WSAGetLastError()};
 }
 
-SysCallSocketResult OsSysCallsImpl::socket(int domain, int type, int protocol) {
+SysCallSocketResult OsSysCallsImpl::socket(int domain, int type, int protocol) const {
   const os_fd_t rc = ::socket(domain, type, protocol);
   return {rc, rc != -1 ? 0 : ::WSAGetLastError()};
 }

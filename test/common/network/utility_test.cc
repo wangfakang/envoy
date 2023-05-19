@@ -337,7 +337,7 @@ TEST(NetworkUtility, GetOriginalDst) {
 
 #ifdef SOL_IP
   sockaddr_storage storage;
-  testing::NiceMock<Api::MockOsSysCalls> os_sys_calls;
+  testing::NiceMock<Api::MockOsSysCalls> os_sys_calls, os_sys_calls1;
   TestThreadsafeSingletonInjector<Api::OsSysCallsImpl> os_calls(&os_sys_calls);
   EXPECT_CALL(socket, addressType()).WillRepeatedly(Return(Address::Type::Ip));
 
@@ -354,7 +354,7 @@ TEST(NetworkUtility, GetOriginalDst) {
   // Transparent socket gets original dst from local address while connection tracking disabled
   EXPECT_CALL(socket, getSocketOption(Eq(SOL_IP), Eq(SO_ORIGINAL_DST), _, _))
       .WillOnce(Return(Api::SysCallIntResult{-1, 0}));
-  EXPECT_CALL(os_sys_calls, supportsIpTransparent()).WillOnce(Return(true));
+  EXPECT_CALL(os_sys_calls, supportsIpTransparent(_)).WillOnce(Return(true));
   EXPECT_CALL(socket, getSocketOption(Eq(SOL_IP), Eq(IP_TRANSPARENT), _, _))
       .WillOnce(DoAll(SetArg2Int(1), Return(Api::SysCallIntResult{0, 0})));
   EXPECT_CALL(os_sys_calls, getsockname(_, _, _))
@@ -364,10 +364,23 @@ TEST(NetworkUtility, GetOriginalDst) {
   // Non-transparent socket fails to get original dst while connection tracking disabled
   EXPECT_CALL(socket, getSocketOption(Eq(SOL_IP), Eq(SO_ORIGINAL_DST), _, _))
       .WillOnce(Return(Api::SysCallIntResult{-1, 0}));
-  EXPECT_CALL(os_sys_calls, supportsIpTransparent()).WillOnce(Return(true));
+  EXPECT_CALL(os_sys_calls, supportsIpTransparent(_)).WillOnce(Return(true));
   EXPECT_CALL(socket, getSocketOption(Eq(SOL_IP), Eq(IP_TRANSPARENT), _, _))
       .WillOnce(DoAll(SetArg2Int(0), Return(Api::SysCallIntResult{0, 0})));
   EXPECT_EQ(nullptr, Utility::getOriginalDst(socket));
+  // Transparent socket gets original dst from local address while connection tracking and ipv6 disabled
+  TestThreadsafeSingletonInjector<Api::OsSysCallsImpl> os_calls1(&os_sys_calls1);
+  EXPECT_CALL(socket, getSocketOption(Eq(SOL_IP), Eq(SO_ORIGINAL_DST), _, _))
+      .WillOnce(Return(Api::SysCallIntResult{-1, 0}));
+  //EXPECT_CALL(os_sys_calls, supportsIpTransparent(_)).WillOnce(Return(true));
+  EXPECT_CALL(socket, getSocketOption(Eq(SOL_IP), Eq(IP_TRANSPARENT), _, _))
+      .WillOnce(DoAll(SetArg2Int(1), Return(Api::SysCallIntResult{0, 0})));
+  EXPECT_CALL(os_sys_calls1, getsockname(_, _, _))
+      .WillOnce(DoAll(SetArg1Sockaddr(storage), SetArg2Uint32(sizeof(sockaddr_in)),
+                      Return(Api::SysCallIntResult{0, 0})));
+  EXPECT_CALL(os_sys_calls1, socket(AF_INET6, _, 0))
+      .WillOnce(Return(Api::SysCallSocketResult{INVALID_SOCKET, 0}));
+  EXPECT_EQ("12.34.56.78:9527", Utility::getOriginalDst(socket)->asString());
 #endif // WIN32
 
   auto& sin6 = reinterpret_cast<sockaddr_in6&>(storage);
@@ -383,7 +396,7 @@ TEST(NetworkUtility, GetOriginalDst) {
   // Transparent socket gets original dst from local address while connection tracking disabled
   EXPECT_CALL(socket, getSocketOption(Eq(SOL_IPV6), Eq(IP6T_SO_ORIGINAL_DST), _, _))
       .WillOnce(Return(Api::SysCallIntResult{-1, 0}));
-  EXPECT_CALL(os_sys_calls, supportsIpTransparent()).WillOnce(Return(true));
+  EXPECT_CALL(os_sys_calls, supportsIpTransparent(_)).WillOnce(Return(true));
   EXPECT_CALL(socket, getSocketOption(Eq(SOL_IPV6), Eq(IPV6_TRANSPARENT), _, _))
       .WillOnce(DoAll(SetArg2Int(1), Return(Api::SysCallIntResult{0, 0})));
   EXPECT_CALL(os_sys_calls, getsockname(_, _, _))
@@ -393,7 +406,7 @@ TEST(NetworkUtility, GetOriginalDst) {
   // Non-transparent socket fails to get original dst while connection tracking disabled
   EXPECT_CALL(socket, getSocketOption(Eq(SOL_IPV6), Eq(IP6T_SO_ORIGINAL_DST), _, _))
       .WillOnce(Return(Api::SysCallIntResult{-1, 0}));
-  EXPECT_CALL(os_sys_calls, supportsIpTransparent()).WillOnce(Return(true));
+  EXPECT_CALL(os_sys_calls, supportsIpTransparent(_)).WillOnce(Return(true));
   EXPECT_CALL(socket, getSocketOption(Eq(SOL_IPV6), Eq(IPV6_TRANSPARENT), _, _))
       .WillOnce(DoAll(SetArg2Int(0), Return(Api::SysCallIntResult{0, 0})));
   EXPECT_EQ(nullptr, Utility::getOriginalDst(socket));

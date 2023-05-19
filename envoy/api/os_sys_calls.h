@@ -123,7 +123,7 @@ public:
   /**
    * return true if the OS support both IP_TRANSPARENT and IPV6_TRANSPARENT options
    */
-  virtual bool supportsIpTransparent() const PURE;
+  virtual bool supportsIpTransparent(Network::Address::IpVersion version) const PURE;
 
   /**
    * return true if the OS supports multi-path TCP
@@ -172,7 +172,7 @@ public:
   /**
    * @see man 2 socket
    */
-  virtual SysCallSocketResult socket(int domain, int type, int protocol) PURE;
+  virtual SysCallSocketResult socket(int domain, int type, int protocol) const PURE;
 
   /**
    * @see man 2 sendmsg

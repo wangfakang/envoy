@@ -101,7 +101,7 @@ public:
               (os_fd_t sockfd, int level, int optname, const void* optval, socklen_t optlen));
   MOCK_METHOD(int, getsockopt_,
               (os_fd_t sockfd, int level, int optname, void* optval, socklen_t* optlen));
-  MOCK_METHOD(SysCallSocketResult, socket, (int domain, int type, int protocol));
+  MOCK_METHOD(SysCallSocketResult, socket, (int domain, int type, int protocol), (const));
   MOCK_METHOD(SysCallIntResult, gethostname, (char* name, size_t length));
   MOCK_METHOD(SysCallIntResult, getsockname, (os_fd_t sockfd, sockaddr* name, socklen_t* namelen));
   MOCK_METHOD(SysCallIntResult, getpeername, (os_fd_t sockfd, sockaddr* name, socklen_t* namelen));
@@ -124,7 +124,7 @@ public:
   MOCK_METHOD(SysCallBoolResult, socketTcpInfo, (os_fd_t sockfd, EnvoyTcpInfo* tcp_info));
   MOCK_METHOD(bool, supportsMmsg, (), (const));
   MOCK_METHOD(bool, supportsUdpGro, (), (const));
-  MOCK_METHOD(bool, supportsIpTransparent, (), (const));
+  MOCK_METHOD(bool, supportsIpTransparent, (Network::Address::IpVersion version), (const));
   MOCK_METHOD(bool, supportsMptcp, (), (const));
   MOCK_METHOD(bool, supportsGetifaddrs, (), (const));
   MOCK_METHOD(SysCallIntResult, getifaddrs, (InterfaceAddressVector & interfaces));

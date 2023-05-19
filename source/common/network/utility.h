@@ -376,6 +376,12 @@ public:
                                                UdpPacketProcessor& udp_packet_processor,
                                                TimeSource& time_source, bool prefer_gro,
                                                uint32_t& packets_dropped);
+  /**
+   * Retrieve whether the socket is transparent, e.g. has IP_TRANSPARENT option set.
+   * @param sock is accepted socket
+   * @return true if the socket is transparent.
+   */
+  static bool isTransparent(Socket& sock);
 
 private:
   static void throwWithMalformedIp(absl::string_view ip_address);

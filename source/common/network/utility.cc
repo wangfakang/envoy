@@ -392,7 +392,7 @@ Address::InstanceConstSharedPtr Utility::getOriginalDst(Socket& sock) {
       sock.getSocketOption(opt_dst.level(), opt_dst.option(), &orig_addr, &addr_len).return_value_;
 
   if (status != 0) {
-    if (Api::OsSysCallsSingleton::get().supportsIpTransparent()) {
+    if (Api::OsSysCallsSingleton::get().supportsIpTransparent(*ipVersion)) {
       socklen_t flag_len = sizeof(int);
       int is_tp;
       status =
@@ -411,6 +411,42 @@ Address::InstanceConstSharedPtr Utility::getOriginalDst(Socket& sock) {
   // divert), and whether it's possible to find the learn destination address.
   UNREFERENCED_PARAMETER(sock);
   return nullptr;
+#endif
+}
+
+bool Utility::isTransparent(Socket& sock) {
+#ifdef SOL_IP
+
+  if (sock.addressType() != Address::Type::Ip) {
+    return false;
+  }
+
+  auto ipVersion = sock.ipVersion();
+  if (!ipVersion.has_value()) {
+    return false;
+  }
+
+  int value;
+  socklen_t value_len = sizeof(value);
+  int status;
+  int call;
+
+  if (*ipVersion == Address::IpVersion::v4) {
+    call = IP_TRANSPARENT;
+  } else {
+    call = IPV6_TRANSPARENT;
+  }
+
+  status = sock.getSocketOption(SOL_IP, call, &value, &value_len).return_value_;
+
+  if (status != 0 || value == 0) {
+    return false;
+  }
+
+  return true;
+#else
+  UNREFERENCED_PARAMETER(sock);
+  return false;
 #endif
 }
 
