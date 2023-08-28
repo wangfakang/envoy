@@ -194,9 +194,9 @@ sphinxcontrib-jsmath==1.0.1 \
 sphinxcontrib-qthelp==1.0.3 \
     --hash=sha256:bd9fc24bcb748a8d51fd4ecaade681350aa63009a347a8c14e637895444dfab6 \
     --hash=sha256:4c33767ee058b70dba89a6fc5c1892c0d57a54be67ddd3e7875a18d14cba5a72
-sphinxcontrib-serializinghtml==1.1.5 \
-    --hash=sha256:352a9a00ae864471d3a7ead8d7d79f5fc0b57e8b3f95e9867eb9eb28999b92fd \
-    --hash=sha256:aa5f6de5dfdf809ef505c4895e51ef5c9eac17d0f287933eb49ec495280b6952
+sphinxcontrib-serializinghtml==1.1.9 \
+    --hash=sha256:0c64ff898339e1fac29abd2bf5f11078f3ec413cfe9c046d3120d7ca65530b54 \
+    --hash=sha256:9b36e503703ff04f20e9675771df105e58aa029cfcbc23b8ed716019b7416ae1
 urllib3==2.0.3 \
     --hash=sha256:48e7fafa40319d358848e1bc6809b208340fafe2096f1725d05d67443d0483d1 \
     --hash=sha256:bee28b5e56addb8226c96f7f13ac28cb4c301dd5ea8a6ca179c0b9835e032825
