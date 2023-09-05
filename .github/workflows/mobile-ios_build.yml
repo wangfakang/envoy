@@ -23,7 +23,7 @@ jobs:
     runs-on: macos-12
     timeout-minutes: 120
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - run: cd mobile && ./ci/mac_ci_setup.sh
       name: 'Install dependencies'
     - name: 'Build Envoy.framework distributable'
@@ -44,7 +44,7 @@ jobs:
     runs-on: macos-12
     timeout-minutes: 50
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - run: cd mobile && ./ci/mac_ci_setup.sh
       name: 'Install dependencies'
     - name: 'Build app'
@@ -84,7 +84,7 @@ jobs:
     runs-on: macos-12
     timeout-minutes: 50
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - run: cd mobile && ./ci/mac_ci_setup.sh
       name: 'Install dependencies'
     - name: 'Build app'
@@ -124,7 +124,7 @@ jobs:
     runs-on: macos-12
     timeout-minutes: 50
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - run: cd mobile && ./ci/mac_ci_setup.sh
       name: 'Install dependencies'
     - name: 'Build app'
@@ -168,7 +168,7 @@ jobs:
     runs-on: macos-12
     timeout-minutes: 50
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - run: cd mobile && ./ci/mac_ci_setup.sh
       name: 'Install dependencies'
     - name: 'Build app'
@@ -225,7 +225,7 @@ jobs:
     runs-on: macos-12
     timeout-minutes: 50
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - run: cd mobile && ./ci/mac_ci_setup.sh
       name: 'Install dependencies'
     - name: 'Build app'

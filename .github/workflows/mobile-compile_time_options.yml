@@ -24,7 +24,7 @@ jobs:
     container:
       image: envoyproxy/envoy-build-ubuntu:41c5a05d708972d703661b702a63ef5060125c33
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Add safe directory
       run: git config --global --add safe.directory /__w/envoy/envoy
     - name: 'Building C++ library'
@@ -45,7 +45,7 @@ jobs:
     runs-on: macos-12
     timeout-minutes: 120
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - run: cd mobile && ./ci/mac_ci_setup.sh
       name: 'Install dependencies'
     - name: 'Build Swift library'
@@ -73,7 +73,7 @@ jobs:
     runs-on: macos-12
     timeout-minutes: 120
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - uses: actions/setup-java@5ffc13f4174014e2d4d4572b3d74c3fa61aeb2c2
       with:
         java-version: '8'
