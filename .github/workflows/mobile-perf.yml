@@ -79,11 +79,11 @@ jobs:
       image: ${{ needs.env.outputs.build_image_ubuntu }}
     steps:
     - uses: actions/checkout@v3
-    - uses: actions/download-artifact@v3
+    - uses: actions/download-artifact@v4
       with:
         name: sizecurrent
         path: dist/sizecurrent
-    - uses: actions/download-artifact@v3
+    - uses: actions/download-artifact@v4
       with:
         name: sizemain
         path: dist/sizemain
