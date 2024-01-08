@@ -50,7 +50,7 @@ jobs:
             bazel-bin/library/kotlin/io/envoyproxy/envoymobile/envoy-sources.jar \
             bazel-bin/library/kotlin/io/envoyproxy/envoymobile/envoy-javadoc.jar
       working-directory: mobile
-    - uses: actions/upload-artifact@v3
+    - uses: actions/upload-artifact@v4
       with:
         name: envoy_android_aar_sources
         path: mobile/envoy_android_aar_sources.tar.gz

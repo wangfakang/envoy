@@ -32,7 +32,7 @@ jobs:
       run: |
         mkdir -p ./sha
         echo $STATE_SHA > ./sha/state_sha
-    - uses: actions/upload-artifact@v3
+    - uses: actions/upload-artifact@v4
       with:
         name: state_sha
         path: sha/
