@@ -35,9 +35,9 @@ aio-api-nist==0.0.3 \
     --hash=sha256:3465d25e4ffdec35d824960e6d68fbff070f823fde55a40fa4eb53a7fd7d18ca \
     --hash=sha256:5ecf9f32e19ad8804bba1358dde93d1008029335009541dadc69c3823241b382
     # via envoy-dependency-check
-aio-core==0.10.0 \
-    --hash=sha256:57e2d8dd8ee8779b0ebc2e2447492c0db8d7ed782e9ad1bb2662593740751acb \
-    --hash=sha256:cb00d530b1e16228b36174c23d446c66e3f2a50ef91aa527c0e58a654316f635
+aio-core==0.10.2 \
+    --hash=sha256:2274534e5a06acb4c4a238269eb79f4e9b70f54e20c0aa75c357244786ec90c4 \
+    --hash=sha256:8bdc8795dccb52003045f38f718c7a9be52413c2923c2ce96821b9272b7e3646
     # via
     #   aio-api-bazel
     #   aio-api-github
@@ -435,9 +435,9 @@ envoy-base-utils==0.4.11 \
     #   envoy-docs-sphinx-runner
     #   envoy-github-release
     #   envoy-gpg-sign
-envoy-code-check==0.5.4 \
-    --hash=sha256:b3c338a0e607960ea75eb8298e786548d317655ac4c89d89b259395684eaf134 \
-    --hash=sha256:ec919ea1e5523c5ad669f6601bb58c8da77bc1891c8846950add3b563c629ac5
+envoy-code-check==0.5.12 \
+    --hash=sha256:6cd41acfd28874c6312db8aebb3dd8cc50a626a45639d4353c8980a8ec29cdb9 \
+    --hash=sha256:b71178b1ca1b2bfc236978ff8c10f78b17329f089147cc6bca01c71ec25721d2
     # via -r requirements.in
 envoy-dependency-check==0.1.8 \
     --hash=sha256:ac9820e446bb44e05121e5c93c210f40ca37076580b0d082da2c63e7784c338a \
@@ -1222,7 +1222,7 @@ sphinxcontrib-httpdomain==1.8.1 \
     --hash=sha256:21eefe1270e4d9de8d717cc89ee92cc4871b8736774393bafc5e38a6bb77b1d5 \
     --hash=sha256:6c2dfe6ca282d75f66df333869bb0ce7331c01b475db6809ff9d107b7cdfe04b
     # via envoy-docs-sphinx-runner
-sphinxcontrib.jquery @ https://github.com/sphinx-contrib/jquery/archive/refs/tags/v3.0.0.zip \
+sphinxcontrib-jquery @ https://github.com/sphinx-contrib/jquery/archive/refs/tags/v3.0.0.zip \
     --hash=sha256:562ad9ac0ac3d8f04a363eb3507ae4b2b856aa04aabab6df7543530fafb849ca
     # via
     #   -r requirements.in
