@@ -619,8 +619,8 @@ frozenlist==1.3.3 \
     # via
     #   aiohttp
     #   aiosignal
-gcs-oauth2-boto-plugin==3.0 \
-    --hash=sha256:f4120b08b7f8d32904674c98f07d4caf4083a58343c0c0fa0016e0f0254dfe31
+gcs-oauth2-boto-plugin==3.2 \
+    --hash=sha256:a46817f3abed2bc4f6b4b12b0de7c8bf5ff5f1822dc03c45fa1ae6ed7a455843
     # via gsutil
 gidgethub==5.3.0 \
     --hash=sha256:4dd92f2252d12756b13f9dd15cde322bfb0d625b6fb5d680da1567ec74b462c0 \
@@ -649,13 +649,21 @@ google-apitools==0.5.32 \
     --hash=sha256:b78f74116558e0476e19501b5b4b2ac7c93261a69c5449c861ea95cbc853c688 \
     --hash=sha256:c3763e52289f61e21c41d5531e20fbda9cc8484a088b8686fd460770db8bad13
     # via gsutil
-google-auth[aiohttp]==2.19.1 \
-    --hash=sha256:a9cfa88b3e16196845e64a3658eb953992129d13ac7337b064c6546f77c17183 \
-    --hash=sha256:ea165e014c7cbd496558796b627c271aa8c18b4cba79dc1cc962b24c5efdfb85
+google-auth[aiohttp]==2.17.0 \
+    --hash=sha256:45ba9b4b3e49406de3c5451697820694b2f6ce8a6b75bb187852fdae231dab94 \
+    --hash=sha256:f51d26ebb3e5d723b9a7dbd310b6c88654ef1ad1fc35750d1fdba48ca4d82f52
     # via
+    #   gcs-oauth2-boto-plugin
     #   google-api-core
+    #   google-auth-httplib2
     #   google-cloud-core
     #   google-cloud-storage
+    #   gsutil
+google-auth-httplib2==0.2.0 \
+    --hash=sha256:38aa7badf48f974f1eb9861794e9c0cb2a0511a4ec0679b1f886d108f5640e05 \
+    --hash=sha256:b65a0a2123300dd71281a7bf6e64d65a0759287df52729bdd1ae2e47dc311a3d
+    # via
+    #   gcs-oauth2-boto-plugin
     #   gsutil
 google-cloud-core==2.3.2 \
     --hash=sha256:8417acf6466be2fa85123441696c4badda48db314c607cf1e5d543fa8bdc22fe \
@@ -749,8 +757,8 @@ googleapis-common-protos==1.59.0 \
     --hash=sha256:4168fcb568a826a52f23510412da405abd93f4d23ba544bb68d943b14ba3cb44 \
     --hash=sha256:b287dc48449d1d41af0c69f4ea26242b5ae4c3d7249a38b0984c86a4caffff1f
     # via google-api-core
-gsutil==5.24 \
-    --hash=sha256:1f841645cda40fcc817e9ca84d285cdf541cc015fd38a5862017b085756729a0
+gsutil==5.30 \
+    --hash=sha256:ef29d47764d2a3c2436ce50c4e1827626725ba8dbfd3127b42a18641710e7d38
     # via -r requirements.in
 httplib2==0.20.4 \
     --hash=sha256:58a98e45b4b1a48273073f905d2961666ecf0fbac4250ea5b47aef259eb5c585 \
@@ -758,6 +766,7 @@ httplib2==0.20.4 \
     # via
     #   gcs-oauth2-boto-plugin
     #   google-apitools
+    #   google-auth-httplib2
     #   gsutil
     #   oauth2client
 humanfriendly==10.0 \
@@ -1222,7 +1231,7 @@ sphinxcontrib-httpdomain==1.8.1 \
     --hash=sha256:21eefe1270e4d9de8d717cc89ee92cc4871b8736774393bafc5e38a6bb77b1d5 \
     --hash=sha256:6c2dfe6ca282d75f66df333869bb0ce7331c01b475db6809ff9d107b7cdfe04b
     # via envoy-docs-sphinx-runner
-sphinxcontrib.jquery @ https://github.com/sphinx-contrib/jquery/archive/refs/tags/v3.0.0.zip \
+sphinxcontrib-jquery @ https://github.com/sphinx-contrib/jquery/archive/refs/tags/v3.0.0.zip \
     --hash=sha256:562ad9ac0ac3d8f04a363eb3507ae4b2b856aa04aabab6df7543530fafb849ca
     # via
     #   -r requirements.in
@@ -1269,9 +1278,7 @@ uritemplate==4.1.1 \
 urllib3==1.26.16 \
     --hash=sha256:8d36afa7616d8ab714608411b4a3b13e58f463aee519024578e062e141dce20f \
     --hash=sha256:8f135f6502756bde6b2a9b28989df5fbe87c9970cecaa69041edcce7f0589b14
-    # via
-    #   google-auth
-    #   requests
+    # via requests
 uvloop==0.17.0 \
     --hash=sha256:0949caf774b9fcefc7c5756bacbbbd3fc4c05a6b7eebc7c7ad6f825b23998d6d \
     --hash=sha256:0ddf6baf9cf11a1a22c71487f39f15b2cf78eb5bde7e5b45fbb99e8a9d91b9e1 \
