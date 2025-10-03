@@ -1,6 +1,6 @@
 module example.com/echo
 
-go 1.18
+go 1.23
 
 require (
 	github.com/cncf/xds/go v0.0.0-20230112175826-46e39c7b9b43
@@ -15,7 +15,7 @@ require (
 	golang.org/x/text v0.7.0 // indirect
 	google.golang.org/genproto v0.0.0-20190819201941-24fa4b261c55 // indirect
 	google.golang.org/grpc v1.25.1 // indirect
-	google.golang.org/protobuf v1.30.0
+	google.golang.org/protobuf v1.36.10
 )
 
 replace github.com/envoyproxy/envoy => ../../../../../../../
