@@ -1,10 +1,10 @@
-load("@envoy//bazel:envoy_build_system.bzl", "envoy_package")
-load("@build_bazel_rules_android//android:rules.bzl", "android_library")
-load("@envoy_mobile//bazel:kotlin_test.bzl", "envoy_mobile_android_test")
+load("@envoy//bazel:envoy_build_system.bzl", "envoy_mobile_package")
+load("@envoy_mobile//bazel:envoy_mobile_android_test.bzl", "envoy_mobile_android_test")
+load("@rules_android//android:rules.bzl", "android_library")
 
 licenses(["notice"])  # Apache 2
 
-envoy_package()
+envoy_mobile_package()
 
 android_library(
     name = "testing",
@@ -37,6 +37,7 @@ android_library(
         "//library/java/io/envoyproxy/envoymobile/engine:envoy_base_engine_lib",
         "//library/java/io/envoyproxy/envoymobile/engine:envoy_engine_lib",
         "//library/java/io/envoyproxy/envoymobile/utilities",
+        "//library/java/io/envoyproxy/envoymobile/utilities:network_utilities",
         "//library/java/org/chromium/net",
         "//library/java/org/chromium/net/impl:cronvoy",
         "//library/kotlin/io/envoyproxy/envoymobile:envoy_interfaces_lib",
@@ -61,9 +62,15 @@ envoy_mobile_android_test(
         "CronetTestRuleTest.java",
     ],
     native_deps = [
-        "//test/common/jni:libenvoy_jni_with_test_extensions.so",
-        "//test/common/jni:libenvoy_jni_with_test_extensions_jnilib",
-    ],
+        "//test/jni:libenvoy_jni_with_test_extensions.so",
+    ] + select({
+        "@platforms//os:macos": [
+            "//test/jni:libenvoy_jni_with_test_extensions_jnilib",
+        ],
+        "//conditions:default": [],
+    }),
+    native_lib_name = "envoy_jni_with_test_extensions",
+    test_class = "org.chromium.net.testing.CronetTestRuleTest",
     deps = [
         ":testing",
         "//library/java/io/envoyproxy/envoymobile/engine:envoy_base_engine_lib",
@@ -79,14 +86,16 @@ envoy_mobile_android_test(
     srcs = [
         "Http2TestServerTest.java",
     ],
-    exec_properties = {
-        # TODO(lfpino): Remove this once the sandboxNetwork=off works for ipv4 localhost addresses.
-        "sandboxNetwork": "standard",
-    },
     native_deps = [
-        "//test/common/jni:libenvoy_jni_with_test_extensions.so",
-        "//test/common/jni:libenvoy_jni_with_test_extensions_jnilib",
-    ],
+        "//test/jni:libenvoy_jni_with_test_extensions.so",
+    ] + select({
+        "@platforms//os:macos": [
+            "//test/jni:libenvoy_jni_with_test_extensions_jnilib",
+        ],
+        "//conditions:default": [],
+    }),
+    native_lib_name = "envoy_jni_with_test_extensions",
+    test_class = "org.chromium.net.testing.Http2TestServerTest",
     deps = [
         ":testing",
         "//library/kotlin/io/envoyproxy/envoymobile:envoy_lib",
@@ -94,18 +103,20 @@ envoy_mobile_android_test(
 )
 
 envoy_mobile_android_test(
-    name = "temporary_test",
+    name = "android_envoy_explicit_h2_flow_test",
     srcs = [
         "AndroidEnvoyExplicitH2FlowTest.java",
     ],
-    exec_properties = {
-        # TODO(lfpino): Remove this once the sandboxNetwork=off works for ipv4 localhost addresses.
-        "sandboxNetwork": "standard",
-    },
     native_deps = [
-        "//test/common/jni:libenvoy_jni_with_test_extensions.so",
-        "//test/common/jni:libenvoy_jni_with_test_extensions_jnilib",
-    ],
+        "//test/jni:libenvoy_jni_with_test_extensions.so",
+    ] + select({
+        "@platforms//os:macos": [
+            "//test/jni:libenvoy_jni_with_test_extensions_jnilib",
+        ],
+        "//conditions:default": [],
+    }),
+    native_lib_name = "envoy_jni_with_test_extensions",
+    test_class = "org.chromium.net.testing.AndroidEnvoyExplicitH2FlowTest",
     deps = [
         ":testing",
         "//library/kotlin/io/envoyproxy/envoymobile:envoy_lib",

@@ -71,8 +71,16 @@ void CodecClient::deleteRequest(ActiveRequest& request) {
   }
 }
 
+RequestEncoder& CodecClient::newStream(ResponseDecoderHandlePtr response_decoder_handle) {
+  return enlistAndCreateEncoder(
+      std::make_unique<ActiveRequest>(*this, std::move(response_decoder_handle)));
+}
+
 RequestEncoder& CodecClient::newStream(ResponseDecoder& response_decoder) {
-  ActiveRequestPtr request(new ActiveRequest(*this, response_decoder));
+  return enlistAndCreateEncoder(std::make_unique<ActiveRequest>(*this, response_decoder));
+}
+
+RequestEncoder& CodecClient::enlistAndCreateEncoder(ActiveRequestPtr request) {
   request->setEncoder(codec_->newStream(*request));
   LinkedList::moveIntoList(std::move(request), active_requests_);
 
@@ -114,7 +122,8 @@ void CodecClient::onEvent(Network::ConnectionEvent event) {
       reason = StreamResetReason::ConnectionTermination;
       if (protocol_error_) {
         reason = StreamResetReason::ProtocolError;
-        connection_->streamInfo().setResponseFlag(StreamInfo::ResponseFlag::UpstreamProtocolError);
+        connection_->streamInfo().setResponseFlag(
+            StreamInfo::CoreResponseFlag::UpstreamProtocolError);
       }
     }
     while (!active_requests_.empty()) {
@@ -155,7 +164,7 @@ void CodecClient::completeRequest(ActiveRequest& request) {
 }
 
 void CodecClient::onReset(ActiveRequest& request, StreamResetReason reason) {
-  ENVOY_CONN_LOG(debug, "request reset", *connection_);
+  ENVOY_CONN_LOG(debug, "Request reset. Reason {}", *connection_, static_cast<int>(reason));
   if (codec_client_callbacks_) {
     codec_client_callbacks_->onStreamReset(reason);
   }
@@ -169,10 +178,13 @@ void CodecClient::onData(Buffer::Instance& data) {
   if (!status.ok()) {
     ENVOY_CONN_LOG(debug, "Error dispatching received data: {}", *connection_, status.message());
 
-    // Don't count 408 responses where we have no active requests as protocol errors
-    if (!isPrematureResponseError(status) ||
-        (!active_requests_.empty() ||
-         getPrematureResponseHttpCode(status) != Code::RequestTimeout)) {
+    // Don't count 408 responses where we have no active requests as protocol errors.
+    // Don't count graceful GOAWAY closes.
+    const bool not_408 =
+        !isPrematureResponseError(status) ||
+        (!active_requests_.empty() || getPrematureResponseHttpCode(status) != Code::RequestTimeout);
+    const bool is_goaway = isGoAwayGracefulCloseError(status);
+    if (not_408 && !is_goaway) {
       host_->cluster().trafficStats()->upstream_cx_protocol_error_.inc();
       protocol_error_ = true;
     }
@@ -263,17 +275,8 @@ CodecClientProd::CodecClientProd(CodecType type, Network::ClientConnectionPtr&& 
                                  Upstream::HostDescriptionConstSharedPtr host,
                                  Event::Dispatcher& dispatcher,
                                  Random::RandomGenerator& random_generator,
-                                 const Network::TransportSocketOptionsConstSharedPtr& options)
-    : NoConnectCodecClientProd(type, std::move(connection), host, dispatcher, random_generator,
-                               options) {
-  connect();
-}
-
-NoConnectCodecClientProd::NoConnectCodecClientProd(
-    CodecType type, Network::ClientConnectionPtr&& connection,
-    Upstream::HostDescriptionConstSharedPtr host, Event::Dispatcher& dispatcher,
-    Random::RandomGenerator& random_generator,
-    const Network::TransportSocketOptionsConstSharedPtr& options)
+                                 const Network::TransportSocketOptionsConstSharedPtr& options,
+                                 bool should_connect)
     : CodecClient(type, std::move(connection), host, dispatcher) {
   switch (type) {
   case CodecType::HTTP1: {
@@ -285,13 +288,14 @@ NoConnectCodecClientProd::NoConnectCodecClientProd(
     }
     codec_ = std::make_unique<Http1::ClientConnectionImpl>(
         *connection_, host->cluster().http1CodecStats(), *this, host->cluster().http1Settings(),
-        host->cluster().maxResponseHeadersCount(), proxied);
+        host->cluster().maxResponseHeadersKb(), host->cluster().maxResponseHeadersCount(), proxied);
     break;
   }
   case CodecType::HTTP2:
     codec_ = std::make_unique<Http2::ClientConnectionImpl>(
         *connection_, *this, host->cluster().http2CodecStats(), random_generator,
-        host->cluster().http2Options(), Http::DEFAULT_MAX_REQUEST_HEADERS_KB,
+        host->cluster().http2Options(),
+        host->cluster().maxResponseHeadersKb().value_or(Http::DEFAULT_MAX_REQUEST_HEADERS_KB),
         host->cluster().maxResponseHeadersCount(), Http2::ProdNghttp2SessionFactory::get());
     break;
   case CodecType::HTTP3: {
@@ -299,7 +303,8 @@ NoConnectCodecClientProd::NoConnectCodecClientProd(
     auto& quic_session = dynamic_cast<Quic::EnvoyQuicClientSession&>(*connection_);
     codec_ = std::make_unique<Quic::QuicHttpClientConnectionImpl>(
         quic_session, *this, host->cluster().http3CodecStats(), host->cluster().http3Options(),
-        Http::DEFAULT_MAX_REQUEST_HEADERS_KB, host->cluster().maxResponseHeadersCount());
+        host->cluster().maxResponseHeadersKb().value_or(Http::DEFAULT_MAX_REQUEST_HEADERS_KB),
+        host->cluster().maxResponseHeadersCount());
     // Initialize the session after max request header size is changed in above http client
     // connection creation.
     quic_session.Initialize();
@@ -309,6 +314,9 @@ NoConnectCodecClientProd::NoConnectCodecClientProd(
     PANIC("unexpected");
 #endif
   }
+  }
+  if (should_connect) {
+    connect();
   }
 }
 

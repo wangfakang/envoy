@@ -42,7 +42,7 @@ private:
 
 class Rule {
 public:
-  Rule(const ProtoRule& rule);
+  Rule(const ProtoRule& rule, Regex::Engine& regex_engine);
   const ProtoRule& rule() const { return rule_; }
   const Regex::CompiledMatcherPtr& regexRewrite() const { return regex_rewrite_; }
   const std::string& regexSubstitution() const { return regex_rewrite_substitution_; }
@@ -61,7 +61,8 @@ const uint32_t MAX_HEADER_VALUE_LEN = 8 * 1024;
 class Config {
 public:
   Config(const envoy::extensions::filters::network::thrift_proxy::filters::header_to_metadata::v3::
-             HeaderToMetadata& config);
+             HeaderToMetadata& config,
+         Regex::Engine& regex_engine);
   const HeaderToMetadataRules& requestRules() const { return request_rules_; }
 
 private:
@@ -80,7 +81,7 @@ public:
 
 private:
   using ProtobufRepeatedRule = Protobuf::RepeatedPtrField<ProtoRule>;
-  using StructMap = std::map<std::string, ProtobufWkt::Struct>;
+  using StructMap = std::map<std::string, Protobuf::Struct>;
 
   /**
    *  writeHeaderToMetadata encapsulates (1) searching for the header and (2) writing it to the

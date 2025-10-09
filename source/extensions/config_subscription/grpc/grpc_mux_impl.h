@@ -7,6 +7,7 @@
 #include "envoy/common/random_generator.h"
 #include "envoy/common/time.h"
 #include "envoy/config/custom_config_validators.h"
+#include "envoy/config/endpoint/v3/endpoint.pb.h"
 #include "envoy/config/grpc_mux.h"
 #include "envoy/config/subscription.h"
 #include "envoy/config/xds_config_tracker.h"
@@ -20,11 +21,13 @@
 #include "source/common/common/logger.h"
 #include "source/common/common/utility.h"
 #include "source/common/config/api_version.h"
+#include "source/common/config/resource_name.h"
 #include "source/common/config/ttl.h"
 #include "source/common/config/utility.h"
 #include "source/common/config/xds_context_params.h"
 #include "source/common/config/xds_resource.h"
-#include "source/extensions/config_subscription/grpc/grpc_stream.h"
+#include "source/extensions/config_subscription/grpc/grpc_mux_context.h"
+#include "source/extensions/config_subscription/grpc/grpc_mux_failover.h"
 
 #include "absl/container/node_hash_map.h"
 #include "xds/core/v3/resource_name.pb.h"
@@ -38,13 +41,7 @@ class GrpcMuxImpl : public GrpcMux,
                     public GrpcStreamCallbacks<envoy::service::discovery::v3::DiscoveryResponse>,
                     public Logger::Loggable<Logger::Id::config> {
 public:
-  GrpcMuxImpl(const LocalInfo::LocalInfo& local_info, Grpc::RawAsyncClientPtr async_client,
-              Event::Dispatcher& dispatcher, const Protobuf::MethodDescriptor& service_method,
-              Stats::Scope& scope, const RateLimitSettings& rate_limit_settings,
-              bool skip_subsequent_node, CustomConfigValidatorsPtr&& config_validators,
-              BackOffStrategyPtr backoff_strategy, XdsConfigTrackerOptRef xds_config_tracker,
-              XdsResourcesDelegateOptRef xds_resources_delegate,
-              const std::string& target_xds_authority);
+  GrpcMuxImpl(GrpcMuxContext& grpc_mux_context, bool skip_subsequent_node);
 
   ~GrpcMuxImpl() override;
 
@@ -72,44 +69,82 @@ public:
   void requestOnDemandUpdate(const std::string&, const absl::flat_hash_set<std::string>&) override {
   }
 
+  EdsResourcesCacheOptRef edsResourcesCache() override {
+    return makeOptRefFromPtr(eds_resources_cache_.get());
+  }
+
+  absl::Status
+  updateMuxSource(Grpc::RawAsyncClientSharedPtr&& primary_async_client,
+                  Grpc::RawAsyncClientSharedPtr&& failover_async_client, Stats::Scope& scope,
+                  BackOffStrategyPtr&& backoff_strategy,
+                  const envoy::config::core::v3::ApiConfigSource& ads_config_source) override;
+
   void handleDiscoveryResponse(
       std::unique_ptr<envoy::service::discovery::v3::DiscoveryResponse>&& message);
 
   // Config::GrpcStreamCallbacks
   void onStreamEstablished() override;
-  void onEstablishmentFailure() override;
+  void onEstablishmentFailure(bool) override;
   void
   onDiscoveryResponse(std::unique_ptr<envoy::service::discovery::v3::DiscoveryResponse>&& message,
                       ControlPlaneStats& control_plane_stats) override;
   void onWriteable() override;
 
-  GrpcStream<envoy::service::discovery::v3::DiscoveryRequest,
-             envoy::service::discovery::v3::DiscoveryResponse>&
+  GrpcStreamInterface<envoy::service::discovery::v3::DiscoveryRequest,
+                      envoy::service::discovery::v3::DiscoveryResponse>&
   grpcStreamForTest() {
-    return grpc_stream_;
+    // TODO(adisuissa): Once envoy.restart_features.xds_failover_support is deprecated,
+    // return grpc_stream_.currentStreamForTest() directly (defined in GrpcMuxFailover).
+    if (Runtime::runtimeFeatureEnabled("envoy.restart_features.xds_failover_support")) {
+      return dynamic_cast<GrpcMuxFailover<envoy::service::discovery::v3::DiscoveryRequest,
+                                          envoy::service::discovery::v3::DiscoveryResponse>*>(
+                 grpc_stream_.get())
+          ->currentStreamForTest();
+    }
+    return *grpc_stream_.get();
   }
 
 private:
+  // Helper function to create the grpc_stream_ object.
+  std::unique_ptr<GrpcStreamInterface<envoy::service::discovery::v3::DiscoveryRequest,
+                                      envoy::service::discovery::v3::DiscoveryResponse>>
+  createGrpcStreamObject(Grpc::RawAsyncClientSharedPtr&& async_client,
+                         Grpc::RawAsyncClientSharedPtr&& failover_async_client,
+                         const Protobuf::MethodDescriptor& service_method, Stats::Scope& scope,
+                         BackOffStrategyPtr&& backoff_strategy,
+                         const RateLimitSettings& rate_limit_settings);
+
   void drainRequests();
   void setRetryTimer();
   void sendDiscoveryRequest(absl::string_view type_url);
+  // Clears the nonces of all subscribed types in this gRPC mux.
+  void clearNonce();
 
   struct GrpcMuxWatchImpl : public GrpcMuxWatch {
     GrpcMuxWatchImpl(const absl::flat_hash_set<std::string>& resources,
                      SubscriptionCallbacks& callbacks,
                      OpaqueResourceDecoderSharedPtr resource_decoder, const std::string& type_url,
                      GrpcMuxImpl& parent, const SubscriptionOptions& options,
-                     const LocalInfo::LocalInfo& local_info)
+                     const LocalInfo::LocalInfo& local_info,
+                     EdsResourcesCacheOptRef eds_resources_cache)
         : callbacks_(callbacks), resource_decoder_(resource_decoder), type_url_(type_url),
           parent_(parent), subscription_options_(options), local_info_(local_info),
-          watches_(parent.apiStateFor(type_url).watches_) {
+          watches_(parent.apiStateFor(type_url).watches_),
+          eds_resources_cache_(eds_resources_cache) {
       updateResources(resources);
+      // If eds resources cache is provided, then the type must be ClusterLoadAssignment.
+      ASSERT(
+          !eds_resources_cache_.has_value() ||
+          (type_url == Config::getTypeUrl<envoy::config::endpoint::v3::ClusterLoadAssignment>()));
     }
 
     ~GrpcMuxWatchImpl() override {
       watches_.erase(iter_);
       if (!resources_.empty()) {
         parent_.queueDiscoveryRequest(type_url_);
+        if (eds_resources_cache_.has_value()) {
+          removeResourcesFromCache(resources_);
+        }
       }
     }
 
@@ -131,12 +166,19 @@ private:
 
   private:
     void updateResources(const absl::flat_hash_set<std::string>& resources) {
-      resources_.clear();
+      // Finding the list of removed resources by keeping the current resources
+      // set until the end the function and computing the diff.
+      // Temporarily keep the resources prior to the update to find which ones
+      // were removed.
+      std::set<std::string> previous_resources;
+      previous_resources.swap(resources_);
       std::transform(
           resources.begin(), resources.end(), std::inserter(resources_, resources_.begin()),
           [this](const std::string& resource_name) -> std::string {
             if (XdsResourceIdentifier::hasXdsTpScheme(resource_name)) {
-              auto xdstp_resource = XdsResourceIdentifier::decodeUrn(resource_name);
+              auto xdstp_resource_or_error = XdsResourceIdentifier::decodeUrn(resource_name);
+              THROW_IF_NOT_OK_REF(xdstp_resource_or_error.status());
+              auto xdstp_resource = xdstp_resource_or_error.value();
               if (subscription_options_.add_xdstp_node_context_params_) {
                 const auto context = XdsContextParams::encodeResource(
                     local_info_.contextProvider().nodeContext(), xdstp_resource.context(), {}, {});
@@ -148,8 +190,40 @@ private:
             }
             return resource_name;
           });
+      if (eds_resources_cache_.has_value()) {
+        // Compute the removed resources and remove them from the cache.
+        std::set<std::string> removed_resources;
+        std::set_difference(previous_resources.begin(), previous_resources.end(),
+                            resources_.begin(), resources_.end(),
+                            std::inserter(removed_resources, removed_resources.begin()));
+        removeResourcesFromCache(removed_resources);
+      }
       // move this watch to the beginning of the list
       iter_ = watches_.emplace(watches_.begin(), this);
+    }
+
+    void removeResourcesFromCache(const std::set<std::string>& resources_to_remove) {
+      ASSERT(eds_resources_cache_.has_value());
+      // Iterate over the resources to remove, and if no other watcher
+      // registered for that resource, remove it from the cache.
+      for (const auto& resource_name : resources_to_remove) {
+        // Counts the number of watchers that watch the resource.
+        uint32_t resource_watchers_count = 0;
+        for (const auto& watch : watches_) {
+          // Skip the current watcher as it is intending to remove the resource.
+          if (watch == this) {
+            continue;
+          }
+          if (watch->resources_.find(resource_name) != watch->resources_.end()) {
+            resource_watchers_count++;
+          }
+        }
+        // Other than "this" watcher, the resource is not watched by any other
+        // watcher, so it can be removed.
+        if (resource_watchers_count == 0) {
+          eds_resources_cache_->removeResource(resource_name);
+        }
+      }
     }
 
     using WatchList = std::list<GrpcMuxWatchImpl*>;
@@ -157,6 +231,8 @@ private:
     const LocalInfo::LocalInfo& local_info_;
     WatchList& watches_;
     WatchList::iterator iter_;
+    // Optional cache for the specific ClusterLoadAssignments of this watch.
+    EdsResourcesCacheOptRef eds_resources_cache_;
   };
 
   // Per muxed API state.
@@ -204,16 +280,21 @@ private:
                                  ApiState& api_state, const std::string& type_url,
                                  const std::string& version_info, bool call_delegate);
 
-  GrpcStream<envoy::service::discovery::v3::DiscoveryRequest,
-             envoy::service::discovery::v3::DiscoveryResponse>
+  Event::Dispatcher& dispatcher_;
+  // Multiplexes the stream to the primary and failover sources.
+  // TODO(adisuissa): Once envoy.restart_features.xds_failover_support is deprecated,
+  // convert from unique_ptr<GrpcStreamInterface> to GrpcMuxFailover directly.
+  std::unique_ptr<GrpcStreamInterface<envoy::service::discovery::v3::DiscoveryRequest,
+                                      envoy::service::discovery::v3::DiscoveryResponse>>
       grpc_stream_;
   const LocalInfo::LocalInfo& local_info_;
   const bool skip_subsequent_node_;
   CustomConfigValidatorsPtr config_validators_;
   XdsConfigTrackerOptRef xds_config_tracker_;
   XdsResourcesDelegateOptRef xds_resources_delegate_;
+  EdsResourcesCachePtr eds_resources_cache_;
   const std::string target_xds_authority_;
-  bool first_stream_request_;
+  bool first_stream_request_{true};
 
   // Helper function for looking up and potentially allocating a new ApiState.
   ApiState& apiStateFor(absl::string_view type_url);
@@ -229,9 +310,9 @@ private:
   // URL.
   std::unique_ptr<std::queue<std::string>> request_queue_;
 
-  Event::Dispatcher& dispatcher_;
   Common::CallbackHandlePtr dynamic_update_callback_handle_;
 
+  bool started_{false};
   // True iff Envoy is shutting down; no messages should be sent on the `grpc_stream_` when this is
   // true because it may contain dangling pointers.
   std::atomic<bool> shutdown_{false};

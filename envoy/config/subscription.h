@@ -75,11 +75,11 @@ public:
   virtual ~OpaqueResourceDecoder() = default;
 
   /**
-   * @param resource some opaque resource (ProtobufWkt::Any).
+   * @param resource some opaque resource (Protobuf::Any).
    * @return ProtobufTypes::MessagePtr decoded protobuf message in the opaque resource, e.g. the
    *         RouteConfiguration for an Any containing envoy.config.route.v3.RouteConfiguration.
    */
-  virtual ProtobufTypes::MessagePtr decodeResource(const ProtobufWkt::Any& resource) PURE;
+  virtual ProtobufTypes::MessagePtr decodeResource(const Protobuf::Any& resource) PURE;
 
   /**
    * @param resource some opaque resource (Protobuf::Message).
@@ -103,28 +103,30 @@ public:
    * everything other than delta gRPC - filesystem, HTTP, non-delta gRPC).
    * @param resources vector of fetched resources corresponding to the configuration update.
    * @param version_info supplies the version information as supplied by the xDS discovery response.
-   * @throw EnvoyException with reason if the configuration is rejected. Otherwise the configuration
-   *        is accepted. Accepted configurations have their version_info reflected in subsequent
-   *        requests.
+   * @return an absl status indicating if a non-exception-throwing error was encountered.
+   * @throw EnvoyException with reason if the configuration is rejected for legacy reasons,
+   *        Accepted configurations have their version_info reflected in subsequent requests.
    */
-  virtual void onConfigUpdate(const std::vector<DecodedResourceRef>& resources,
-                              const std::string& version_info) PURE;
+  virtual absl::Status onConfigUpdate(const std::vector<DecodedResourceRef>& resources,
+                                      const std::string& version_info) PURE;
 
   /**
    * Called when a delta configuration update is received.
    * @param added_resources resources newly added since the previous fetch.
    * @param removed_resources names of resources that this fetch instructed to be removed.
    * @param system_version_info aggregate response data "version", for debugging.
-   * @throw EnvoyException with reason if the config changes are rejected. Otherwise the changes
-   *        are accepted. Accepted changes have their version_info reflected in subsequent requests.
+   * @return an absl status indicating if a non-exception-throwing error was encountered.
+   * @throw EnvoyException with reason if the configuration is rejected for legacy reasons,
+   *        Accepted configurations have their version_info reflected in subsequent requests.
    */
-  virtual void onConfigUpdate(const std::vector<DecodedResourceRef>& added_resources,
-                              const Protobuf::RepeatedPtrField<std::string>& removed_resources,
-                              const std::string& system_version_info) PURE;
+  virtual absl::Status
+  onConfigUpdate(const std::vector<DecodedResourceRef>& added_resources,
+                 const Protobuf::RepeatedPtrField<std::string>& removed_resources,
+                 const std::string& system_version_info) PURE;
 
   /**
    * Called when either the Subscription is unable to fetch a config update or when onConfigUpdate
-   * invokes an exception.
+   * returns a failure or invokes an exception.
    * @param reason supplies the update failure reason.
    * @param e supplies any exception data on why the fetch failed. May be nullptr.
    */
@@ -164,7 +166,7 @@ public:
    *        is accepted. Accepted configurations have their version_info reflected in subsequent
    *        requests.
    */
-  virtual void onConfigUpdate(const Protobuf::RepeatedPtrField<ProtobufWkt::Any>& resources,
+  virtual void onConfigUpdate(const Protobuf::RepeatedPtrField<Protobuf::Any>& resources,
                               const std::string& version_info) PURE;
 
   /**
@@ -189,10 +191,10 @@ public:
    * being updated. Accepted changes have their version_info reflected in subsequent
    * requests.
    */
-  virtual void onConfigUpdate(
-      const Protobuf::RepeatedPtrField<envoy::service::discovery::v3::Resource>& added_resources,
-      const Protobuf::RepeatedPtrField<std::string>& removed_resources,
-      const std::string& system_version_info) PURE;
+  virtual void
+  onConfigUpdate(absl::Span<const envoy::service::discovery::v3::Resource* const> added_resources,
+                 const Protobuf::RepeatedPtrField<std::string>& removed_resources,
+                 const std::string& system_version_info) PURE;
 
   /**
    * Called when either the Subscription is unable to fetch a config update or when onConfigUpdate

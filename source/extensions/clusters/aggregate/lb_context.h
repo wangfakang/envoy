@@ -1,7 +1,7 @@
 #pragma once
 
-#include "source/common/upstream/load_balancer_impl.h"
 #include "source/common/upstream/upstream_impl.h"
+#include "source/extensions/load_balancing_policies/common/load_balancer_impl.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -64,6 +64,9 @@ public:
   }
   Network::TransportSocketOptionsConstSharedPtr upstreamTransportSocketOptions() const override {
     return context_->upstreamTransportSocketOptions();
+  }
+  void setHeadersModifier(std::function<void(Http::ResponseHeaderMap&)> modifier) override {
+    context_->setHeadersModifier(std::move(modifier));
   }
 
 private:

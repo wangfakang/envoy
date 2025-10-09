@@ -1,6 +1,8 @@
 #include <cstdint>
 #include <memory>
 
+#include "envoy/network/socket.h"
+
 #include "source/common/network/address_impl.h"
 #include "source/common/network/multi_connection_base_impl.h"
 #include "source/common/network/transport_socket_options_impl.h"
@@ -76,7 +78,7 @@ public:
 
   void expectConnectionCreation(size_t id) {
     EXPECT_CALL(*connection_provider_, createNextConnection(_))
-        .WillOnce(testing::Invoke([ this, id ](uint64_t conn_id) -> auto{
+        .WillOnce(testing::Invoke([this, id](uint64_t conn_id) -> auto {
           EXPECT_EQ(connection_provider_->nextConnection(), id);
           return connection_provider_->getNextConnection(conn_id);
         }));
@@ -297,7 +299,8 @@ TEST_F(MultiConnectionBaseImplTest, HashKey) {
   startConnect();
 
   std::vector<uint8_t> hash_key = {'A', 'B', 'C'};
-  uint8_t* id_array = reinterpret_cast<uint8_t*>(&id);
+  uint8_t id_array[sizeof(id)];
+  absl::little_endian::Store64(id_array, id);
   impl_->hashKey(hash_key);
   EXPECT_EQ(3 + sizeof(id), hash_key.size());
   EXPECT_EQ('A', hash_key[0]);
@@ -966,17 +969,17 @@ TEST_F(MultiConnectionBaseImplTest, ReadDisable) {
   setupMultiConnectionImpl(3);
 
   // The disables will be captured by the impl and not passed to the connection until it completes.
-  impl_->readDisable(true);
+  EXPECT_EQ(Connection::ReadDisableStatus::TransitionedToReadDisabled, impl_->readDisable(true));
 
   startConnect();
 
   timeOutAndStartNextAttempt();
 
   // The disables will be captured by the impl and not passed to the connection until it completes.
-  impl_->readDisable(true);
-  impl_->readDisable(true);
+  EXPECT_EQ(Connection::ReadDisableStatus::StillReadDisabled, impl_->readDisable(true));
+  EXPECT_EQ(Connection::ReadDisableStatus::StillReadDisabled, impl_->readDisable(true));
   // Read disable count should now be 2.
-  impl_->readDisable(false);
+  EXPECT_EQ(Connection::ReadDisableStatus::StillReadDisabled, impl_->readDisable(false));
 
   // readDisable() should be applied to the now final connection.
   EXPECT_CALL(*createdConnections()[1], readDisable(true)).Times(2);
@@ -984,23 +987,27 @@ TEST_F(MultiConnectionBaseImplTest, ReadDisable) {
 
   // Verify that addBytesSentCallback() calls are delegated to the remaining connection.
   EXPECT_CALL(*createdConnections()[1], readDisable(false));
-  impl_->readDisable(false);
+  EXPECT_EQ(Connection::ReadDisableStatus::NoTransition, impl_->readDisable(false));
 }
 
 TEST_F(MultiConnectionBaseImplTest, ReadEnabled) {
   setupMultiConnectionImpl(2);
 
   EXPECT_TRUE(impl_->readEnabled());
-  impl_->readDisable(true); // Disable count 1.
+  EXPECT_EQ(Connection::ReadDisableStatus::TransitionedToReadDisabled,
+            impl_->readDisable(true)); // Disable count 1.
   EXPECT_FALSE(impl_->readEnabled());
 
   startConnect();
 
-  impl_->readDisable(true); // Disable count 2
+  EXPECT_EQ(Connection::ReadDisableStatus::StillReadDisabled,
+            impl_->readDisable(true)); // Disable count 2
   EXPECT_FALSE(impl_->readEnabled());
-  impl_->readDisable(false); // Disable count 1
+  EXPECT_EQ(Connection::ReadDisableStatus::StillReadDisabled,
+            impl_->readDisable(false)); // Disable count 1
   EXPECT_FALSE(impl_->readEnabled());
-  impl_->readDisable(false); // Disable count 0
+  EXPECT_EQ(Connection::ReadDisableStatus::TransitionedToReadEnabled,
+            impl_->readDisable(false)); // Disable count 0
   EXPECT_TRUE(impl_->readEnabled());
 }
 
@@ -1175,6 +1182,40 @@ TEST_F(MultiConnectionBaseImplTest, LastRoundTripTime) {
   absl::optional<std::chrono::milliseconds> rtt = std::chrono::milliseconds(5);
   EXPECT_CALL(*createdConnections()[0], lastRoundTripTime()).WillOnce(Return(rtt));
   EXPECT_EQ(rtt, impl_->lastRoundTripTime());
+}
+
+TEST_F(MultiConnectionBaseImplTest, SetSocketOptionTest) {
+  setupMultiConnectionImpl(2);
+  connectFirstAttempt();
+  EXPECT_CALL(*createdConnections()[0], setSocketOption(_, _)).WillOnce(Return(true));
+
+  Envoy::Network::SocketOptionName sockopt_name = ENVOY_MAKE_SOCKET_OPTION_NAME(1, 2);
+
+  int val = 1;
+  absl::Span<uint8_t> sockopt_val(reinterpret_cast<uint8_t*>(&val), sizeof(val));
+
+  EXPECT_TRUE(impl_->setSocketOption(sockopt_name, sockopt_val));
+}
+
+TEST_F(MultiConnectionBaseImplTest, SetSocketOptionFailedTest) {
+  setupMultiConnectionImpl(2);
+  connectFirstAttempt();
+
+  EXPECT_CALL(*createdConnections()[0], setSocketOption(_, _)).WillOnce(Return(false));
+
+  Envoy::Network::SocketOptionName sockopt_name = ENVOY_MAKE_SOCKET_OPTION_NAME(1, 2);
+
+  int val = 1;
+  absl::Span<uint8_t> sockopt_val(reinterpret_cast<uint8_t*>(&val), sizeof(val));
+
+  EXPECT_FALSE(impl_->setSocketOption(sockopt_name, sockopt_val));
+}
+
+TEST_F(MultiConnectionBaseImplTest, GetSocketPanics) {
+  setupMultiConnectionImpl(2);
+
+  // getSocket() should panic as it's not implemented for MultiConnectionBaseImpl.
+  EXPECT_DEATH(impl_->getSocket(), "not implemented");
 }
 
 } // namespace Network

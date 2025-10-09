@@ -7,3 +7,5 @@ HTTP cluster specifier
   :maxdepth: 2
 
   golang
+  lua
+  matcher

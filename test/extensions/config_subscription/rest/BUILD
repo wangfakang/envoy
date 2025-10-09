@@ -12,6 +12,7 @@ envoy_package()
 envoy_cc_test(
     name = "http_subscription_impl_test",
     srcs = ["http_subscription_impl_test.cc"],
+    rbe_pool = "6gig",
     deps = [
         ":http_subscription_test_harness",
     ],
@@ -19,7 +20,7 @@ envoy_cc_test(
 
 envoy_cc_test_library(
     name = "http_subscription_test_harness",
-    srcs = ["http_subscription_test_harness.h"],
+    hdrs = ["http_subscription_test_harness.h"],
     deps = [
         "//envoy/http:async_client_interface",
         "//source/common/common:utility_lib",

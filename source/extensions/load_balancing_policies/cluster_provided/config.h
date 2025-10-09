@@ -12,6 +12,11 @@ namespace Extensions {
 namespace LoadBalancingPolices {
 namespace ClusterProvided {
 
+class ClusterProvidedLbConfig : public Upstream::LoadBalancerConfig {
+public:
+  ClusterProvidedLbConfig() = default;
+};
+
 class Factory
     : public Upstream::TypedLoadBalancerFactoryBase<
           envoy::extensions::load_balancing_policies::cluster_provided::v3::ClusterProvided> {
@@ -24,7 +29,18 @@ public:
                                               Runtime::Loader& runtime,
                                               Random::RandomGenerator& random,
                                               TimeSource& time_source) override;
+
+  absl::StatusOr<Upstream::LoadBalancerConfigPtr>
+  loadConfig(Server::Configuration::ServerFactoryContext&, const Protobuf::Message&) override {
+    return std::make_unique<ClusterProvidedLbConfig>();
+  }
+  absl::StatusOr<Upstream::LoadBalancerConfigPtr>
+  loadLegacy(Server::Configuration::ServerFactoryContext&, const Upstream::ClusterProto&) override {
+    return std::make_unique<ClusterProvidedLbConfig>();
+  }
 };
+
+DECLARE_FACTORY(Factory);
 
 } // namespace ClusterProvided
 } // namespace LoadBalancingPolices

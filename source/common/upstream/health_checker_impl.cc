@@ -26,6 +26,7 @@
 #include "source/common/runtime/runtime_features.h"
 #include "source/common/upstream/host_utility.h"
 
+#include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 
@@ -47,16 +48,15 @@ const std::string& HealthCheckerFactory::getHostname(const HostSharedPtr& host,
   return cluster->name();
 }
 
-HealthCheckerSharedPtr HealthCheckerFactory::create(
-    const envoy::config::core::v3::HealthCheck& health_check_config, Upstream::Cluster& cluster,
-    Runtime::Loader& runtime, Event::Dispatcher& dispatcher,
-    AccessLog::AccessLogManager& log_manager,
-    ProtobufMessage::ValidationVisitor& validation_visitor, Api::Api& api) {
+absl::StatusOr<HealthCheckerSharedPtr>
+HealthCheckerFactory::create(const envoy::config::core::v3::HealthCheck& health_check_config,
+                             Upstream::Cluster& cluster,
+                             Server::Configuration::ServerFactoryContext& server_context) {
   Server::Configuration::CustomHealthCheckerFactory* factory = nullptr;
 
   switch (health_check_config.health_checker_case()) {
   case envoy::config::core::v3::HealthCheck::HealthCheckerCase::HEALTH_CHECKER_NOT_SET:
-    throw EnvoyException("invalid cluster config");
+    return absl::InvalidArgumentError("invalid cluster config");
   case envoy::config::core::v3::HealthCheck::HealthCheckerCase::kHttpHealthCheck:
     factory = &Config::Utility::getAndCheckFactoryByName<
         Server::Configuration::CustomHealthCheckerFactory>("envoy.health_checkers.http");
@@ -67,8 +67,8 @@ HealthCheckerSharedPtr HealthCheckerFactory::create(
     break;
   case envoy::config::core::v3::HealthCheck::HealthCheckerCase::kGrpcHealthCheck:
     if (!(cluster.info()->features() & Upstream::ClusterInfo::Features::HTTP2)) {
-      throw EnvoyException(fmt::format("{} cluster must support HTTP/2 for gRPC healthchecking",
-                                       cluster.info()->name()));
+      return absl::InvalidArgumentError(fmt::format(
+          "{} cluster must support HTTP/2 for gRPC healthchecking", cluster.info()->name()));
     }
     factory = &Config::Utility::getAndCheckFactoryByName<
         Server::Configuration::CustomHealthCheckerFactory>("envoy.health_checkers.grpc");
@@ -81,39 +81,53 @@ HealthCheckerSharedPtr HealthCheckerFactory::create(
   }
 
   std::unique_ptr<Server::Configuration::HealthCheckerFactoryContext> context(
-      new HealthCheckerFactoryContextImpl(cluster, runtime, dispatcher, validation_visitor, api,
-                                          log_manager));
+      new HealthCheckerFactoryContextImpl(cluster, server_context));
 
   if (!health_check_config.event_log_path().empty() /* deprecated */ ||
       !health_check_config.event_logger().empty()) {
-    HealthCheckEventLoggerPtr event_logger;
-    event_logger = std::make_unique<HealthCheckEventLoggerImpl>(
-        log_manager, dispatcher.timeSource(), health_check_config, *context);
-    context->setEventLogger(std::move(event_logger));
+    auto logger_or_error = HealthCheckEventLoggerImpl::create(health_check_config, *context);
+    RETURN_IF_NOT_OK_REF(logger_or_error.status());
+    context->setEventLogger(std::move(*logger_or_error));
   }
   return factory->createCustomHealthChecker(health_check_config, *context);
 }
 
-PayloadMatcher::MatchSegments PayloadMatcher::loadProtoBytes(
-    const Protobuf::RepeatedPtrField<envoy::config::core::v3::HealthCheck::Payload>& byte_array) {
-  MatchSegments result;
-
-  for (const auto& entry : byte_array) {
-    std::vector<uint8_t> decoded;
-    if (entry.has_text()) {
-      decoded = Hex::decode(entry.text());
-      if (decoded.empty()) {
-        throw EnvoyException(fmt::format("invalid hex string '{}'", entry.text()));
-      }
-    } else {
-      decoded.assign(entry.binary().begin(), entry.binary().end());
+absl::StatusOr<std::vector<uint8_t>>
+PayloadMatcher::decodePayload(const envoy::config::core::v3::HealthCheck::Payload& payload) {
+  std::vector<uint8_t> decoded;
+  if (payload.has_text()) {
+    decoded = Hex::decode(payload.text());
+    if (decoded.empty()) {
+      return absl::InvalidArgumentError(fmt::format("invalid hex string '{}'", payload.text()));
     }
-    if (!decoded.empty()) {
-      result.push_back(decoded);
+  } else {
+    decoded.assign(payload.binary().begin(), payload.binary().end());
+  }
+  return decoded;
+}
+
+absl::StatusOr<PayloadMatcher::MatchSegments> PayloadMatcher::loadProtoBytes(
+    const Protobuf::RepeatedPtrField<envoy::config::core::v3::HealthCheck::Payload>& byte_array) {
+  MatchSegments segments;
+  for (const auto& payload : byte_array) {
+    auto decoded_or_error = decodePayload(payload);
+    if (!decoded_or_error.ok()) {
+      return decoded_or_error.status();
+    }
+    if (!decoded_or_error.value().empty()) {
+      segments.emplace_back(std::move(decoded_or_error.value()));
     }
   }
+  return segments;
+}
 
-  return result;
+absl::StatusOr<PayloadMatcher::MatchSegments> PayloadMatcher::loadProtoBytes(
+    const envoy::config::core::v3::HealthCheck::Payload& single_payload) {
+  auto decoded_or_error = decodePayload(single_payload);
+  if (!decoded_or_error.ok()) {
+    return decoded_or_error.status();
+  }
+  return MatchSegments{std::move(decoded_or_error.value())};
 }
 
 bool PayloadMatcher::match(const MatchSegments& expected, const Buffer::Instance& buffer) {

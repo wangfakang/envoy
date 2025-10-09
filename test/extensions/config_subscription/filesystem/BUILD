@@ -12,6 +12,7 @@ envoy_package()
 envoy_cc_test(
     name = "filesystem_subscription_impl_test",
     srcs = ["filesystem_subscription_impl_test.cc"],
+    rbe_pool = "6gig",
     deps = [
         ":filesystem_subscription_test_harness",
         "//test/mocks/event:event_mocks",
@@ -25,7 +26,7 @@ envoy_cc_test(
 
 envoy_cc_test_library(
     name = "filesystem_subscription_test_harness",
-    srcs = ["filesystem_subscription_test_harness.h"],
+    hdrs = ["filesystem_subscription_test_harness.h"],
     deps = [
         "//source/common/config:utility_lib",
         "//source/common/event:dispatcher_lib",

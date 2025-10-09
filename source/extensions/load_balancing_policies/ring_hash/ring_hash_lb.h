@@ -8,12 +8,32 @@
 #include "envoy/runtime/runtime.h"
 #include "envoy/stats/scope.h"
 #include "envoy/stats/stats_macros.h"
+#include "envoy/upstream/load_balancer.h"
 
 #include "source/common/common/logger.h"
-#include "source/common/upstream/thread_aware_lb_impl.h"
+#include "source/extensions/load_balancing_policies/common/thread_aware_lb_impl.h"
 
 namespace Envoy {
 namespace Upstream {
+
+using RingHashLbProto = envoy::extensions::load_balancing_policies::ring_hash::v3::RingHash;
+using ClusterProto = envoy::config::cluster::v3::Cluster;
+
+using CommonLbConfigProto = envoy::config::cluster::v3::Cluster::CommonLbConfig;
+using LegacyRingHashLbProto = envoy::config::cluster::v3::Cluster::RingHashLbConfig;
+
+/**
+ * Load balancer config that used to wrap typed ring hash config.
+ */
+class TypedRingHashLbConfig : public Upstream::TypedHashLbConfigBase {
+public:
+  TypedRingHashLbConfig(const CommonLbConfigProto& common_lb_config,
+                        const LegacyRingHashLbProto& lb_config);
+  TypedRingHashLbConfig(const RingHashLbProto& lb_config, Regex::Engine& regex_engine,
+                        absl::Status& creation_status);
+
+  RingHashLbProto lb_config_;
+};
 
 /**
  * All ring hash load balancer stats. @see stats_macros.h
@@ -39,23 +59,17 @@ struct RingHashLoadBalancerStats {
  * 2) Per-zone rings and optional zone aware routing (not all applications will want this).
  * 3) Max request fallback to support hot shards (not all applications will want this).
  */
-class RingHashLoadBalancer : public ThreadAwareLoadBalancerBase,
-                             Logger::Loggable<Logger::Id::upstream> {
+class RingHashLoadBalancer : public ThreadAwareLoadBalancerBase {
 public:
   RingHashLoadBalancer(const PrioritySet& priority_set, ClusterLbStats& stats, Stats::Scope& scope,
                        Runtime::Loader& runtime, Random::RandomGenerator& random,
-                       OptRef<const envoy::config::cluster::v3::Cluster::RingHashLbConfig> config,
-                       const envoy::config::cluster::v3::Cluster::CommonLbConfig& common_config);
-
-  RingHashLoadBalancer(
-      const PrioritySet& priority_set, ClusterLbStats& stats, Stats::Scope& scope,
-      Runtime::Loader& runtime, Random::RandomGenerator& random, uint32_t healthy_panic_threshold,
-      const envoy::extensions::load_balancing_policies::ring_hash::v3::RingHash& config);
+                       uint32_t healthy_panic_threshold, const RingHashLbProto& config,
+                       HashPolicySharedPtr hash_policy);
 
   const RingHashLoadBalancerStats& stats() const { return stats_; }
 
 private:
-  using HashFunction = envoy::config::cluster::v3::Cluster::RingHashLbConfig::HashFunction;
+  using HashFunction = RingHashLbProto::HashFunction;
 
   struct RingEntry {
     uint64_t hash_;
@@ -68,7 +82,7 @@ private:
          bool use_hostname_for_hashing, RingHashLoadBalancerStats& stats);
 
     // ThreadAwareLoadBalancerBase::HashingLoadBalancer
-    HostConstSharedPtr chooseHost(uint64_t hash, uint32_t attempt) const override;
+    HostSelectionResponse chooseHost(uint64_t hash, uint32_t attempt) const override;
 
     std::vector<RingEntry> ring_;
 

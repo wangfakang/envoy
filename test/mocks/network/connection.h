@@ -43,6 +43,7 @@ public:
   testing::NiceMock<StreamInfo::MockStreamInfo> stream_info_;
   std::string local_close_reason_{"unset_local_close_reason"};
   Connection::State state_{Connection::State::Open};
+  DetectedCloseType detected_close_type_{DetectedCloseType::Normal};
 };
 
 #define DEFINE_MOCK_CONNECTION_MOCK_METHODS                                                        \
@@ -58,13 +59,14 @@ public:
   MOCK_METHOD(bool, isHalfCloseEnabled, (), (const));                                              \
   MOCK_METHOD(void, close, (ConnectionCloseType type));                                            \
   MOCK_METHOD(void, close, (ConnectionCloseType type, absl::string_view details));                 \
-  MOCK_METHOD(Event::Dispatcher&, dispatcher, ());                                                 \
+  MOCK_METHOD(DetectedCloseType, detectedCloseType, (), (const));                                  \
+  MOCK_METHOD(Event::Dispatcher&, dispatcher, (), (const));                                        \
   MOCK_METHOD(uint64_t, id, (), (const));                                                          \
   MOCK_METHOD(void, hashKey, (std::vector<uint8_t>&), (const));                                    \
   MOCK_METHOD(bool, initializeReadFilters, ());                                                    \
   MOCK_METHOD(std::string, nextProtocol, (), (const));                                             \
   MOCK_METHOD(void, noDelay, (bool enable));                                                       \
-  MOCK_METHOD(void, readDisable, (bool disable));                                                  \
+  MOCK_METHOD(ReadDisableStatus, readDisable, (bool disable));                                     \
   MOCK_METHOD(void, detectEarlyCloseWhenReadDisabled, (bool));                                     \
   MOCK_METHOD(bool, readEnabled, (), (const));                                                     \
   MOCK_METHOD(ConnectionInfoSetter&, connectionInfoSetter, ());                                    \
@@ -76,12 +78,14 @@ public:
   MOCK_METHOD(Ssl::ConnectionInfoConstSharedPtr, ssl, (), (const));                                \
   MOCK_METHOD(absl::string_view, requestedServerName, (), (const));                                \
   MOCK_METHOD(absl::string_view, ja3Hash, (), (const));                                            \
+  MOCK_METHOD(absl::string_view, ja4Hash, (), (const));                                            \
   MOCK_METHOD(State, state, (), (const));                                                          \
   MOCK_METHOD(bool, connecting, (), (const));                                                      \
   MOCK_METHOD(void, write, (Buffer::Instance & data, bool end_stream));                            \
   MOCK_METHOD(void, setBufferLimits, (uint32_t limit));                                            \
   MOCK_METHOD(uint32_t, bufferLimit, (), (const));                                                 \
   MOCK_METHOD(bool, aboveHighWatermark, (), (const));                                              \
+  MOCK_METHOD(const ConnectionSocketPtr&, getSocket, (), (const));                                 \
   MOCK_METHOD(const Network::ConnectionSocket::OptionsSharedPtr&, socketOptions, (), (const));     \
   MOCK_METHOD(StreamInfo::StreamInfo&, streamInfo, ());                                            \
   MOCK_METHOD(const StreamInfo::StreamInfo&, streamInfo, (), (const));                             \
@@ -93,12 +97,15 @@ public:
   MOCK_METHOD(void, configureInitialCongestionWindow,                                              \
               (uint64_t bandwidth_bits_per_sec, std::chrono::microseconds rtt), ());               \
   MOCK_METHOD(absl::optional<uint64_t>, congestionWindowInBytes, (), (const));                     \
-  MOCK_METHOD(void, dumpState, (std::ostream&, int), (const));
+  MOCK_METHOD(void, dumpState, (std::ostream&, int), (const));                                     \
+  MOCK_METHOD(bool, setSocketOption, (Network::SocketOptionName, absl::Span<uint8_t>), ());        \
+  MOCK_METHOD(OptRef<const StreamInfo::StreamInfo>, trackedStream, (), (const));
 
 class MockConnection : public Connection, public MockConnectionBase {
 public:
   MockConnection();
   ~MockConnection() override;
+
   DEFINE_MOCK_CONNECTION_MOCK_METHODS;
 };
 
@@ -143,6 +150,7 @@ public:
   MOCK_METHOD(StreamBuffer, getReadBuffer, ());
   MOCK_METHOD(StreamBuffer, getWriteBuffer, ());
   MOCK_METHOD(void, rawWrite, (Buffer::Instance & data, bool end_stream));
+  MOCK_METHOD(void, closeConnection, (ConnectionCloseAction close_action));
 };
 
 } // namespace Network

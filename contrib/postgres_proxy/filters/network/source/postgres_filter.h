@@ -10,6 +10,7 @@
 
 #include "contrib/envoy/extensions/filters/network/postgres_proxy/v3alpha/postgres_proxy.pb.h"
 #include "contrib/postgres_proxy/filters/network/source/postgres_decoder.h"
+#include "contrib/postgres_proxy/filters/network/source/postgres_encoder.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -72,6 +73,8 @@ public:
     bool terminate_ssl_;
     envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::SSLMode
         upstream_ssl_;
+    envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::SSLMode
+        downstream_ssl_;
   };
   PostgresFilterConfig(const PostgresFilterConfigOptions& config_options, Stats::Scope& scope);
 
@@ -79,6 +82,9 @@ public:
   bool terminate_ssl_{false};
   envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::SSLMode
       upstream_ssl_{
+          envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::DISABLE};
+  envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::SSLMode
+      downstream_ssl_{
           envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::DISABLE};
   Stats::Scope& scope_;
   PostgresProxyStats stats_;
@@ -102,6 +108,7 @@ public:
   Network::FilterStatus onData(Buffer::Instance& data, bool end_stream) override;
   Network::FilterStatus onNewConnection() override;
   void initializeReadFilterCallbacks(Network::ReadFilterCallbacks& callbacks) override;
+  void initializeWriteFilterCallbacks(Network::WriteFilterCallbacks& callbacks) override;
 
   // Network::WriteFilter
   Network::FilterStatus onWrite(Buffer::Instance& data, bool end_stream) override;
@@ -122,12 +129,20 @@ public:
   bool onSSLRequest() override;
   bool shouldEncryptUpstream() const override;
   void sendUpstream(Buffer::Instance&) override;
-  void encryptUpstream(bool, Buffer::Instance&) override;
+  bool encryptUpstream(bool, Buffer::Instance&) override;
+  void verifyDownstreamSSL() override;
+
+  void closeConn();
+  bool isSwitchedToTls() { return switched_to_tls_; };
 
   Network::FilterStatus doDecode(Buffer::Instance& data, bool);
   DecoderPtr createDecoder(DecoderCallbacks* callbacks);
   void setDecoder(std::unique_ptr<Decoder> decoder) { decoder_ = std::move(decoder); }
   Decoder* getDecoder() const { return decoder_.get(); }
+
+  EncoderPtr createEncoder();
+  void setEncoder(std::unique_ptr<Encoder> encoder) { encoder_ = std::move(encoder); }
+  Encoder* getEncoder() const { return encoder_.get(); }
 
   // Routines used during integration and unit tests
   uint32_t getFrontendBufLength() const { return frontend_buffer_.length(); }
@@ -138,10 +153,13 @@ public:
 
 private:
   Network::ReadFilterCallbacks* read_callbacks_{};
+  Network::WriteFilterCallbacks* write_callbacks_{};
   PostgresFilterConfigSharedPtr config_;
   Buffer::OwnedImpl frontend_buffer_;
   Buffer::OwnedImpl backend_buffer_;
   std::unique_ptr<Decoder> decoder_;
+  std::unique_ptr<Encoder> encoder_;
+  bool switched_to_tls_{false}; // tells if tls negotiation with downstream client is completed
 };
 
 } // namespace PostgresProxy

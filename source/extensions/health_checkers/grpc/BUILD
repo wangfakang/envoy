@@ -12,9 +12,7 @@ envoy_cc_extension(
     name = "health_checker_lib",
     srcs = ["health_checker_impl.cc"],
     hdrs = ["health_checker_impl.h"],
-    external_deps = [
-        "grpc_health_proto",
-    ],
+    external_deps = ["grpc_health_proto"],
     extra_visibility = [
         # previously considered core code.
         "//test:__subpackages__",
@@ -22,6 +20,7 @@ envoy_cc_extension(
     deps = [
         "//source/common/grpc:codec_lib",
         "//source/common/http:codec_client_lib",
+        "//source/common/http:response_decoder_impl_base",
         "//source/common/upstream:health_checker_lib",
         "//source/common/upstream:host_utility_lib",
         "//source/extensions/health_checkers/common:health_checker_base_lib",

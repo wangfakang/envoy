@@ -34,7 +34,6 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.chromium.net.CallbackException;
 import org.chromium.net.CronetException;
 import org.chromium.net.InlineExecutionProhibitedException;
-import org.chromium.net.NetworkException;
 import org.chromium.net.RequestFinishedInfo;
 import org.chromium.net.RequestFinishedInfo.Metrics;
 import org.chromium.net.UploadDataProvider;
@@ -104,8 +103,6 @@ public final class CronvoyUrlRequest extends CronvoyUrlRequestBase {
   private static final String TAG = CronvoyUrlRequest.class.getSimpleName();
   private static final String USER_AGENT = "User-Agent";
   private static final String CONTENT_TYPE = "Content-Type";
-  private static final Executor DIRECT_EXECUTOR = new DirectExecutor();
-
   private final String mUserAgent;
   private final HeadersList mRequestHeaders = new HeadersList();
   private final Collection<Object> mRequestAnnotations;
@@ -183,6 +180,7 @@ public final class CronvoyUrlRequest extends CronvoyUrlRequestBase {
   private String mCurrentUrl;
   private volatile CronvoyUrlResponseInfoImpl mUrlResponseInfo;
   private String mPendingRedirectUrl;
+  private boolean mIdempotent;
 
   /**
    * @param executor The executor for orchestrating tasks between envoy-mobile callbacks
@@ -191,7 +189,7 @@ public final class CronvoyUrlRequest extends CronvoyUrlRequestBase {
                     Executor executor, String userAgent, boolean allowDirectExecutor,
                     Collection<Object> connectionAnnotations, boolean trafficStatsTagSet,
                     int trafficStatsTag, boolean trafficStatsUidSet, int trafficStatsUid,
-                    RequestFinishedInfo.Listener requestFinishedListener) {
+                    RequestFinishedInfo.Listener requestFinishedListener, boolean idempotent) {
     if (url == null) {
       throw new NullPointerException("URL is required");
     }
@@ -213,6 +211,7 @@ public final class CronvoyUrlRequest extends CronvoyUrlRequestBase {
     mCurrentUrl = url;
     mUserAgent = userAgent;
     mRequestAnnotations = connectionAnnotations;
+    mIdempotent = idempotent;
   }
 
   @Override
@@ -536,14 +535,12 @@ public final class CronvoyUrlRequest extends CronvoyUrlRequestBase {
     mBytesReceivedFromRedirects += mBytesReceivedFromLastRedirect;
     mAdditionalStatusDetails = Status.CONNECTING;
     mUrlChain.add(mCurrentUrl);
-    Map<String, List<String>> envoyRequestHeaders =
-        buildEnvoyRequestHeaders(mInitialMethod, mRequestHeaders, mUploadDataStream, mUserAgent,
-                                 mCurrentUrl, mRequestContext.getBuilder().quicEnabled());
+    Map<String, List<String>> envoyRequestHeaders = buildEnvoyRequestHeaders(
+        mInitialMethod, mRequestHeaders, mUploadDataStream, mUserAgent, mCurrentUrl);
     mCronvoyCallbacks = new CronvoyHttpCallbacks();
     mStream.set(mRequestContext.getEnvoyEngine().startStream(mCronvoyCallbacks,
-                                                             /* explicitFlowCrontrol= */ true,
-                                                             /* minDeliverySize */ 0));
-    mStream.get().sendHeaders(envoyRequestHeaders, mUploadDataStream == null);
+                                                             /* explicitFlowControl= */ true));
+    mStream.get().sendHeaders(envoyRequestHeaders, mUploadDataStream == null, mIdempotent);
     if (mUploadDataStream != null && mUrlChain.size() == 1) {
       mUploadDataStream.initializeWithRequest();
     }
@@ -552,7 +549,7 @@ public final class CronvoyUrlRequest extends CronvoyUrlRequestBase {
   private static Map<String, List<String>>
   buildEnvoyRequestHeaders(String initialMethod, HeadersList headersList,
                            CronvoyUploadDataStream mUploadDataStream, String userAgent,
-                           String currentUrl, boolean isQuicEnabled) {
+                           String currentUrl) {
     Map<String, List<String>> headers = new LinkedHashMap<>();
     final URL url;
     try {
@@ -769,22 +766,10 @@ public final class CronvoyUrlRequest extends CronvoyUrlRequestBase {
 
   private static class HeadersList extends ArrayList<Map.Entry<String, String>> {}
 
-  private static class DirectExecutor implements Executor {
-    @Override
-    public void execute(Runnable runnable) {
-      runnable.run();
-    }
-  }
-
   private class CronvoyHttpCallbacks implements EnvoyHTTPCallbacks {
 
     private final AtomicInteger mCancelState = new AtomicInteger(CancelState.READY);
     private volatile boolean mEndStream = false; // Accessed by different Threads
-
-    @Override
-    public Executor getExecutor() {
-      return DIRECT_EXECUTOR;
-    }
 
     @Override
     public void onHeaders(Map<String, List<String>> headers, boolean endStream,
@@ -799,7 +784,12 @@ public final class CronvoyUrlRequest extends CronvoyUrlRequestBase {
       if (responseCode >= 300 && responseCode < 400) {
         setUrlResponseInfo(headers, responseCode);
         List<String> locationFields = mUrlResponseInfo.getAllHeaders().get("location");
-        locationField = locationFields == null ? null : locationFields.get(0);
+        if (locationFields != null && !locationFields.isEmpty() &&
+            !locationFields.get(0).isEmpty()) {
+          locationField = locationFields.get(0);
+        } else {
+          locationField = null;
+        }
       } else {
         locationField = null;
       }
@@ -864,10 +854,18 @@ public final class CronvoyUrlRequest extends CronvoyUrlRequestBase {
       mEndStream = endStream;
       @State int originalState;
       @State int updatedState;
+
+      // When endStream with no data is read, there will be no more calls to read().
+      boolean isFinalRead = endStream && !data.hasRemaining();
       do {
         originalState = mState.get();
-        updatedState = determineNextState(endStream, originalState, State.AWAITING_READ);
+        updatedState = determineNextState(endStream, originalState,
+                                          isFinalRead ? State.COMPLETE : State.AWAITING_READ);
       } while (!mState.compareAndSet(originalState, updatedState));
+      if (isFinalRead) {
+        // onComplete still needs to be called - this always returns false.
+        mSucceededState.hasReachedFinalState(SucceededState.FINAL_READ_DONE);
+      }
       if (completeAbandonIfAny(originalState, updatedState)) {
         return;
       }
@@ -875,16 +873,23 @@ public final class CronvoyUrlRequest extends CronvoyUrlRequestBase {
         return;
       }
 
+      ByteBuffer userBuffer = mUserCurrentReadBuffer;
+      mUserCurrentReadBuffer = null; // Avoid the reference to a potentially large buffer.
+      int dataRead = data.remaining();
+      // It is important to copy the `data` into the `userBuffer` outside the thread execution
+      // because the `data` is backed by a direct `ByteBuffer` and it will be destroyed once
+      // the `onData` completes.
+      userBuffer.put(data); // NPE ==> BUG, BufferOverflowException ==> User not behaving.
       Runnable task = new Runnable() {
         @Override
         public void run() {
           checkCallingThread();
           try {
-            ByteBuffer userBuffer = mUserCurrentReadBuffer;
-            mUserCurrentReadBuffer = null; // Avoid the reference to a potentially large buffer.
-            userBuffer.put(data); // NPE ==> BUG, BufferOverflowException ==> User not behaving.
-            mWaitingOnRead.set(true);
-            mCallback.onReadCompleted(CronvoyUrlRequest.this, mUrlResponseInfo, userBuffer);
+
+            if (dataRead > 0 || !endStream) {
+              mWaitingOnRead.set(true);
+              mCallback.onReadCompleted(CronvoyUrlRequest.this, mUrlResponseInfo, userBuffer);
+            }
           } catch (Throwable t) {
             onCallbackException(t);
           }
@@ -936,14 +941,18 @@ public final class CronvoyUrlRequest extends CronvoyUrlRequestBase {
       int javaError = mapNetErrorToCronetApiErrorCode(netError);
 
       if (isQuicException(javaError)) {
+        // `message` is populated from StreamInfo::responseCodeDetails(), so `message` is used to
+        // populate the error details in the exception.
         enterErrorState(new CronvoyQuicExceptionImpl("Exception in CronvoyUrlRequest: " + netError,
                                                      javaError, netError.getErrorCode(),
-                                                     Errors.QUIC_INTERNAL_ERROR));
+                                                     Errors.QUIC_INTERNAL_ERROR, message));
         return;
       }
 
+      // `message` is populated from StreamInfo::responseCodeDetails(), so `message` is used to
+      // populate the error details in the exception.
       enterErrorState(new CronvoyNetworkExceptionImpl("Exception in CronvoyUrlRequest: " + netError,
-                                                      javaError, netError.getErrorCode()));
+                                                      javaError, netError.getErrorCode(), message));
     }
 
     @Override
@@ -985,7 +994,7 @@ public final class CronvoyUrlRequest extends CronvoyUrlRequestBase {
         return;
       }
 
-      mUploadDataStream.readDataReady(); // Have the next request body delivery to be sent.
+      mUploadDataStream.readDataReady(); // Have the next request body chunk to be sent.
     }
 
     @Override

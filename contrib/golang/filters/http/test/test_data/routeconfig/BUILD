@@ -1,20 +1,18 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_binary")
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 licenses(["notice"])  # Apache 2
 
-go_binary(
-    name = "filter.so",
+go_library(
+    name = "routeconfig",
     srcs = [
         "config.go",
         "filter.go",
     ],
-    out = "filter.so",
     cgo = True,
-    importpath = "github.com/envoyproxy/envoy/contrib/golang/filters/http/test/test_data/routeconfig",
-    linkmode = "c-shared",
+    importpath = "example.com/test-data/routeconfig",
     visibility = ["//visibility:public"],
     deps = [
-        "//contrib/golang/filters/http/source/go/pkg/api",
+        "//contrib/golang/common/go/api",
         "//contrib/golang/filters/http/source/go/pkg/http",
         "@com_github_cncf_xds_go//xds/type/v3:type",
         "@org_golang_google_protobuf//types/known/anypb",

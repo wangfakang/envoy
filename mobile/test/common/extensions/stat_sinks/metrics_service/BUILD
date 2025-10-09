@@ -1,4 +1,4 @@
-load("@envoy//bazel:envoy_build_system.bzl", "envoy_package")
+load("@envoy//bazel:envoy_build_system.bzl", "envoy_mobile_package")
 load(
     "@envoy//test/extensions:extensions_build_system.bzl",
     "envoy_extension_cc_test",
@@ -6,7 +6,7 @@ load(
 
 licenses(["notice"])  # Apache 2
 
-envoy_package()
+envoy_mobile_package()
 
 envoy_extension_cc_test(
     name = "mobile_grpc_streamer_test",
@@ -32,7 +32,7 @@ envoy_extension_cc_test(
         "//library/common/extensions/stat_sinks/metrics_service:config",
         "//library/common/extensions/stat_sinks/metrics_service:config_proto_cc_proto",
         "//library/common/extensions/stat_sinks/metrics_service:service_cc_proto",
-        "@envoy//test/integration:http_integration_lib",
+        "@envoy//test/integration:http_integration_lib_light",
         "@envoy//test/mocks/grpc:grpc_mocks",
         "@envoy//test/mocks/local_info:local_info_mocks",
         "@envoy//test/mocks/thread_local:thread_local_mocks",

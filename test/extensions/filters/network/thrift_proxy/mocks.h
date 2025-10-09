@@ -417,12 +417,12 @@ public:
                                Server::Configuration::FactoryContext& context) override;
 
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
-    return std::make_unique<ProtobufWkt::Struct>();
+    return std::make_unique<Protobuf::Struct>();
   }
 
   std::string name() const override { return name_; }
 
-  ProtobufWkt::Struct config_struct_;
+  Protobuf::Struct config_struct_;
   std::string config_stat_prefix_;
 
 private:
@@ -441,12 +441,12 @@ public:
                                Server::Configuration::FactoryContext& context) override;
 
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
-    return std::make_unique<ProtobufWkt::Struct>();
+    return std::make_unique<Protobuf::Struct>();
   }
 
   std::string name() const override { return name_; }
 
-  ProtobufWkt::Struct config_struct_;
+  Protobuf::Struct config_struct_;
   std::string config_stat_prefix_;
 
 private:
@@ -465,12 +465,12 @@ public:
                                Server::Configuration::FactoryContext& context) override;
 
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
-    return std::make_unique<ProtobufWkt::Struct>();
+    return std::make_unique<Protobuf::Struct>();
   }
 
   std::string name() const override { return name_; }
 
-  ProtobufWkt::Struct config_struct_;
+  Protobuf::Struct config_struct_;
   std::string config_stat_prefix_;
 
 private:
@@ -548,10 +548,10 @@ public:
 
   MOCK_METHOD(Upstream::ClusterManager&, clusterManager, (), ());
   MOCK_METHOD(Event::Dispatcher&, dispatcher, (), ());
-  MOCK_METHOD(absl::optional<std::reference_wrapper<ShadowRouterHandle>>, submit,
+  MOCK_METHOD(OptRef<ShadowRouterHandle>, submit,
               (const std::string&, MessageMetadataSharedPtr, TransportType, ProtocolType), ());
 
-  absl::optional<std::reference_wrapper<ShadowRouterHandle>> router_handle_{absl::nullopt};
+  OptRef<ShadowRouterHandle> router_handle_{absl::nullopt};
 };
 
 } // namespace Router

@@ -30,46 +30,21 @@ To configure traffic tapping, add an ``envoy.transport_sockets.tap`` transport s
 :ref:`configuration <envoy_v3_api_msg_extensions.filters.http.tap.v3.Tap>` to the listener
 or cluster. For a plain text socket this might look like:
 
-.. code-block:: yaml
-
-  transport_socket:
-    name: envoy.transport_sockets.tap
-    typed_config:
-      "@type": type.googleapis.com/envoy.extensions.transport_sockets.tap.v3.Tap
-      common_config:
-        static_config:
-          match_config:
-            any_match: true
-          output_config:
-            sinks:
-              - format: PROTO_BINARY
-                file_per_tap:
-                  path_prefix: /some/tap/path
-      transport_socket:
-        name: envoy.transport_sockets.raw_buffer
-        typed_config:
-          "@type": type.googleapis.com/envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer
+.. literalinclude:: _include/traffic_tapping_plain_text.yaml
+   :language: yaml
+   :lines: 29-45
+   :linenos:
+   :lineno-start: 29
+   :caption: :download:`traffic_tapping_plain_text.yaml <_include/traffic_tapping_plain_text.yaml>`
 
 For a TLS socket, this will be:
 
-.. code-block:: yaml
-
-  transport_socket:
-    name: envoy.transport_sockets.tap
-    typed_config:
-      "@type": type.googleapis.com/envoy.extensions.transport_sockets.tap.v3.Tap
-      common_config:
-        static_config:
-          match_config:
-            any_match: true
-          output_config:
-            sinks:
-              - format: PROTO_BINARY
-                file_per_tap:
-                  path_prefix: /some/tap/path
-      transport_socket:
-        name: envoy.transport_sockets.tls
-        typed_config: <TLS context>
+.. literalinclude:: _include/traffic_tapping_ssl.yaml
+   :language: yaml
+   :lines: 44-60
+   :linenos:
+   :lineno-start: 44
+   :caption: :download:`traffic_tapping_ssl.yaml <_include/traffic_tapping_ssl.yaml>`
 
 where the TLS context configuration replaces any existing :ref:`downstream
 <envoy_v3_api_msg_extensions.transport_sockets.tls.v3.DownstreamTlsContext>` or :ref:`upstream
@@ -104,6 +79,20 @@ emitted. When streaming, a series of :ref:`SocketStreamedTraceSegment
 
 See the :ref:`HTTP tap filter streaming <config_http_filters_tap_streaming>` documentation for more
 information. Most of the concepts overlap between the HTTP filter and the transport socket.
+
+Statistics
+----------
+
+The tap filter emits statistics within the ``transport.tap.<stat_prefix>`` namespace.
+To customize the prefix used in these statistics, configure the :ref:`stats_prefix
+<envoy_v3_api_field_extensions.transport_sockets.tap.v3.SocketTapConfig.stats_prefix>` field accordingly.
+
+.. csv-table::
+  :header: Name, Type, Description
+  :widths: 1, 1, 2
+
+  streamed_submit, Counter, The total count of submissions triggered by streamed trace events
+  buffered_submit, Counter, The total count of submissions triggered by buffered trace events
 
 PCAP generation
 ---------------

@@ -49,6 +49,7 @@ public:
   }
   Api::IoCallUint64Result close() override;
   bool isOpen() const override;
+  bool wasConnected() const override;
   Api::IoCallUint64Result readv(uint64_t max_length, Buffer::RawSlice* slices,
                                 uint64_t num_slice) override;
   Api::IoCallUint64Result read(Buffer::Instance& buffer,
@@ -59,8 +60,11 @@ public:
                                   const Network::Address::Ip* self_ip,
                                   const Network::Address::Instance& peer_address) override;
   Api::IoCallUint64Result recvmsg(Buffer::RawSlice* slices, const uint64_t num_slice,
-                                  uint32_t self_port, RecvMsgOutput& output) override;
+                                  uint32_t self_port,
+                                  const Network::IoHandle::UdpSaveCmsgConfig& udp_save_cmsg_config,
+                                  RecvMsgOutput& output) override;
   Api::IoCallUint64Result recvmmsg(RawSliceArrays& slices, uint32_t self_port,
+                                   const Network::IoHandle::UdpSaveCmsgConfig& udp_save_cmsg_config,
                                    RecvMsgOutput& output) override;
   Api::IoCallUint64Result recv(void* buffer, size_t length, int flags) override;
   bool supportsMmsg() const override;
@@ -76,8 +80,8 @@ public:
                               unsigned long*) override;
   Api::SysCallIntResult setBlocking(bool blocking) override;
   absl::optional<int> domain() override;
-  Network::Address::InstanceConstSharedPtr localAddress() override;
-  Network::Address::InstanceConstSharedPtr peerAddress() override;
+  absl::StatusOr<Network::Address::InstanceConstSharedPtr> localAddress() override;
+  absl::StatusOr<Network::Address::InstanceConstSharedPtr> peerAddress() override;
 
   void initializeFileEvent(Event::Dispatcher& dispatcher, Event::FileReadyCb cb,
                            Event::FileTriggerType trigger, uint32_t events) override;
@@ -189,7 +193,7 @@ public:
   void mergeInto(envoy::config::core::v3::Metadata& metadata,
                  StreamInfo::FilterState& filter_state) override;
 
-private:
+protected:
   enum class State { Created, Initialized, Done };
   State state_{State::Created};
   std::unique_ptr<envoy::config::core::v3::Metadata> metadata_;
@@ -199,27 +203,22 @@ private:
 using IoHandleImplPtr = std::unique_ptr<IoHandleImpl>;
 class IoHandleFactory {
 public:
-  static std::pair<IoHandleImplPtr, IoHandleImplPtr> createIoHandlePair() {
-    auto state = std::make_shared<PassthroughStateImpl>();
-    auto p = std::pair<IoHandleImplPtr, IoHandleImplPtr>{new IoHandleImpl(state),
-                                                         new IoHandleImpl(state)};
-    p.first->setPeerHandle(p.second.get());
-    p.second->setPeerHandle(p.first.get());
-    return p;
-  }
+  /**
+   * @return a pair of connected IoHandleImpl instances.
+   * @param state optional existing value to use as the shared PassthroughState. If omitted, a
+   * newly constructed PassthroughStateImpl will be used.
+   */
   static std::pair<IoHandleImplPtr, IoHandleImplPtr>
-  createBufferLimitedIoHandlePair(uint32_t buffer_size) {
-    auto state = std::make_shared<PassthroughStateImpl>();
-    auto p = std::pair<IoHandleImplPtr, IoHandleImplPtr>{new IoHandleImpl(state),
-                                                         new IoHandleImpl(state)};
-    // This buffer watermark setting emulates the OS socket buffer parameter
-    // `/proc/sys/net/ipv4/tcp_{r,w}mem`.
-    p.first->setWatermarks(buffer_size);
-    p.second->setWatermarks(buffer_size);
-    p.first->setPeerHandle(p.second.get());
-    p.second->setPeerHandle(p.first.get());
-    return p;
-  }
+  createIoHandlePair(PassthroughStatePtr state = nullptr);
+
+  /**
+   * @return a pair of connected IoHandleImpl instances with pre-configured watermarks.
+   * @param buffer_size buffer watermark size in bytes
+   * @param state optional existing value to use as the shared PassthroughState. If omitted, a
+   * newly constructed PassthroughStateImpl will be used.
+   */
+  static std::pair<IoHandleImplPtr, IoHandleImplPtr>
+  createBufferLimitedIoHandlePair(uint32_t buffer_size, PassthroughStatePtr state = nullptr);
 };
 } // namespace UserSpace
 } // namespace IoSocket

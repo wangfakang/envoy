@@ -15,7 +15,7 @@ namespace Extensions {
 namespace HttpFilters {
 namespace BufferFilter {
 
-Http::FilterFactoryCb BufferFilterFactory::createFilterFactoryFromProtoTyped(
+absl::StatusOr<Http::FilterFactoryCb> BufferFilterFactory::createFilterFactoryFromProtoTyped(
     const envoy::extensions::filters::http::buffer::v3::Buffer& proto_config, const std::string&,
     DualInfo, Server::Configuration::ServerFactoryContext&) {
   ASSERT(proto_config.has_max_request_bytes());
@@ -26,7 +26,7 @@ Http::FilterFactoryCb BufferFilterFactory::createFilterFactoryFromProtoTyped(
   };
 }
 
-Router::RouteSpecificFilterConfigConstSharedPtr
+absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
 BufferFilterFactory::createRouteSpecificFilterConfigTyped(
     const envoy::extensions::filters::http::buffer::v3::BufferPerRoute& proto_config,
     Server::Configuration::ServerFactoryContext&, ProtobufMessage::ValidationVisitor&) {

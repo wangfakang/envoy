@@ -7,6 +7,7 @@
 #include "test/extensions/filters/http/jwt_authn/test_common.h"
 #include "test/mocks/server/factory_context.h"
 #include "test/mocks/server/instance.h"
+#include "test/test_common/test_runtime.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -14,7 +15,6 @@
 using envoy::extensions::filters::http::jwt_authn::v3::JwtAuthentication;
 using envoy::extensions::filters::http::jwt_authn::v3::PerRouteConfig;
 using testing::HasSubstr;
-using testing::ReturnRef;
 
 namespace Envoy {
 namespace Extensions {
@@ -166,37 +166,24 @@ rules:
     provider_name: provider1
 )";
 
-  NiceMock<Server::Configuration::MockServerFactoryContext> server_context;
-  // Make sure that the thread callbacks are not invoked inline.
-  server_context.thread_local_.defer_data_ = true;
-  {
-    // Scope in all the things that the filter depends on, so they are destroyed as we leave the
-    // scope.
-    NiceMock<Server::Configuration::MockFactoryContext> context;
-    // The threadLocal, dispatcher and api that are used by the filter config, actually belong to
-    // the server factory context that who's lifetime is longer. We simulate that by returning
-    // their instances from outside the scope.
-    ON_CALL(context, mainThreadDispatcher())
-        .WillByDefault(ReturnRef(server_context.mainThreadDispatcher()));
-    ON_CALL(context, api()).WillByDefault(ReturnRef(server_context.api()));
-    ON_CALL(context, threadLocal()).WillByDefault(ReturnRef(server_context.threadLocal()));
+  NiceMock<Server::Configuration::MockFactoryContext> context;
+  context.server_factory_context_.thread_local_.defer_data_ = true;
 
-    JwtAuthentication proto_config;
-    TestUtility::loadFromYaml(config, proto_config);
-    auto filter_conf = std::make_unique<FilterConfigImpl>(proto_config, "", context);
-  }
+  JwtAuthentication proto_config;
+  TestUtility::loadFromYaml(config, proto_config);
+  auto filter_conf = std::make_unique<FilterConfigImpl>(proto_config, "", context);
 
   // Even though filter_conf is now de-allocated, using a reference to it might still work, as its
   // memory was not cleared. This leads to a false positive in this test when run normally. The
   // test should fail under asan if the code uses invalid reference.
 
   // Make sure the filter scheduled a callback
-  EXPECT_EQ(1, server_context.thread_local_.deferred_data_.size());
+  EXPECT_EQ(1, context.server_factory_context_.thread_local_.deferred_data_.size());
 
   // Simulate a situation where the callback is called after the filter config is destroyed.
   // call the tls callback. we want to make sure that it doesn't depend on objects
   // that are out of scope.
-  EXPECT_NO_THROW(server_context.thread_local_.call());
+  EXPECT_NO_THROW(context.server_factory_context_.thread_local_.call());
 }
 
 TEST(HttpJwtAuthnFilterConfigTest, FindByFilterState) {
@@ -322,6 +309,8 @@ providers:
     remote_jwks:
       cache_duration:
         seconds: 5223372036
+      http_uri:
+        uri: http://www.google.com
 )";
 
   JwtAuthentication proto_config;
@@ -330,6 +319,43 @@ providers:
   NiceMock<Server::Configuration::MockFactoryContext> context;
   EXPECT_THAT_THROWS_MESSAGE(FilterConfigImpl(proto_config, "", context), EnvoyException,
                              HasSubstr("Duration out-of-range"));
+}
+
+TEST(HttpJwtAuthnFilterConfigTest, RemoteJwksInvalidUri) {
+  // Invalid URI should fail config validation.
+  const char config[] = R"(
+providers:
+  provider1:
+    issuer: issuer1
+    remote_jwks:
+      http_uri:
+        uri: http://www.not\nvalid.com
+)";
+
+  JwtAuthentication proto_config;
+  TestUtility::loadFromYaml(config, proto_config);
+
+  NiceMock<Server::Configuration::MockFactoryContext> context;
+  EXPECT_THAT_THROWS_MESSAGE(FilterConfigImpl(proto_config, "", context), EnvoyException,
+                             HasSubstr("invalid URI"));
+}
+
+TEST(HttpJwtAuthnFilterConfigTest, RemoteJwksValidUri) {
+  // Valid URI should not fail config validation.
+  const char config[] = R"(
+providers:
+  provider1:
+    issuer: issuer1
+    remote_jwks:
+      http_uri:
+        uri: http://www.valid.com/resource
+)";
+
+  JwtAuthentication proto_config;
+  TestUtility::loadFromYaml(config, proto_config);
+
+  NiceMock<Server::Configuration::MockFactoryContext> context;
+  FilterConfigImpl(proto_config, "", context);
 }
 
 TEST(HttpJwtAuthnFilterConfigTest, RemoteJwksAsyncFetchRefetchDurationVeryBig) {

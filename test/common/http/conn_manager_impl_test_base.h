@@ -6,6 +6,7 @@
 #include "source/common/network/address_impl.h"
 #include "source/common/tracing/custom_tag_impl.h"
 #include "source/extensions/access_loggers/common/file_access_log_impl.h"
+#include "source/extensions/http/header_validators/envoy_default/http1_header_validator.h"
 
 #include "test/mocks/access_log/mocks.h"
 #include "test/mocks/event/mocks.h"
@@ -28,6 +29,38 @@ using testing::NiceMock;
 namespace Envoy {
 namespace Http {
 
+struct SetupOpts {
+  SetupOpts& setSsl(bool ssl) {
+    ssl_ = ssl;
+    return *this;
+  }
+
+  SetupOpts& setServerName(absl::string_view server_name) {
+    server_name_ = server_name;
+    return *this;
+  }
+
+  SetupOpts& setTracing(bool tracing) {
+    tracing_ = tracing;
+    return *this;
+  }
+
+  SetupOpts& setUseSrds(bool use_srds) {
+    use_srds_ = use_srds;
+    return *this;
+  }
+
+  SetupOpts& setHttp1SafeMaxConnectionDuration(bool http1_safe_max_connection_duration) {
+    http1_safe_max_connection_duration_ = http1_safe_max_connection_duration;
+    return *this;
+  }
+
+  bool ssl_{false};
+  std::string server_name_{"envoy-server-test"};
+  bool tracing_{true};
+  bool use_srds_{false};
+  bool http1_safe_max_connection_duration_{false};
+};
 // Base class for HttpConnectionManagerImpl related tests. This base class is used by tests under
 // common/http as well as test/extensions/filters/http/ext_proc/, to reuse the many mocks/default
 // impls of ConnectionManagerConfig that we need to provide to HttpConnectionManagerImpl.
@@ -36,7 +69,7 @@ public:
   HttpConnectionManagerImplMixin();
   ~HttpConnectionManagerImplMixin() override;
   Tracing::CustomTagConstSharedPtr requestHeaderCustomTag(const std::string& header);
-  void setup(bool ssl, const std::string& server_name, bool tracing = true, bool use_srds = false);
+  void setup(const SetupOpts& opts = {});
   void setupFilterChain(int num_decoder_filters, int num_encoder_filters, int num_requests = 1);
   void setUpBufferLimits();
 
@@ -52,7 +85,7 @@ public:
   void sendRequestHeadersAndData();
   ResponseHeaderMap*
   sendResponseHeaders(ResponseHeaderMapPtr&& response_headers,
-                      absl::optional<StreamInfo::ResponseFlag> response_flag = absl::nullopt,
+                      absl::optional<StreamInfo::CoreResponseFlag> response_flag = absl::nullopt,
                       std::string response_code_details = "details");
   void expectOnDestroy(bool deferred = true);
   void doRemoteClose(bool deferred = true);
@@ -60,7 +93,7 @@ public:
                              const ResponseHeaderMap& expected_response);
 
   // Http::ConnectionManagerConfig
-  const std::list<AccessLog::InstanceSharedPtr>& accessLogs() override { return access_logs_; }
+  const AccessLog::InstanceSharedPtrVector& accessLogs() override { return access_logs_; }
   bool flushAccessLogOnNewRequest() override { return flush_access_log_on_new_request_; }
   bool flushAccessLogOnTunnelSuccessfullyEstablished() const override {
     return flush_log_on_tunnel_successfully_established_;
@@ -85,7 +118,13 @@ public:
   absl::optional<std::chrono::milliseconds> maxConnectionDuration() const override {
     return max_connection_duration_;
   }
+  bool http1SafeMaxConnectionDuration() const override {
+    return http1_safe_max_connection_duration_;
+  }
   std::chrono::milliseconds streamIdleTimeout() const override { return stream_idle_timeout_; }
+  absl::optional<std::chrono::milliseconds> streamFlushTimeout() const override {
+    return stream_flush_timeout_;
+  }
   std::chrono::milliseconds requestTimeout() const override { return request_timeout_; }
   std::chrono::milliseconds requestHeadersTimeout() const override {
     return request_headers_timeout_;
@@ -119,6 +158,7 @@ public:
     return server_transformation_;
   }
   const absl::optional<std::string>& schemeToSet() const override { return scheme_; }
+  bool shouldSchemeMatchUpstream() const override { return scheme_match_upstream_; }
   ConnectionManagerStats& stats() override { return stats_; }
   ConnectionManagerTracingStats& tracingStats() override { return tracing_stats_; }
   bool useRemoteAddress() const override { return use_remote_address_; }
@@ -164,13 +204,14 @@ public:
   const std::vector<Http::EarlyHeaderMutationPtr>& earlyHeaderMutationExtensions() const override {
     return early_header_mutations_;
   }
-  uint64_t maxRequestsPerConnection() const override { return max_requests_per_connection_; }
+  uint32_t maxRequestsPerConnection() const override { return max_requests_per_connection_; }
   const HttpConnectionManagerProto::ProxyStatusConfig* proxyStatusConfig() const override {
     return proxy_status_config_.get();
   }
   ServerHeaderValidatorPtr makeHeaderValidator(Protocol protocol) override {
     return header_validator_factory_.createServerHeaderValidator(protocol, header_validator_stats_);
   }
+  bool appendLocalOverload() const override { return false; }
   bool appendXForwardedPort() const override { return false; }
   bool addProxyProtocolConnectionState() const override {
     return add_proxy_protocol_connection_state_;
@@ -201,6 +242,11 @@ public:
   void expectUhvTrailerCheck(HeaderValidator::ValidationResult validation_result,
                              HeaderValidator::TransformationResult transformation_result,
                              bool expect_response = true);
+  // This method sets-up expectation that UHV will be called and provides real default UHV to
+  // validate headers.
+  void expectCheckWithDefaultUhv();
+
+  Event::MockSchedulableCallback* enableStreamsPerIoLimit(uint32_t limit);
 
   Envoy::Event::SimulatedTimeSystem test_time_;
   NiceMock<Router::MockRouteConfigProvider> route_config_provider_;
@@ -213,7 +259,7 @@ public:
   NiceMock<Runtime::MockLoader> runtime_;
   NiceMock<Envoy::AccessLog::MockAccessLogManager> log_manager_;
   std::string access_log_path_;
-  std::list<AccessLog::InstanceSharedPtr> access_logs_;
+  AccessLog::InstanceSharedPtrVector access_logs_;
   bool flush_access_log_on_new_request_ = false;
   bool flush_log_on_tunnel_successfully_established_ = false;
   absl::optional<std::chrono::milliseconds> access_log_flush_interval_;
@@ -228,6 +274,7 @@ public:
   HttpConnectionManagerProto::ServerHeaderTransformation server_transformation_{
       HttpConnectionManagerProto::OVERWRITE};
   absl::optional<std::string> scheme_;
+  bool scheme_match_upstream_{false};
   Network::Address::Ipv4Instance local_address_{"127.0.0.1"};
   bool use_remote_address_{true};
   Http::DefaultInternalAddressConfig internal_address_config_;
@@ -236,14 +283,16 @@ public:
   absl::optional<std::string> user_agent_;
   uint32_t max_request_headers_kb_{Http::DEFAULT_MAX_REQUEST_HEADERS_KB};
   uint32_t max_request_headers_count_{Http::DEFAULT_MAX_HEADERS_COUNT};
-  uint64_t max_requests_per_connection_{};
+  uint32_t max_requests_per_connection_{};
   absl::optional<std::chrono::milliseconds> idle_timeout_;
   absl::optional<std::chrono::milliseconds> max_connection_duration_;
+  bool http1_safe_max_connection_duration_{false};
   std::chrono::milliseconds stream_idle_timeout_{};
+  absl::optional<std::chrono::milliseconds> stream_flush_timeout_{};
   std::chrono::milliseconds request_timeout_{};
   std::chrono::milliseconds request_headers_timeout_{};
   std::chrono::milliseconds delayed_close_timeout_{};
-  absl::optional<std::chrono::milliseconds> max_stream_duration_{};
+  absl::optional<std::chrono::milliseconds> max_stream_duration_;
   NiceMock<Random::MockRandomGenerator> random_;
   NiceMock<LocalInfo::MockLocalInfo> local_info_;
   NiceMock<Server::Configuration::MockFactoryContext> factory_context_;
@@ -272,8 +321,8 @@ public:
   NiceMock<Network::MockClientConnection> upstream_conn_; // for websocket tests
   NiceMock<Tcp::ConnectionPool::MockInstance> conn_pool_; // for websocket tests
   RequestIDExtensionSharedPtr request_id_extension_;
-  std::vector<Http::OriginalIPDetectionSharedPtr> ip_detection_extensions_{};
-  std::vector<Http::EarlyHeaderMutationPtr> early_header_mutations_{};
+  std::vector<Http::OriginalIPDetectionSharedPtr> ip_detection_extensions_;
+  std::vector<Http::EarlyHeaderMutationPtr> early_header_mutations_;
   bool add_proxy_protocol_connection_state_ = true;
 
   const LocalReply::LocalReplyPtr local_reply_;
@@ -290,6 +339,10 @@ public:
   std::unique_ptr<HttpConnectionManagerProto::ProxyStatusConfig> proxy_status_config_;
   NiceMock<MockHeaderValidatorFactory> header_validator_factory_;
   NiceMock<MockHeaderValidatorStats> header_validator_stats_;
+  envoy::extensions::http::header_validators::envoy_default::v3::HeaderValidatorConfig
+      header_validator_config_;
+  Extensions::Http::HeaderValidators::EnvoyDefault::ConfigOverrides
+      header_validator_config_overrides_;
 };
 
 class HttpConnectionManagerImplTest : public HttpConnectionManagerImplMixin,

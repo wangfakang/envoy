@@ -35,6 +35,17 @@ template <class T> struct OptRef {
   }
 
   /**
+   * Cast operator to extract a ref to U from this, assuming T*
+   * is assignable to U*. For example, if U* is const T, or t is derived
+   * from U.
+   *
+   * @return a ref to the converted object.
+   */
+  template <class U> operator OptRef<U>() {
+    return ptr_ == nullptr ? absl::nullopt : OptRef<U>(*ptr_);
+  }
+
+  /**
    * Helper to call a const method on T. The caller is responsible for ensuring
    * has_value() is true.
    */
@@ -48,17 +59,19 @@ template <class T> struct OptRef {
   /**
    * Helper to convert a OptRef into a ref. Behavior if !has_value() is undefined.
    */
-  T& ref() const { return *ptr_; }
+  T& ref() const { return *ptr_; } // NOLINT(clang-analyzer-core.uninitialized.UndefReturn)
 
   /**
    * Helper to dereference an OptRef. Behavior if !has_value() is undefined.
    */
-  T& operator*() const { return *ptr_; }
+  T& operator*() const { return *ptr_; } // NOLINT(clang-analyzer-core.uninitialized.UndefReturn)
 
   /**
    * @return true if the object has a value.
    */
   bool has_value() const { return ptr_ != nullptr; }
+
+  T& value_or(T& other) const { return has_value() ? *ptr_ : other; }
 
   /**
    * @return true if the object has a value.

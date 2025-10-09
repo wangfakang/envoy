@@ -12,6 +12,12 @@ namespace Envoy {
 namespace Fuzz {
 
 DEFINE_FUZZER(const uint8_t* buf, size_t len) {
+  // Cap the input string by 32KiB. The fuzzer should be able to detect issues
+  // for smaller inputs.
+  if (len > 32 * 1024) {
+    ENVOY_LOG_MISC(warn, "The input buffer is longer than 32KiB, skipping");
+    return;
+  }
   FuzzedDataProvider provider(buf, len);
   std::string buffer1, buffer2, errmsg;
   while (provider.remaining_bytes() != 0) {
@@ -27,6 +33,11 @@ DEFINE_FUZZER(const uint8_t* buf, size_t len) {
       absl::string_view proto_sanitized = Envoy::Json::stripDoubleQuotes(buffer2);
       RELEASE_ASSERT(Envoy::Json::TestUtil::utf8Equivalent(sanitized, proto_sanitized, errmsg),
                      errmsg);
+    } else {
+      std::string decoded, errmsg;
+      EXPECT_TRUE(Json::TestUtil::decodeEscapedJson(sanitized, decoded, errmsg))
+          << input << ": " << errmsg;
+      EXPECT_EQ(input, decoded);
     }
   }
 }

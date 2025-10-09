@@ -19,7 +19,7 @@ namespace Ssl {
 //
 // When adding or changing this interface, it is likely that a change is needed to
 // `DefaultCertValidator::updateDigestForSessionId` in
-// `source/extensions/transport_sockets/tls/cert_validator/default_validator.cc`.
+// `source/common/tls/cert_validator/default_validator.cc`.
 class CertificateValidationContextConfig {
 public:
   virtual ~CertificateValidationContextConfig() = default;
@@ -34,6 +34,11 @@ public:
    * if the CA certificate was inlined.
    */
   virtual const std::string& caCertPath() const PURE;
+
+  /**
+   * @return the name of the CA certificate.
+   */
+  virtual const std::string& caCertName() const PURE;
 
   /**
    * @return The CRL to check if a cert is revoked.
@@ -94,6 +99,18 @@ public:
    * @return the max depth used when verifying the certificate-chain
    */
   virtual absl::optional<uint32_t> maxVerifyDepth() const PURE;
+
+  /**
+   * @return true if the SAN validation rules should be replaced with a rule to validate that the
+   * certificate matches the transmitted SNI.
+   */
+  virtual bool autoSniSanMatch() const PURE;
+
+  // SECURITY NOTE
+  //
+  // When adding or changing this interface, it is likely that a change is needed to
+  // `DefaultCertValidator::updateDigestForSessionId` in
+  // `source/common/tls/cert_validator/default_validator.cc`.
 };
 
 using CertificateValidationContextConfigPtr = std::unique_ptr<CertificateValidationContextConfig>;

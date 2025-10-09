@@ -506,13 +506,13 @@ public:
    *        If set to non-zero, overflow callbacks will be called if the
    *        buffered data exceeds watermark * overflow_multiplier.
    */
-  virtual void setWatermarks(uint32_t watermark, uint32_t overflow_multiplier = 0) PURE;
+  virtual void setWatermarks(uint64_t watermark, uint32_t overflow_multiplier = 0) PURE;
 
   /**
    * Returns the configured high watermark. A return value of 0 indicates that watermark
    * functionality is disabled.
    */
-  virtual uint32_t highWatermark() const PURE;
+  virtual uint64_t highWatermark() const PURE;
   /**
    * Determine if the buffer watermark trigger condition is currently set. The watermark trigger is
    * set when the buffer size exceeds the configured high watermark and is cleared once the buffer
@@ -647,7 +647,7 @@ public:
   // The following are for use only by implementations of Buffer. Because c++
   // doesn't allow inheritance of friendship, these are just trying to make
   // misuse easy to spot in a code review.
-  static Reservation bufferImplUseOnlyConstruct(Instance& buffer) { return Reservation(buffer); }
+  static Reservation bufferImplUseOnlyConstruct(Instance& buffer) { return {buffer}; }
   decltype(slices_)& bufferImplUseOnlySlices() { return slices_; }
   ReservationSlicesOwnerPtr& bufferImplUseOnlySlicesOwner() { return slices_owner_; }
   void bufferImplUseOnlySetLength(uint64_t length) { length_ = length; }
@@ -708,9 +708,7 @@ public:
   // The following are for use only by implementations of Buffer. Because c++
   // doesn't allow inheritance of friendship, these are just trying to make
   // misuse easy to spot in a code review.
-  static ReservationSingleSlice bufferImplUseOnlyConstruct(Instance& buffer) {
-    return ReservationSingleSlice(buffer);
-  }
+  static ReservationSingleSlice bufferImplUseOnlyConstruct(Instance& buffer) { return {buffer}; }
   RawSlice& bufferImplUseOnlySlice() { return slice_; }
   ReservationSlicesOwnerPtr& bufferImplUseOnlySliceOwner() { return slice_owner_; }
 };

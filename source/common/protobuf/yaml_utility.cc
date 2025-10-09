@@ -17,6 +17,7 @@
 #include "absl/strings/match.h"
 #include "udpa/annotations/sensitive.pb.h"
 #include "udpa/annotations/status.pb.h"
+#include "utf8_validity.h"
 #include "validate/validate.h"
 #include "xds/annotations/v3/status.pb.h"
 #include "yaml-cpp/yaml.h"
@@ -41,11 +42,11 @@ void blockFormat(YAML::Node node) {
   }
 }
 
-ProtobufWkt::Value parseYamlNode(const YAML::Node& node) {
-  ProtobufWkt::Value value;
+Protobuf::Value parseYamlNode(const YAML::Node& node) {
+  Protobuf::Value value;
   switch (node.Type()) {
   case YAML::NodeType::Null:
-    value.set_null_value(ProtobufWkt::NULL_VALUE);
+    value.set_null_value(Protobuf::NULL_VALUE);
     break;
   case YAML::NodeType::Scalar: {
     if (node.Tag() == "!") {
@@ -62,7 +63,7 @@ ProtobufWkt::Value parseYamlNode(const YAML::Node& node) {
       if (std::numeric_limits<int32_t>::min() <= int_value &&
           std::numeric_limits<int32_t>::max() >= int_value) {
         // We could convert all integer values to string but it will break some stuff relying on
-        // ProtobufWkt::Struct itself, only convert small numbers into number_value here.
+        // Protobuf::Struct itself, only convert small numbers into number_value here.
         value.set_number_value(int_value);
       } else {
         // Proto3 JSON mapping allows use string for integer, this still has to be converted from
@@ -114,26 +115,26 @@ void jsonConvertInternal(const Protobuf::Message& source,
 
 } // namespace
 
-void MessageUtil::loadFromJson(const std::string& json, Protobuf::Message& message,
+void MessageUtil::loadFromJson(absl::string_view json, Protobuf::Message& message,
                                ProtobufMessage::ValidationVisitor& validation_visitor) {
   bool has_unknown_field;
-  auto status = loadFromJsonNoThrow(json, message, has_unknown_field);
-  if (status.ok()) {
+  auto load_status = loadFromJsonNoThrow(json, message, has_unknown_field);
+  if (load_status.ok()) {
     return;
   }
   if (has_unknown_field) {
     // If the parsing failure is caused by the unknown fields.
-    validation_visitor.onUnknownField("type " + message.GetTypeName() + " reason " +
-                                      status.ToString());
+    THROW_IF_NOT_OK(validation_visitor.onUnknownField(
+        fmt::format("type {} reason {}", message.GetTypeName(), load_status.ToString())));
   } else {
     // If the error has nothing to do with unknown field.
-    throw EnvoyException("Unable to parse JSON as proto (" + status.ToString() + "): " + json);
+    throw EnvoyException(
+        fmt::format("Unable to parse JSON as proto ({}): {}", load_status.ToString(), json));
   }
 }
 
-Protobuf::util::Status MessageUtil::loadFromJsonNoThrow(const std::string& json,
-                                                        Protobuf::Message& message,
-                                                        bool& has_unknown_fileld) {
+absl::Status MessageUtil::loadFromJsonNoThrow(absl::string_view json, Protobuf::Message& message,
+                                              bool& has_unknown_fileld) {
   has_unknown_fileld = false;
   Protobuf::util::JsonParseOptions options;
   options.case_insensitive_enum_parsing = true;
@@ -163,7 +164,7 @@ Protobuf::util::Status MessageUtil::loadFromJsonNoThrow(const std::string& json,
   return relaxed_status;
 }
 
-void MessageUtil::loadFromJson(const std::string& json, ProtobufWkt::Struct& message) {
+void MessageUtil::loadFromJson(absl::string_view json, Protobuf::Struct& message) {
   // No need to validate if converting to a Struct, since there are no unknown
   // fields possible.
   loadFromJson(json, message, ProtobufMessage::getNullValidationVisitor());
@@ -171,42 +172,13 @@ void MessageUtil::loadFromJson(const std::string& json, ProtobufWkt::Struct& mes
 
 void MessageUtil::loadFromYaml(const std::string& yaml, Protobuf::Message& message,
                                ProtobufMessage::ValidationVisitor& validation_visitor) {
-  ProtobufWkt::Value value = ValueUtil::loadFromYaml(yaml);
-  if (value.kind_case() == ProtobufWkt::Value::kStructValue ||
-      value.kind_case() == ProtobufWkt::Value::kListValue) {
+  Protobuf::Value value = ValueUtil::loadFromYaml(yaml);
+  if (value.kind_case() == Protobuf::Value::kStructValue ||
+      value.kind_case() == Protobuf::Value::kListValue) {
     jsonConvertInternal(value, validation_visitor, message);
     return;
   }
   throw EnvoyException("Unable to convert YAML as JSON: " + yaml);
-}
-
-void MessageUtil::loadFromFile(const std::string& path, Protobuf::Message& message,
-                               ProtobufMessage::ValidationVisitor& validation_visitor,
-                               Api::Api& api) {
-  const std::string contents = api.fileSystem().fileReadToEnd(path);
-  // If the filename ends with .pb, attempt to parse it as a binary proto.
-  if (absl::EndsWithIgnoreCase(path, FileExtensions::get().ProtoBinary)) {
-    // Attempt to parse the binary format.
-    if (message.ParseFromString(contents)) {
-      MessageUtil::checkForUnexpectedFields(message, validation_visitor);
-    }
-    return;
-  }
-
-  // If the filename ends with .pb_text, attempt to parse it as a text proto.
-  if (absl::EndsWithIgnoreCase(path, FileExtensions::get().ProtoText)) {
-    if (Protobuf::TextFormat::ParseFromString(contents, &message)) {
-      return;
-    }
-    throw EnvoyException("Unable to parse file \"" + path + "\" as a text protobuf (type " +
-                         message.GetTypeName() + ")");
-  }
-  if (absl::EndsWithIgnoreCase(path, FileExtensions::get().Yaml) ||
-      absl::EndsWithIgnoreCase(path, FileExtensions::get().Yml)) {
-    loadFromYaml(contents, message, validation_visitor);
-  } else {
-    loadFromJson(contents, message, validation_visitor);
-  }
 }
 
 std::string MessageUtil::getYamlStringFromMessage(const Protobuf::Message& message,
@@ -238,7 +210,7 @@ std::string MessageUtil::getYamlStringFromMessage(const Protobuf::Message& messa
   return out.c_str();
 }
 
-ProtobufUtil::StatusOr<std::string>
+absl::StatusOr<std::string>
 MessageUtil::getJsonStringFromMessage(const Protobuf::Message& message, const bool pretty_print,
                                       const bool always_print_primitive_fields) {
   Protobuf::util::JsonPrintOptions json_options;
@@ -252,7 +224,7 @@ MessageUtil::getJsonStringFromMessage(const Protobuf::Message& message, const bo
   // Primitive types such as int32s and enums will not be serialized if they have the default value.
   // This flag disables that behavior.
   if (always_print_primitive_fields) {
-    json_options.always_print_primitive_fields = true;
+    json_options.always_print_fields_with_no_presence = true;
   }
   std::string json;
   if (auto status = Protobuf::util::MessageToJsonString(message, &json, json_options);
@@ -276,20 +248,20 @@ void MessageUtil::jsonConvert(const Protobuf::Message& source, Protobuf::Message
   jsonConvertInternal(source, ProtobufMessage::getNullValidationVisitor(), dest);
 }
 
-void MessageUtil::jsonConvert(const Protobuf::Message& source, ProtobufWkt::Struct& dest) {
+void MessageUtil::jsonConvert(const Protobuf::Message& source, Protobuf::Struct& dest) {
   // Any proto3 message can be transformed to Struct, so there is no need to check for unknown
   // fields. There is one catch; Duration/Timestamp etc. which have non-object canonical JSON
   // representations don't work.
   jsonConvertInternal(source, ProtobufMessage::getNullValidationVisitor(), dest);
 }
 
-void MessageUtil::jsonConvert(const ProtobufWkt::Struct& source,
+void MessageUtil::jsonConvert(const Protobuf::Struct& source,
                               ProtobufMessage::ValidationVisitor& validation_visitor,
                               Protobuf::Message& dest) {
   jsonConvertInternal(source, validation_visitor, dest);
 }
 
-bool MessageUtil::jsonConvertValue(const Protobuf::Message& source, ProtobufWkt::Value& dest) {
+bool MessageUtil::jsonConvertValue(const Protobuf::Message& source, Protobuf::Value& dest) {
   Protobuf::util::JsonPrintOptions json_options;
   json_options.preserve_proto_field_names = true;
   std::string json;
@@ -305,7 +277,7 @@ bool MessageUtil::jsonConvertValue(const Protobuf::Message& source, ProtobufWkt:
   return false;
 }
 
-ProtobufWkt::Value ValueUtil::loadFromYaml(const std::string& yaml) {
+Protobuf::Value ValueUtil::loadFromYaml(const std::string& yaml) {
   TRY_ASSERT_MAIN_THREAD { return parseYamlNode(YAML::Load(yaml)); }
   END_TRY
   catch (YAML::ParserException& e) {
@@ -323,33 +295,31 @@ ProtobufWkt::Value ValueUtil::loadFromYaml(const std::string& yaml) {
   }
 }
 
-std::string MessageUtil::sanitizeUtf8String(absl::string_view input) {
-  if (!Runtime::runtimeFeatureEnabled(
-          "envoy.reloadable_features.service_sanitize_non_utf8_strings")) {
-    return std::string(input);
-  }
+namespace {
 
-  // This returns the original string if it was already valid, and returns a pointer to
-  // `result.data()` if it needed to coerce. The coerced string is always
-  // the same length as the source string.
-  //
-  // Initializing `result` to `input` ensures that `result` is correctly sized to receive the
-  // modified string, or in the case where no modification is needed it already contains the correct
-  // value, so `result` can be returned in both cases.
-  //
+// This is a modified copy of the UTF8CoerceToStructurallyValid from the protobuf code.
+// A copy was needed after if was removed from the protobuf.
+std::string utf8CoerceToStructurallyValid(absl::string_view str, const char replace_char) {
+  std::string result(str);
+  auto replace_pos = result.begin();
+  while (!str.empty()) {
+    size_t n_valid_bytes = utf8_range::SpanStructurallyValid(str);
+    if (n_valid_bytes == str.size()) {
+      break;
+    }
+    replace_pos += n_valid_bytes;
+    *replace_pos++ = replace_char; // replace one bad byte
+    str.remove_prefix(n_valid_bytes + 1);
+  }
+  return result;
+}
+
+} // namespace
+
+std::string MessageUtil::sanitizeUtf8String(absl::string_view input) {
   // The choice of '!' is somewhat arbitrary, but we wanted to avoid any character that has
   // special semantic meaning in URLs or similar.
-  std::string result(input);
-  const char* sanitized = google::protobuf::internal::UTF8CoerceToStructurallyValid(
-      google::protobuf::StringPiece(input.data(), input.length()), result.data(), '!');
-  ASSERT(sanitized == result.data() || sanitized == input.data());
-
-  // Validate requirement that if the input string is returned from
-  // `UTF8CoerceToStructurallyValid`, no modification was made to result so it still contains the
-  // correct return value.
-  ASSERT(sanitized == result.data() || result == input);
-
-  return result;
+  return utf8CoerceToStructurallyValid(input, '!');
 }
 
 } // namespace Envoy

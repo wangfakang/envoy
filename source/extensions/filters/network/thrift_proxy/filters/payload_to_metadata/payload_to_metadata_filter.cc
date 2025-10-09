@@ -20,15 +20,18 @@ using FieldSelector = envoy::extensions::filters::network::thrift_proxy::filters
     payload_to_metadata::v3::PayloadToMetadata::FieldSelector;
 
 Config::Config(const envoy::extensions::filters::network::thrift_proxy::filters::
-                   payload_to_metadata::v3::PayloadToMetadata& config) {
-  trie_root_ = std::make_shared<Trie>();
+                   payload_to_metadata::v3::PayloadToMetadata& config,
+               Regex::Engine& regex_engine) {
+  trie_root_ = std::make_shared<PayloadExtractor::Trie>();
   request_rules_.reserve(config.request_rules().size());
   for (const auto& entry : config.request_rules()) {
-    request_rules_.emplace_back(entry, static_cast<uint16_t>(request_rules_.size()), trie_root_);
+    request_rules_.emplace_back(entry, static_cast<uint16_t>(request_rules_.size()), trie_root_,
+                                regex_engine);
   }
 }
 
-Rule::Rule(const ProtoRule& rule, uint16_t rule_id, TrieSharedPtr root)
+Rule::Rule(const ProtoRule& rule, uint16_t rule_id, PayloadExtractor::TrieSharedPtr root,
+           Regex::Engine& regex_engine)
     : rule_(rule), rule_id_(rule_id) {
   if (!rule_.has_on_present() && !rule_.has_on_missing()) {
     throw EnvoyException("payload to metadata filter: neither `on_present` nor `on_missing` set");
@@ -41,7 +44,9 @@ Rule::Rule(const ProtoRule& rule, uint16_t rule_id, TrieSharedPtr root)
 
   if (rule_.has_on_present() && rule_.on_present().has_regex_value_rewrite()) {
     const auto& rewrite_spec = rule_.on_present().regex_value_rewrite();
-    regex_rewrite_ = Regex::Utility::parseRegex(rewrite_spec.pattern());
+    regex_rewrite_ =
+        THROW_OR_RETURN_VALUE(Regex::Utility::parseRegex(rewrite_spec.pattern(), regex_engine),
+                              Regex::CompiledMatcherPtr);
     regex_rewrite_substitution_ = rewrite_spec.substitution();
   }
 
@@ -62,30 +67,22 @@ Rule::Rule(const ProtoRule& rule, uint16_t rule_id, TrieSharedPtr root)
     PANIC_DUE_TO_CORRUPT_ENUM;
   }
 
-  const FieldSelector* field_selector = &rule_.field_selector();
-  TrieSharedPtr node = root;
-  while (true) {
-    int16_t id = static_cast<int16_t>(field_selector->id());
-    if (node->children_.find(id) == node->children_.end()) {
-      node->children_[id] = std::make_shared<Trie>(node);
-    }
-    node = node->children_[id];
-    node->name_ = field_selector->name();
-    if (!field_selector->has_child()) {
-      break;
-    }
-
-    field_selector = &field_selector->child();
-  }
-
-  node->rule_ids_.push_back(rule_id_);
+  root->insert<FieldSelector>(&rule_.field_selector(), rule_id_);
 }
 
 bool Rule::matches(const ThriftProxy::MessageMetadata& metadata) const {
   if (match_type_ == MatchType::MethodName) {
     const std::string& method_name{method_or_service_name_};
-    return method_name.empty() ||
-           (metadata.hasMethodName() && metadata.methodName() == method_name);
+    if (method_name.empty()) {
+      return true;
+    }
+
+    const std::string& metadata_method_name = metadata.hasMethodName() ? metadata.methodName() : "";
+    const auto func_pos = metadata_method_name.find(':');
+    if (func_pos != std::string::npos) {
+      return metadata_method_name.substr(func_pos + 1) == method_name;
+    }
+    return metadata_method_name == method_name;
   }
   ASSERT(match_type_ == MatchType::ServiceName);
   const std::string& service_name{method_or_service_name_};
@@ -93,81 +90,12 @@ bool Rule::matches(const ThriftProxy::MessageMetadata& metadata) const {
          (metadata.hasMethodName() && absl::StartsWith(metadata.methodName(), service_name));
 }
 
-FilterStatus TrieMatchHandler::messageEnd() {
-  ENVOY_LOG(trace, "TrieMatchHandler messageEnd");
-  parent_.handleOnMissing();
-  complete_ = true;
-  return FilterStatus::Continue;
-}
-
-FilterStatus TrieMatchHandler::structBegin(absl::string_view) {
-  ENVOY_LOG(trace, "TrieMatchHandler structBegin id:{}",
-            last_field_id_.has_value() ? std::to_string(last_field_id_.value())
-                                       : "top_level_struct");
-  ASSERT(node_);
-  if (last_field_id_.has_value()) {
-    if (steps_ == 0 && node_->children_.find(last_field_id_.value()) != node_->children_.end()) {
-      node_ = node_->children_[last_field_id_.value()];
-      ENVOY_LOG(trace, "name: {}", node_->name_);
-    } else {
-      steps_++;
-    }
-  }
-  return FilterStatus::Continue;
-}
-
-FilterStatus TrieMatchHandler::structEnd() {
-  ENVOY_LOG(trace, "TrieMatchHandler structEnd");
-  ASSERT(node_);
-  if (steps_ > 0) {
-    steps_--;
-  } else if (node_->parent_.lock()) {
-    node_ = node_->parent_.lock();
-  } else {
-    // last decoder event
-    node_ = nullptr;
-  }
-  return FilterStatus::Continue;
-}
-
-FilterStatus TrieMatchHandler::fieldBegin(absl::string_view, FieldType&, int16_t& field_id) {
-  last_field_id_ = field_id;
-  return FilterStatus::Continue;
-}
-
-FilterStatus TrieMatchHandler::fieldEnd() {
-  last_field_id_.reset();
-  return FilterStatus::Continue;
-}
-
-FilterStatus TrieMatchHandler::stringValue(absl::string_view value) {
-  ASSERT(last_field_id_.has_value());
-  ENVOY_LOG(trace, "TrieMatchHandler stringValue id:{} value:{}", last_field_id_.value(), value);
-  return handleString(static_cast<std::string>(value));
-}
-
-template <typename NumberType> FilterStatus TrieMatchHandler::numberValue(NumberType value) {
-  ASSERT(last_field_id_.has_value());
-  ENVOY_LOG(trace, "TrieMatchHandler numberValue id:{} value:{}", last_field_id_.value(), value);
-  return handleString(std::to_string(value));
-}
-
-FilterStatus TrieMatchHandler::handleString(std::string value) {
-  ASSERT(node_);
-  ASSERT(last_field_id_.has_value());
-  if (steps_ == 0 && node_->children_.find(last_field_id_.value()) != node_->children_.end() &&
-      !node_->children_[last_field_id_.value()]->rule_ids_.empty()) {
-    auto on_present_node = node_->children_[last_field_id_.value()];
-    ENVOY_LOG(trace, "name: {}", on_present_node->name_);
-    parent_.handleOnPresent(std::move(value), on_present_node->rule_ids_);
-  }
-  return FilterStatus::Continue;
-}
-
 PayloadToMetadataFilter::PayloadToMetadataFilter(const ConfigSharedPtr config) : config_(config) {}
 
-void PayloadToMetadataFilter::handleOnPresent(std::string&& value,
-                                              const std::vector<uint16_t>& rule_ids) {
+void PayloadToMetadataFilter::handleOnPresent(
+    absl::variant<absl::string_view, int64_t, double> value, const std::vector<uint16_t>& rule_ids,
+    bool is_request) {
+  ASSERT(is_request); // Currently we only support request rules.
   for (uint16_t rule_id : rule_ids) {
     if (matched_rule_ids_.find(rule_id) == matched_rule_ids_.end()) {
       ENVOY_LOG(trace, "rule_id {} is not matched.", rule_id);
@@ -178,20 +106,31 @@ void PayloadToMetadataFilter::handleOnPresent(std::string&& value,
     matched_rule_ids_.erase(rule_id);
     ASSERT(rule_id < config_->requestRules().size());
     const Rule& rule = config_->requestRules()[rule_id];
-    if (!value.empty() && rule.rule().has_on_present()) {
+    std::string value_str;
+    if (absl::holds_alternative<absl::string_view>(value)) {
+      value_str = absl::get<absl::string_view>(value);
+    } else if (absl::holds_alternative<int64_t>(value)) {
+      value_str = std::to_string(absl::get<int64_t>(value));
+    } else {
+      value_str = std::to_string(absl::get<double>(value));
+    }
+
+    if (!value_str.empty() && rule.rule().has_on_present()) {
       // We can *not* always std::move(value) here since we need `value` if multiple rules are
       // matched. Optimize the most common usage, which is one rule per payload field.
       if (rule_ids.size() == 1) {
-        applyKeyValue(std::move(value), rule, rule.rule().on_present());
+        applyKeyValue(std::move(value_str), rule, rule.rule().on_present());
         break;
       } else {
-        applyKeyValue(value, rule, rule.rule().on_present());
+        applyKeyValue(value_str, rule, rule.rule().on_present());
       }
     }
   }
 }
 
-void PayloadToMetadataFilter::handleOnMissing() {
+void PayloadToMetadataFilter::handleComplete(bool is_request) {
+  ASSERT(is_request); // Currently we only support request rules.
+
   ENVOY_LOG(trace, "{} rules missing", matched_rule_ids_.size());
 
   for (uint16_t rule_id : matched_rule_ids_) {
@@ -213,7 +152,7 @@ const std::string& PayloadToMetadataFilter::decideNamespace(const std::string& n
 
 bool PayloadToMetadataFilter::addMetadata(const std::string& meta_namespace, const std::string& key,
                                           std::string value, ValueType type) {
-  ProtobufWkt::Value val;
+  Protobuf::Value val;
   ASSERT(!value.empty());
 
   if (value.size() >= MAX_PAYLOAD_VALUE_LEN) {
@@ -244,15 +183,8 @@ bool PayloadToMetadataFilter::addMetadata(const std::string& meta_namespace, con
   }
   }
 
-  // Have we seen this namespace before?
-  auto namespace_iter = structs_by_namespace_.find(meta_namespace);
-  if (namespace_iter == structs_by_namespace_.end()) {
-    structs_by_namespace_[meta_namespace] = ProtobufWkt::Struct();
-    namespace_iter = structs_by_namespace_.find(meta_namespace);
-  }
-
-  auto& keyval = namespace_iter->second;
-  (*keyval.mutable_fields())[key] = val;
+  auto& keyval = structs_by_namespace_[meta_namespace];
+  (*keyval.mutable_fields())[key] = std::move(val);
 
   return true;
 }
@@ -300,9 +232,28 @@ FilterStatus PayloadToMetadataFilter::messageBegin(MessageMetadataSharedPtr meta
   return FilterStatus::Continue;
 }
 
+static std::string getHexRepresentation(Buffer::Instance& data) {
+  void* buf = data.linearize(static_cast<uint32_t>(data.length()));
+  const unsigned char* linearized_data = static_cast<const unsigned char*>(buf);
+  std::stringstream hex_stream;
+  for (uint32_t i = 0; i < data.length(); ++i) {
+    // Convert each byte to a two-digit hexadecimal representation
+    hex_stream << std::setfill('0') << std::setw(2) << std::hex
+               << static_cast<int>(linearized_data[i]);
+    if (i != data.length() - 1) {
+      // Append a space after each character except the last one
+      hex_stream << ' ';
+    }
+  }
+  std::string hex_representation = hex_stream.str();
+  std::transform(hex_representation.begin(), hex_representation.end(), hex_representation.begin(),
+                 ::toupper);
+  return hex_representation;
+}
+
 FilterStatus PayloadToMetadataFilter::passthroughData(Buffer::Instance& data) {
   if (!matched_rule_ids_.empty()) {
-    TrieMatchHandler handler(*this, config_->trieRoot());
+    PayloadExtractor::TrieMatchHandler handler(*this, config_->trieRoot());
     ProtocolPtr protocol = createProtocol(decoder_callbacks_->downstreamProtocolType());
 
     // TODO(kuochunghsu): avoid copying payload https://github.com/envoyproxy/envoy/issues/23901
@@ -311,8 +262,15 @@ FilterStatus PayloadToMetadataFilter::passthroughData(Buffer::Instance& data) {
 
     DecoderStateMachinePtr state_machine =
         std::make_unique<DecoderStateMachine>(*protocol, metadata_, handler, handler);
-    state_machine->runPassthroughData(data_copy);
-
+    TRY_NEEDS_AUDIT { state_machine->runPassthroughData(data_copy); }
+    END_TRY
+    CATCH(const EnvoyException& e, {
+      IS_ENVOY_BUG(fmt::format("decoding error, error_message: {}, payload: {}", e.what(),
+                               getHexRepresentation(data)));
+      if (!handler.isComplete()) {
+        handleComplete(true);
+      }
+    });
     finalizeDynamicMetadata();
   }
 

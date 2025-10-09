@@ -28,12 +28,13 @@
 #include "test/common/http/common.h"
 #include "test/common/upstream/utility.h"
 #include "test/mocks/access_log/mocks.h"
-#include "test/mocks/api/mocks.h"
 #include "test/mocks/common.h"
 #include "test/mocks/http/mocks.h"
 #include "test/mocks/network/mocks.h"
 #include "test/mocks/protobuf/mocks.h"
 #include "test/mocks/runtime/mocks.h"
+#include "test/mocks/server/factory_context.h"
+#include "test/mocks/server/health_checker_factory_context.h"
 #include "test/mocks/upstream/cluster_info.h"
 #include "test/mocks/upstream/cluster_priority_set.h"
 #include "test/mocks/upstream/health_check_event_logger.h"
@@ -76,15 +77,12 @@ TEST(HealthCheckerFactoryTest, GrpcHealthCheckHTTP2NotConfiguredException) {
   EXPECT_CALL(*cluster.info_, features()).WillRepeatedly(Return(0));
 
   Runtime::MockLoader runtime;
-  Event::MockDispatcher dispatcher;
-  AccessLog::MockAccessLogManager log_manager;
-  NiceMock<ProtobufMessage::MockValidationVisitor> validation_visitor;
-  Api::MockApi api;
+  NiceMock<Server::Configuration::MockServerFactoryContext> server_context;
 
-  EXPECT_THROW_WITH_MESSAGE(
-      HealthCheckerFactory::create(createGrpcHealthCheckConfig(), cluster, runtime, dispatcher,
-                                   log_manager, validation_visitor, api),
-      EnvoyException, "fake_cluster cluster must support HTTP/2 for gRPC healthchecking");
+  EXPECT_EQ(HealthCheckerFactory::create(createGrpcHealthCheckConfig(), cluster, server_context)
+                .status()
+                .message(),
+            "fake_cluster cluster must support HTTP/2 for gRPC healthchecking");
 }
 
 TEST(HealthCheckerFactoryTest, CreateGrpc) {
@@ -93,21 +91,25 @@ TEST(HealthCheckerFactoryTest, CreateGrpc) {
   EXPECT_CALL(*cluster.info_, features())
       .WillRepeatedly(Return(Upstream::ClusterInfo::Features::HTTP2));
 
-  Runtime::MockLoader runtime;
-  Event::MockDispatcher dispatcher;
-  AccessLog::MockAccessLogManager log_manager;
-  NiceMock<ProtobufMessage::MockValidationVisitor> validation_visitor;
-  NiceMock<Api::MockApi> api;
+  NiceMock<Server::Configuration::MockServerFactoryContext> server_context;
 
   EXPECT_NE(nullptr,
             dynamic_cast<GrpcHealthCheckerImpl*>(
-                HealthCheckerFactory::create(createGrpcHealthCheckConfig(), cluster, runtime,
-                                             dispatcher, log_manager, validation_visitor, api)
+                HealthCheckerFactory::create(createGrpcHealthCheckConfig(), cluster, server_context)
+                    .value()
                     .get()));
 }
 
 class HealthCheckerTestBase {
 public:
+  HealthCheckerTestBase() {
+    ON_CALL(context_, mainThreadDispatcher()).WillByDefault(ReturnRef(dispatcher_));
+    ON_CALL(context_.api_, randomGenerator()).WillByDefault(ReturnRef(random_));
+    ON_CALL(context_, runtime()).WillByDefault(ReturnRef(runtime_));
+    ON_CALL(context_.server_context_, mainThreadDispatcher()).WillByDefault(ReturnRef(dispatcher_));
+    ON_CALL(context_.server_context_.api_, randomGenerator()).WillByDefault(ReturnRef(random_));
+    ON_CALL(context_.server_context_, runtime()).WillByDefault(ReturnRef(runtime_));
+  }
   std::shared_ptr<MockClusterMockPrioritySet> cluster_{
       std::make_shared<NiceMock<MockClusterMockPrioritySet>>()};
   NiceMock<Event::MockDispatcher> dispatcher_;
@@ -116,6 +118,7 @@ public:
   MockHealthCheckEventLogger& event_logger_{*event_logger_storage_};
   NiceMock<Random::MockRandomGenerator> random_;
   NiceMock<Runtime::MockLoader> runtime_;
+  NiceMock<Server::Configuration::MockHealthCheckerFactoryContext> context_;
 };
 
 class TestHttpHealthCheckerImpl : public HttpHealthCheckerImpl {
@@ -152,17 +155,17 @@ public:
       absl::node_hash_map<std::string,
                           const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig>;
 
-  HttpHealthCheckerImplTest() : engine_(std::make_unique<Regex::GoogleReEngine>()) {}
+  HttpHealthCheckerImplTest() = default;
 
   void allocHealthChecker(const std::string& yaml) {
     health_checker_ = std::make_shared<TestHttpHealthCheckerImpl>(
-        *cluster_, parseHealthCheckFromV3Yaml(yaml), dispatcher_, runtime_, random_,
+        *cluster_, parseHealthCheckFromV3Yaml(yaml), context_,
         HealthCheckEventLoggerPtr(event_logger_storage_.release()));
   }
 
   void addCompletionCallback() {
     health_checker_->addHostCheckCompleteCb(
-        [this](HostSharedPtr host, HealthTransition changed_state) -> void {
+        [this](HostSharedPtr host, HealthTransition changed_state, HealthState) -> void {
           onHostStatus(host, changed_state);
         });
   }
@@ -310,6 +313,25 @@ public:
         prefix: locations
       path: /healthcheck
     always_log_health_check_failures: true
+    )EOF";
+
+    allocHealthChecker(yaml);
+    addCompletionCallback();
+  }
+
+  void setupNoServiceValidationHCAlwaysLogSuccess() {
+    const std::string yaml = R"EOF(
+    timeout: 1s
+    interval: 1s
+    no_traffic_interval: 5s
+    interval_jitter: 1s
+    unhealthy_threshold: 2
+    healthy_threshold: 1
+    http_health_check:
+      service_name_matcher:
+        prefix: locations
+      path: /healthcheck
+    always_log_health_check_success: true
     )EOF";
 
     allocHealthChecker(yaml);
@@ -577,8 +599,8 @@ public:
                        const HostWithHealthCheckMap& hosts, const std::string& protocol = "tcp://",
                        const uint32_t priority = 0) {
     for (const auto& host : hosts) {
-      cluster->prioritySet().getMockHostSet(priority)->hosts_.emplace_back(makeTestHost(
-          cluster->info_, fmt::format("{}{}", protocol, host.first), host.second, simTime()));
+      cluster->prioritySet().getMockHostSet(priority)->hosts_.emplace_back(
+          makeTestHost(cluster->info_, fmt::format("{}{}", protocol, host.first), host.second));
     }
   }
 
@@ -698,8 +720,7 @@ public:
               Event::MockDispatcher dispatcher_;
               test_session.codec_client_ = new CodecClientForTest(
                   Http::CodecType::HTTP1, std::move(conn_data.connection_), test_session.codec_,
-                  nullptr, Upstream::makeTestHost(cluster, "tcp://127.0.0.1:9000", simTime()),
-                  dispatcher_);
+                  nullptr, Upstream::makeTestHost(cluster, "tcp://127.0.0.1:9000"), dispatcher_);
               return test_session.codec_client_;
             }));
   }
@@ -772,7 +793,7 @@ public:
   void expectSuccessStartFailedFailFirst(
       const absl::optional<std::string>& health_checked_cluster = absl::optional<std::string>()) {
     cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-        makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+        makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
     cluster_->prioritySet().getMockHostSet(0)->hosts_[0]->healthFlagSet(
         Host::HealthFlag::FAILED_ACTIVE_HC);
     expectSessionCreate();
@@ -853,7 +874,6 @@ public:
   std::list<uint32_t> connection_index_{};
   std::list<uint32_t> codec_index_{};
   const HostWithHealthCheckMap health_checker_map_{};
-  ScopedInjectableLoader<Regex::Engine> engine_;
 };
 
 TEST_F(HttpHealthCheckerImplTest, Success) {
@@ -861,7 +881,7 @@ TEST_F(HttpHealthCheckerImplTest, Success) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -884,7 +904,7 @@ TEST_F(HttpHealthCheckerImplTest, Degraded) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Changed)).Times(2);
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -922,7 +942,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessIntervalJitter) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged)).Times(testing::AnyNumber());
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
@@ -952,7 +972,7 @@ TEST_F(HttpHealthCheckerImplTest, InitialJitterNoTraffic) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged)).Times(testing::AnyNumber());
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->interval_timer_, enableTimer(_, _));
@@ -984,7 +1004,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessIntervalJitterPercentNoTraffic) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged)).Times(testing::AnyNumber());
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
@@ -1014,7 +1034,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessIntervalJitterPercent) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged)).Times(testing::AnyNumber());
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1045,7 +1065,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessWithSpurious1xx) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1073,7 +1093,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessWithSpuriousMetadata) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1102,8 +1122,8 @@ TEST_F(HttpHealthCheckerImplTest, SuccessWithMultipleHosts) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged)).Times(2);
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime()),
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:81", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80"),
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:81")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
@@ -1138,9 +1158,9 @@ TEST_F(HttpHealthCheckerImplTest, SuccessWithMultipleHostSets) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged)).Times(2);
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->prioritySet().getMockHostSet(1)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:81", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:81")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
@@ -1174,7 +1194,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessExpectedResponseCheck) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1197,7 +1217,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessExpectedResponseStringContainsCheck) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1221,7 +1241,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessExpectedResponseHexStringContainsCheck)
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1244,7 +1264,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessExpectedResponseCheckBuffer) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1269,7 +1289,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessExpectedResponseCheckMaxBuffer) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1309,7 +1329,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessExpectedResponseCheckHttp2) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1334,7 +1354,7 @@ TEST_F(HttpHealthCheckerImplTest, FailExpectedResponseCheck) {
   EXPECT_CALL(event_logger_, logUnhealthy(_, _, _, true));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1360,7 +1380,7 @@ TEST_F(HttpHealthCheckerImplTest, FailStatusCheckWithExpectedResponseCheck) {
   EXPECT_CALL(event_logger_, logUnhealthy(_, _, _, true));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1385,7 +1405,7 @@ TEST_F(HttpHealthCheckerImplTest, ImmediateFailExpectedResponseCheck) {
   EXPECT_CALL(event_logger_, logUnhealthy(_, _, _, true));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1432,7 +1452,7 @@ TEST_F(HttpHealthCheckerImplTest, ZeroRetryInterval) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1491,7 +1511,7 @@ TEST_F(HttpHealthCheckerImplTest, TlsOptions) {
 
   allocHealthChecker(yaml);
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1509,7 +1529,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessServiceCheckSetsCorrectLastHcPassTime) 
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
   simTime().advanceTimeWait(std::chrono::seconds(1));
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1592,7 +1612,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessServicePrefixPatternCheck) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1628,7 +1648,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessServiceExactPatternCheck) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1664,7 +1684,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessServiceRegexPatternCheck) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1696,10 +1716,10 @@ TEST_F(HttpHealthCheckerImplTest, SuccessServiceCheckWithCustomHostValueOnTheHos
   const std::string host = "www.envoyproxy.io";
   envoy::config::endpoint::v3::Endpoint::HealthCheckConfig health_check_config;
   health_check_config.set_hostname(host);
-  auto test_host = std::make_shared<HostImpl>(
-      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), nullptr, 1,
-      envoy::config::core::v3::Locality(), health_check_config, 0, envoy::config::core::v3::UNKNOWN,
-      simTime());
+  auto test_host = std::shared_ptr<Upstream::HostImpl>(
+      *HostImpl::create(cluster_->info_, "", *Network::Utility::resolveUrl("tcp://127.0.0.1:80"),
+                        nullptr, nullptr, 1, envoy::config::core::v3::Locality(),
+                        health_check_config, 0, envoy::config::core::v3::UNKNOWN));
   const std::string path = "/healthcheck";
   setupServiceValidationHC();
   // Requires non-empty `service_name` in config.
@@ -1741,10 +1761,10 @@ TEST_F(HttpHealthCheckerImplTest,
   const std::string host = "www.envoyproxy.io";
   envoy::config::endpoint::v3::Endpoint::HealthCheckConfig health_check_config;
   health_check_config.set_hostname(host);
-  auto test_host = std::make_shared<HostImpl>(
-      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), nullptr, 1,
-      envoy::config::core::v3::Locality(), health_check_config, 0, envoy::config::core::v3::UNKNOWN,
-      simTime());
+  auto test_host = std::shared_ptr<Upstream::HostImpl>(
+      *HostImpl::create(cluster_->info_, "", *Network::Utility::resolveUrl("tcp://127.0.0.1:80"),
+                        nullptr, nullptr, 1, envoy::config::core::v3::Locality(),
+                        health_check_config, 0, envoy::config::core::v3::UNKNOWN));
   const std::string path = "/healthcheck";
   // Setup health check config with a different host, to check that we still get the host configured
   // on the endpoint.
@@ -1791,7 +1811,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessServiceCheckWithCustomHostValue) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1856,7 +1876,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessServiceCheckWithAdditionalHeaders) {
       )EOF");
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", metadata, simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", metadata)};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1921,7 +1941,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessServiceCheckWithoutUserAgent) {
 
   std::string current_start_time;
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", metadata, simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", metadata)};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1959,7 +1979,7 @@ TEST_F(HttpHealthCheckerImplTest, ServiceDoesNotMatchFail) {
   EXPECT_CALL(event_logger_, logEjectUnhealthy(_, _, _));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -1991,7 +2011,7 @@ TEST_F(HttpHealthCheckerImplTest, ServicePatternDoesNotMatchFail) {
   EXPECT_CALL(event_logger_, logEjectUnhealthy(_, _, _));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -2022,7 +2042,7 @@ TEST_F(HttpHealthCheckerImplTest, ServiceNotPresentInResponseFail) {
   EXPECT_CALL(event_logger_, logEjectUnhealthy(_, _, _));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -2050,7 +2070,7 @@ TEST_F(HttpHealthCheckerImplTest, ServiceCheckRuntimeOff) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -2077,7 +2097,7 @@ TEST_F(HttpHealthCheckerImplTest, ServiceCheckRuntimeOffWithStringPattern) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -2109,7 +2129,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessNoTraffic) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
@@ -2127,7 +2147,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessNoTraffic) {
 TEST_F(HttpHealthCheckerImplTest, UnhealthyTransitionNoTrafficHealthy) {
   setupNoTrafficHealthyValidationHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->prioritySet().getMockHostSet(0)->hosts_[0]->healthFlagSet(
       Host::HealthFlag::FAILED_ACTIVE_HC);
   expectSessionCreate();
@@ -2149,7 +2169,7 @@ TEST_F(HttpHealthCheckerImplTest, UnhealthyTransitionNoTrafficHealthy) {
 TEST_F(HttpHealthCheckerImplTest, SuccessStartFailedSuccessFirst) {
   setupNoServiceValidationHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->prioritySet().getMockHostSet(0)->hosts_[0]->healthFlagSet(
       Host::HealthFlag::FAILED_ACTIVE_HC);
   expectSessionCreate();
@@ -2183,7 +2203,7 @@ TEST_F(HttpHealthCheckerImplTest, SuccessStartFailedFailFirstLogError) {
 TEST_F(HttpHealthCheckerImplTest, HttpFailRemoveHostInCallbackNoClose) {
   setupNoServiceValidationHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
@@ -2205,7 +2225,7 @@ TEST_F(HttpHealthCheckerImplTest, HttpFailRemoveHostInCallbackNoClose) {
 TEST_F(HttpHealthCheckerImplTest, HttpFailRemoveHostInCallbackClose) {
   setupNoServiceValidationHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
@@ -2226,7 +2246,7 @@ TEST_F(HttpHealthCheckerImplTest, HttpFailRemoveHostInCallbackClose) {
 TEST_F(HttpHealthCheckerImplTest, HttpFail) {
   setupNoServiceValidationHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
@@ -2274,7 +2294,7 @@ TEST_F(HttpHealthCheckerImplTest, HttpFail) {
 TEST_F(HttpHealthCheckerImplTest, ImmediateFailure) {
   setupNoServiceValidationHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
@@ -2297,7 +2317,7 @@ TEST_F(HttpHealthCheckerImplTest, ImmediateFailure) {
 TEST_F(HttpHealthCheckerImplTest, HttpFailLogError) {
   setupNoServiceValidationHCAlwaysLogFailure();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
@@ -2355,13 +2375,49 @@ TEST_F(HttpHealthCheckerImplTest, HttpFailLogError) {
             cluster_->prioritySet().getMockHostSet(0)->hosts_[0]->coarseHealth());
 }
 
+TEST_F(HttpHealthCheckerImplTest, HttpAlwaysLogSuccess) {
+  setupNoServiceValidationHCAlwaysLogSuccess();
+  cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
+  cluster_->prioritySet().getMockHostSet(0)->hosts_[0]->healthFlagSet(
+      Host::HealthFlag::FAILED_ACTIVE_HC);
+  cluster_->prioritySet().getMockHostSet(0)->hosts_[0]->healthFlagSet(
+      Host::HealthFlag::PENDING_ACTIVE_HC);
+  expectSessionCreate();
+  expectStreamCreate(0);
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+  health_checker_->start();
+
+  EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Changed));
+  EXPECT_CALL(event_logger_, logAddHealthy(_, _, true));
+  EXPECT_CALL(event_logger_, logSuccessfulHealthCheck(_, _)).Times(0);
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_, enableTimer(_, _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+  respond(0, "200", false);
+  EXPECT_EQ(Host::Health::Healthy,
+            cluster_->prioritySet().getMockHostSet(0)->hosts_[0]->coarseHealth());
+
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+  expectStreamCreate(0);
+  test_sessions_[0]->interval_timer_->invokeCallback();
+
+  EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
+  EXPECT_CALL(event_logger_, logAddHealthy(_, _, _)).Times(0);
+  EXPECT_CALL(event_logger_, logSuccessfulHealthCheck(_, _));
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_, enableTimer(_, _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+  respond(0, "200", false);
+  EXPECT_EQ(Host::Health::Healthy,
+            cluster_->prioritySet().getMockHostSet(0)->hosts_[0]->coarseHealth());
+}
+
 TEST_F(HttpHealthCheckerImplTest, Disconnect) {
   setupNoServiceValidationHC();
   EXPECT_CALL(event_logger_, logUnhealthy(_, _, _, true));
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::ChangePending));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
@@ -2393,7 +2449,7 @@ TEST_F(HttpHealthCheckerImplTest, Disconnect) {
 TEST_F(HttpHealthCheckerImplTest, Timeout) {
   setupNoServiceValidationHCOneUnhealthy();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
@@ -2417,7 +2473,7 @@ TEST_F(HttpHealthCheckerImplTest, TimeoutThenSuccess) {
   setupNoServiceValidationHC();
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
@@ -2454,7 +2510,7 @@ TEST_F(HttpHealthCheckerImplTest, TimeoutThenRemoteClose) {
   setupNoServiceValidationHC();
   EXPECT_CALL(event_logger_, logUnhealthy(_, _, _, true));
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
@@ -2489,7 +2545,7 @@ TEST_F(HttpHealthCheckerImplTest, TimeoutThenRemoteClose) {
 TEST_F(HttpHealthCheckerImplTest, TimeoutAfterDisconnect) {
   setupNoServiceValidationHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(event_logger_, logUnhealthy(_, _, _, true));
@@ -2520,7 +2576,7 @@ TEST_F(HttpHealthCheckerImplTest, DynamicAddAndRemove) {
   expectSessionCreate();
   expectStreamCreate(0);
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
   cluster_->prioritySet().getMockHostSet(0)->runCallbacks(
       {cluster_->prioritySet().getMockHostSet(0)->hosts_.back()}, {});
@@ -2542,19 +2598,19 @@ TEST_F(HttpHealthCheckerImplTest, DynamicRemoveDisableHC) {
 
   envoy::config::endpoint::v3::Endpoint::HealthCheckConfig health_check_config;
   health_check_config.set_disable_active_health_check(false);
-  auto enable_host = std::make_shared<HostImpl>(
-      cluster_->info_, "test_host", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), nullptr, 1,
-      envoy::config::core::v3::Locality(), health_check_config, 0, envoy::config::core::v3::UNKNOWN,
-      simTime());
+  auto enable_host = std::shared_ptr<Upstream::HostImpl>(*HostImpl::create(
+      cluster_->info_, "test_host", *Network::Utility::resolveUrl("tcp://127.0.0.1:80"), nullptr,
+      nullptr, 1, envoy::config::core::v3::Locality(), health_check_config, 0,
+      envoy::config::core::v3::UNKNOWN));
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {enable_host};
   health_checker_->start();
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   health_check_config.set_disable_active_health_check(true);
-  auto disable_host = std::make_shared<HostImpl>(
-      cluster_->info_, "test_host", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), nullptr, 1,
-      envoy::config::core::v3::Locality(), health_check_config, 0, envoy::config::core::v3::UNKNOWN,
-      simTime());
+  auto disable_host = std::shared_ptr<Upstream::HostImpl>(*HostImpl::create(
+      cluster_->info_, "test_host", *Network::Utility::resolveUrl("tcp://127.0.0.1:80"), nullptr,
+      nullptr, 1, envoy::config::core::v3::Locality(), health_check_config, 0,
+      envoy::config::core::v3::UNKNOWN));
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {disable_host};
   EXPECT_CALL(*test_sessions_[0]->client_connection_, close(Network::ConnectionCloseType::Abort));
   cluster_->prioritySet().runUpdateCallbacks(0, {disable_host}, {enable_host});
@@ -2571,10 +2627,10 @@ TEST_F(HttpHealthCheckerImplTest, AddDisableHC) {
 
   envoy::config::endpoint::v3::Endpoint::HealthCheckConfig health_check_config;
   health_check_config.set_disable_active_health_check(true);
-  auto disable_host = std::make_shared<HostImpl>(
-      cluster_->info_, "test_host", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), nullptr, 1,
-      envoy::config::core::v3::Locality(), health_check_config, 0, envoy::config::core::v3::UNKNOWN,
-      simTime());
+  auto disable_host = std::shared_ptr<Upstream::HostImpl>(*HostImpl::create(
+      cluster_->info_, "test_host", *Network::Utility::resolveUrl("tcp://127.0.0.1:80"), nullptr,
+      nullptr, 1, envoy::config::core::v3::Locality(), health_check_config, 0,
+      envoy::config::core::v3::UNKNOWN));
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {disable_host};
   health_checker_->start();
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged)).Times(0);
@@ -2585,7 +2641,7 @@ TEST_F(HttpHealthCheckerImplTest, ConnectionClose) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
@@ -2608,7 +2664,7 @@ TEST_F(HttpHealthCheckerImplTest, ProxyConnectionClose) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
@@ -2629,7 +2685,7 @@ TEST_F(HttpHealthCheckerImplTest, ProxyConnectionClose) {
 TEST_F(HttpHealthCheckerImplTest, HealthCheckIntervals) {
   setupHealthCheckIntervalOverridesHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://128.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://128.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
@@ -2864,7 +2920,7 @@ TEST_F(HttpHealthCheckerImplTest, RemoteCloseBetweenChecks) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged)).Times(2);
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
@@ -2896,7 +2952,7 @@ TEST_F(HttpHealthCheckerImplTest, DontReuseConnectionBetweenChecks) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged)).Times(2);
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
@@ -2928,7 +2984,7 @@ TEST_F(HttpHealthCheckerImplTest, StreamReachesWatermarkDuringCheck) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
@@ -2950,7 +3006,7 @@ TEST_F(HttpHealthCheckerImplTest, ConnectionReachesWatermarkDuringCheck) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
@@ -3170,8 +3226,8 @@ TEST_F(HttpHealthCheckerImplTest, TransportSocketMatchCriteria) {
   // We expect resolve() to be called twice, once for endpoint socket matching (with no metadata in
   // this test) and once for health check socket matching. In the latter we expect metadata that
   // matches the above object.
-  EXPECT_CALL(*transport_socket_match, resolve(nullptr));
-  EXPECT_CALL(*transport_socket_match, resolve(MetadataEq(metadata)))
+  EXPECT_CALL(*transport_socket_match, resolve(nullptr, nullptr));
+  EXPECT_CALL(*transport_socket_match, resolve(MetadataEq(metadata), nullptr))
       .WillOnce(Return(TransportSocketMatcher::MatchData(
           *health_check_only_socket_factory, health_transport_socket_stats, "health_check_only")));
   // The health_check_only_socket_factory should be used to create a transport socket for the health
@@ -3183,7 +3239,7 @@ TEST_F(HttpHealthCheckerImplTest, TransportSocketMatchCriteria) {
   allocHealthChecker(yaml);
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -3217,14 +3273,14 @@ TEST_F(HttpHealthCheckerImplTest, NoTransportSocketMatchCriteria) {
       std::make_unique<Upstream::MockTransportSocketMatcher>(std::move(default_socket_factory));
   // We expect resolve() to be called exactly once for endpoint socket matching. We should not
   // attempt to match again for health checks since there is not match criteria in the config.
-  EXPECT_CALL(*transport_socket_match, resolve(nullptr));
+  EXPECT_CALL(*transport_socket_match, resolve(nullptr, nullptr));
 
   cluster_->info_->transport_socket_matcher_ = std::move(transport_socket_match);
 
   allocHealthChecker(yaml);
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -3241,7 +3297,7 @@ TEST_F(HttpHealthCheckerImplTest, GoAwayErrorProbeInProgress) {
       .WillRepeatedly(Return(false));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -3289,7 +3345,7 @@ TEST_F(HttpHealthCheckerImplTest, GoAwayProbeInProgress) {
   EXPECT_CALL(runtime_.snapshot_, featureEnabled("health_check.verify_cluster", 100))
       .WillRepeatedly(Return(false));
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
 
   expectSessionCreate();
@@ -3322,7 +3378,7 @@ TEST_F(HttpHealthCheckerImplTest, GoAwayProbeInProgress) {
 TEST_F(HttpHealthCheckerImplTest, GoAwayProbeInProgressTimeout) {
   setupHCHttp2();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   EXPECT_CALL(runtime_.snapshot_, featureEnabled("health_check.verify_cluster", 100))
       .WillRepeatedly(Return(false));
 
@@ -3358,7 +3414,7 @@ TEST_F(HttpHealthCheckerImplTest, GoAwayProbeInProgressTimeout) {
 TEST_F(HttpHealthCheckerImplTest, GoAwayProbeInProgressStreamReset) {
   setupHCHttp2();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   EXPECT_CALL(runtime_.snapshot_, featureEnabled("health_check.verify_cluster", 100))
       .WillRepeatedly(Return(false));
 
@@ -3394,7 +3450,7 @@ TEST_F(HttpHealthCheckerImplTest, GoAwayProbeInProgressStreamReset) {
 TEST_F(HttpHealthCheckerImplTest, GoAwayProbeInProgressConnectionClose) {
   setupHCHttp2();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   EXPECT_CALL(runtime_.snapshot_, featureEnabled("health_check.verify_cluster", 100))
       .WillRepeatedly(Return(false));
 
@@ -3430,7 +3486,7 @@ TEST_F(HttpHealthCheckerImplTest, GoAwayProbeInProgressConnectionClose) {
 TEST_F(HttpHealthCheckerImplTest, GoAwayBetweenChecks) {
   setupHCHttp2();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   EXPECT_CALL(runtime_.snapshot_, featureEnabled("health_check.verify_cluster", 100))
       .WillRepeatedly(Return(false));
 
@@ -3478,13 +3534,13 @@ class ProdHttpHealthCheckerTest : public testing::Test, public HealthCheckerTest
 public:
   void allocHealthChecker(const std::string& yaml) {
     health_checker_ = std::make_shared<TestProdHttpHealthChecker>(
-        *cluster_, parseHealthCheckFromV3Yaml(yaml), dispatcher_, runtime_, random_,
+        *cluster_, parseHealthCheckFromV3Yaml(yaml), context_,
         HealthCheckEventLoggerPtr(event_logger_storage_.release()));
   }
 
   void addCompletionCallback() {
     health_checker_->addHostCheckCompleteCb(
-        [this](HostSharedPtr host, HealthTransition changed_state) -> void {
+        [this](HostSharedPtr host, HealthTransition changed_state, HealthState) -> void {
           onHostStatus(host, changed_state);
         });
   }
@@ -3588,7 +3644,7 @@ TEST_F(HttpHealthCheckerImplTest, ServiceNameMatch) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -3624,7 +3680,7 @@ TEST_F(HttpHealthCheckerImplTest, ServiceNameMismatch) {
   EXPECT_CALL(event_logger_, logEjectUnhealthy(_, _, _));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -3650,7 +3706,7 @@ TEST_F(HttpHealthCheckerImplTest, DefaultMethodGet) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -3679,7 +3735,7 @@ TEST_F(HttpHealthCheckerImplTest, MethodHead) {
   EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
   expectSessionCreate();
   expectStreamCreate(0);
@@ -3717,6 +3773,40 @@ TEST_F(HttpHealthCheckerImplTest, MethodConnectDisallowedValidation) {
 
   EXPECT_THROW_WITH_REGEX(TestUtility::validate(parseHealthCheckFromV3Yaml(yaml)), EnvoyException,
                           "Proto constraint validation failed.*")
+}
+
+TEST_F(HttpHealthCheckerImplTest, InvalidHost) {
+  const std::string yaml = R"EOF(
+    timeout: 1s
+    interval: 1s
+    no_traffic_interval: 5s
+    interval_jitter: 1s
+    unhealthy_threshold: 1
+    healthy_threshold: 1
+    http_health_check:
+      host: "\x07"
+      path: "/aaa"
+    )EOF";
+
+  EXPECT_THROW_WITH_REGEX(TestUtility::validate(parseHealthCheckFromV3Yaml(yaml)), EnvoyException,
+                          "Proto constraint validation failed*")
+}
+
+TEST_F(HttpHealthCheckerImplTest, InvalidPath) {
+  const std::string yaml = R"EOF(
+    timeout: 1s
+    interval: 1s
+    no_traffic_interval: 5s
+    interval_jitter: 1s
+    unhealthy_threshold: 1
+    healthy_threshold: 1
+    http_health_check:
+      host: "aaa"
+      path: "\x08"
+    )EOF";
+
+  EXPECT_THROW_WITH_REGEX(TestUtility::validate(parseHealthCheckFromV3Yaml(yaml)), EnvoyException,
+                          "Proto constraint validation failed*")
 }
 
 TEST_F(ProdHttpHealthCheckerTest, ProdHttpHealthCheckerH2HealthChecking) {
@@ -4063,7 +4153,8 @@ TEST(PayloadMatcher, loadJsonBytes) {
     repeated_payload.Add()->set_text("39000000");
     repeated_payload.Add()->set_text("EEEEEEEE");
 
-    PayloadMatcher::MatchSegments segments = PayloadMatcher::loadProtoBytes(repeated_payload);
+    PayloadMatcher::MatchSegments segments =
+        PayloadMatcher::loadProtoBytes(repeated_payload).value();
     EXPECT_EQ(2U, segments.size());
   }
 
@@ -4071,14 +4162,42 @@ TEST(PayloadMatcher, loadJsonBytes) {
     Protobuf::RepeatedPtrField<envoy::config::core::v3::HealthCheck::Payload> repeated_payload;
     repeated_payload.Add()->set_text("4");
 
-    EXPECT_THROW(PayloadMatcher::loadProtoBytes(repeated_payload), EnvoyException);
+    EXPECT_FALSE(PayloadMatcher::loadProtoBytes(repeated_payload).status().ok());
   }
 
   {
     Protobuf::RepeatedPtrField<envoy::config::core::v3::HealthCheck::Payload> repeated_payload;
     repeated_payload.Add()->set_text("gg");
 
-    EXPECT_THROW(PayloadMatcher::loadProtoBytes(repeated_payload), EnvoyException);
+    EXPECT_FALSE(PayloadMatcher::loadProtoBytes(repeated_payload).status().ok());
+  }
+}
+
+TEST(PayloadMatcher, loadSinglePayload) {
+  // Test the single payload overload with text.
+  {
+    envoy::config::core::v3::HealthCheck::Payload single_payload;
+    single_payload.set_text("39000000");
+
+    PayloadMatcher::MatchSegments segments = PayloadMatcher::loadProtoBytes(single_payload).value();
+    EXPECT_EQ(1U, segments.size());
+  }
+
+  // Test the single payload overload with binary.
+  {
+    envoy::config::core::v3::HealthCheck::Payload single_payload;
+    single_payload.set_binary(std::string({0x01, 0x02}));
+
+    PayloadMatcher::MatchSegments segments = PayloadMatcher::loadProtoBytes(single_payload).value();
+    EXPECT_EQ(1U, segments.size());
+  }
+
+  // Test the single payload overload with invalid hex.
+  {
+    envoy::config::core::v3::HealthCheck::Payload single_payload;
+    single_payload.set_text("gg");
+
+    EXPECT_FALSE(PayloadMatcher::loadProtoBytes(single_payload).status().ok());
   }
 }
 
@@ -4091,7 +4210,7 @@ TEST(PayloadMatcher, matchHexText) {
   repeated_payload.Add()->set_text("01");
   repeated_payload.Add()->set_text("02");
 
-  PayloadMatcher::MatchSegments segments = PayloadMatcher::loadProtoBytes(repeated_payload);
+  PayloadMatcher::MatchSegments segments = PayloadMatcher::loadProtoBytes(repeated_payload).value();
 
   Buffer::OwnedImpl buffer;
   EXPECT_FALSE(PayloadMatcher::match(segments, buffer));
@@ -4118,7 +4237,7 @@ TEST(PayloadMatcher, matchBinary) {
   Protobuf::RepeatedPtrField<envoy::config::core::v3::HealthCheck::Payload> repeated_payload;
   repeated_payload.Add()->set_binary(std::string({0x01, 0x02}));
 
-  PayloadMatcher::MatchSegments segments = PayloadMatcher::loadProtoBytes(repeated_payload);
+  PayloadMatcher::MatchSegments segments = PayloadMatcher::loadProtoBytes(repeated_payload).value();
 
   Buffer::OwnedImpl buffer;
   EXPECT_FALSE(PayloadMatcher::match(segments, buffer));
@@ -4185,6 +4304,25 @@ public:
     allocHealthChecker(yaml);
   }
 
+  void setupDataProxyProtocol() {
+    std::string yaml = R"EOF(
+    timeout: 1s
+    interval: 1s
+    unhealthy_threshold: 2
+    healthy_threshold: 2
+    reuse_connection: false
+    tcp_health_check:
+      proxy_protocol_config:
+        version: v2
+      send:
+        text: "01"
+      receive:
+      - text: "02"
+    )EOF";
+
+    allocHealthChecker(yaml);
+  }
+
   void expectSessionCreate() {
     interval_timer_ = new Event::MockTimer(&dispatcher_);
     timeout_timer_ = new Event::MockTimer(&dispatcher_);
@@ -4208,7 +4346,7 @@ TEST_F(TcpHealthCheckerImplTest, Success) {
 
   setupData();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectClientCreate();
   EXPECT_CALL(*connection_, write(_, _));
@@ -4232,7 +4370,7 @@ TEST_F(TcpHealthCheckerImplTest, DataWithoutReusingConnection) {
 
   setupDataDontReuseConnection();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectClientCreate();
   EXPECT_CALL(*connection_, write(_, _));
@@ -4261,7 +4399,7 @@ TEST_F(TcpHealthCheckerImplTest, WrongData) {
 
   setupDataDontReuseConnection();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectClientCreate();
   EXPECT_CALL(*connection_, write(_, _));
@@ -4292,7 +4430,7 @@ TEST_F(TcpHealthCheckerImplTest, TimeoutThenRemoteClose) {
   expectSessionCreate();
   expectClientCreate();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   EXPECT_CALL(*connection_, write(_, _));
   EXPECT_CALL(*timeout_timer_, enableTimer(_, _));
 
@@ -4351,7 +4489,7 @@ TEST_F(TcpHealthCheckerImplTest, Timeout) {
   expectSessionCreate();
   expectClientCreate();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   EXPECT_CALL(*connection_, write(_, _));
   EXPECT_CALL(*timeout_timer_, enableTimer(_, _));
 
@@ -4385,7 +4523,7 @@ TEST_F(TcpHealthCheckerImplTest, DoubleTimeout) {
   expectSessionCreate();
   expectClientCreate();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   EXPECT_CALL(*connection_, write(_, _));
   EXPECT_CALL(*timeout_timer_, enableTimer(_, _));
 
@@ -4444,7 +4582,7 @@ TEST_F(TcpHealthCheckerImplTest, TimeoutWithoutReusingConnection) {
 
   setupDataDontReuseConnection();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectClientCreate();
   EXPECT_CALL(*connection_, write(_, _));
@@ -4515,7 +4653,7 @@ TEST_F(TcpHealthCheckerImplTest, NoData) {
 
   setupNoData();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectClientCreate();
   EXPECT_CALL(*connection_, write(_, _)).Times(0);
@@ -4538,7 +4676,7 @@ TEST_F(TcpHealthCheckerImplTest, PassiveFailure) {
 
   setupNoData();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectClientCreate();
   EXPECT_CALL(*connection_, write(_, _)).Times(0);
@@ -4599,7 +4737,7 @@ TEST_F(TcpHealthCheckerImplTest, PassiveFailureCrossThreadRemoveHostRace) {
 
   setupNoData();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectClientCreate();
   EXPECT_CALL(*connection_, write(_, _)).Times(0);
@@ -4631,7 +4769,7 @@ TEST_F(TcpHealthCheckerImplTest, PassiveFailureCrossThreadRemoveClusterRace) {
 
   setupNoData();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectClientCreate();
   EXPECT_CALL(*connection_, write(_, _)).Times(0);
@@ -4662,7 +4800,7 @@ TEST_F(TcpHealthCheckerImplTest, ConnectionLocalFailure) {
 
   setupData();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
   expectClientCreate();
   EXPECT_CALL(*connection_, write(_, _));
@@ -4682,6 +4820,29 @@ TEST_F(TcpHealthCheckerImplTest, ConnectionLocalFailure) {
   EXPECT_EQ(0UL, cluster_->info_->stats_store_.counter("health_check.success").value());
   EXPECT_EQ(1UL, cluster_->info_->stats_store_.counter("health_check.failure").value());
   EXPECT_EQ(0UL, cluster_->info_->stats_store_.counter("health_check.passive_failure").value());
+}
+
+TEST_F(TcpHealthCheckerImplTest, SuccessProxyProtocol) {
+  InSequence s;
+
+  setupDataProxyProtocol();
+  cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
+  expectSessionCreate();
+  expectClientCreate();
+  EXPECT_CALL(*connection_, write(_, _));
+  EXPECT_CALL(*timeout_timer_, enableTimer(_, _));
+  health_checker_->start();
+
+  connection_->runHighWatermarkCallbacks();
+  connection_->runLowWatermarkCallbacks();
+  connection_->raiseEvent(Network::ConnectionEvent::Connected);
+
+  EXPECT_CALL(*timeout_timer_, disableTimer());
+  EXPECT_CALL(*interval_timer_, enableTimer(_, _));
+  Buffer::OwnedImpl response;
+  addUint8(response, 2);
+  read_filter_->onData(response, false);
 }
 
 class TestGrpcHealthCheckerImpl : public GrpcHealthCheckerImpl {
@@ -4806,7 +4967,7 @@ public:
 
   void addCompletionCallback() {
     health_checker_->addHostCheckCompleteCb(
-        [this](HostSharedPtr host, HealthTransition changed_state) -> void {
+        [this](HostSharedPtr host, HealthTransition changed_state, HealthState) -> void {
           onHostStatus(host, changed_state);
         });
   }
@@ -4906,8 +5067,7 @@ public:
 
               test_session.codec_client_ = new CodecClientForTest(
                   Http::CodecType::HTTP1, std::move(conn_data.connection_), test_session.codec_,
-                  nullptr, Upstream::makeTestHost(cluster, "tcp://127.0.0.1:9000", simTime()),
-                  dispatcher_);
+                  nullptr, Upstream::makeTestHost(cluster, "tcp://127.0.0.1:9000"), dispatcher_);
               return test_session.codec_client_;
             }));
   }
@@ -4943,7 +5103,7 @@ public:
 
   void expectSingleHealthcheck(HealthTransition host_changed_state) {
     cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-        makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+        makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
     expectHealthchecks(host_changed_state, 1);
   }
 
@@ -5021,7 +5181,7 @@ public:
     setupServiceNameHC(authority);
 
     cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-        makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+        makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
     runHealthCheck(expected_host);
   }
 
@@ -5047,7 +5207,7 @@ public:
         .WillOnce(Invoke([&](Buffer::Instance& data, bool) {
           std::vector<Grpc::Frame> decoded_frames;
           Grpc::Decoder decoder;
-          ASSERT_TRUE(decoder.decode(data, decoded_frames));
+          ASSERT_TRUE(decoder.decode(data, decoded_frames).ok());
           ASSERT_EQ(1U, decoded_frames.size());
           auto& frame = decoded_frames[0];
           Buffer::ZeroCopyInputStreamImpl stream(std::move(frame.data_));
@@ -5104,10 +5264,10 @@ TEST_F(GrpcHealthCheckerImplTest, SuccessWithHostname) {
 
   envoy::config::endpoint::v3::Endpoint::HealthCheckConfig health_check_config;
   health_check_config.set_hostname(expected_host);
-  auto test_host = std::make_shared<HostImpl>(
-      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), nullptr, 1,
-      envoy::config::core::v3::Locality(), health_check_config, 0, envoy::config::core::v3::UNKNOWN,
-      simTime());
+  auto test_host = std::shared_ptr<Upstream::HostImpl>(
+      *HostImpl::create(cluster_->info_, "", *Network::Utility::resolveUrl("tcp://127.0.0.1:80"),
+                        nullptr, nullptr, 1, envoy::config::core::v3::Locality(),
+                        health_check_config, 0, envoy::config::core::v3::UNKNOWN));
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {test_host};
   runHealthCheck(expected_host);
 }
@@ -5119,10 +5279,10 @@ TEST_F(GrpcHealthCheckerImplTest, SuccessWithHostnameOverridesConfig) {
 
   envoy::config::endpoint::v3::Endpoint::HealthCheckConfig health_check_config;
   health_check_config.set_hostname(expected_host);
-  auto test_host = std::make_shared<HostImpl>(
-      cluster_->info_, "", Network::Utility::resolveUrl("tcp://127.0.0.1:80"), nullptr, 1,
-      envoy::config::core::v3::Locality(), health_check_config, 0, envoy::config::core::v3::UNKNOWN,
-      simTime());
+  auto test_host = std::shared_ptr<Upstream::HostImpl>(
+      *HostImpl::create(cluster_->info_, "", *Network::Utility::resolveUrl("tcp://127.0.0.1:80"),
+                        nullptr, nullptr, 1, envoy::config::core::v3::Locality(),
+                        health_check_config, 0, envoy::config::core::v3::UNKNOWN));
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {test_host};
   runHealthCheck(expected_host);
 }
@@ -5175,7 +5335,7 @@ TEST_F(GrpcHealthCheckerImplTest, SuccessWithAdditionalHeaders) {
       )EOF");
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", metadata, simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", metadata)};
 
   cluster_->info_->trafficStats()->upstream_cx_total_.inc();
 
@@ -5231,7 +5391,7 @@ TEST_F(GrpcHealthCheckerImplTest, SuccessWithAdditionalHeaders) {
       .WillOnce(Invoke([&](Buffer::Instance& data, bool) {
         std::vector<Grpc::Frame> decoded_frames;
         Grpc::Decoder decoder;
-        ASSERT_TRUE(decoder.decode(data, decoded_frames));
+        ASSERT_TRUE(decoder.decode(data, decoded_frames).ok());
         ASSERT_EQ(1U, decoded_frames.size());
         auto& frame = decoded_frames[0];
         Buffer::ZeroCopyInputStreamImpl stream(std::move(frame.data_));
@@ -5290,8 +5450,8 @@ TEST_F(GrpcHealthCheckerImplTest, SuccessWithMultipleHosts) {
   setupHC();
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime()),
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:81", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80"),
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:81")};
 
   expectHealthchecks(HealthTransition::Unchanged, 2);
 
@@ -5308,9 +5468,9 @@ TEST_F(GrpcHealthCheckerImplTest, SuccessWithMultipleHostSets) {
   setupHC();
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->prioritySet().getMockHostSet(1)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:81", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:81")};
 
   expectHealthchecks(HealthTransition::Unchanged, 2);
 
@@ -5350,7 +5510,7 @@ TEST_F(GrpcHealthCheckerImplTest, ConnectionReachesWatermarkDuringCheck) {
 TEST_F(GrpcHealthCheckerImplTest, SuccessNoTraffic) {
   setupHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
 
   expectSessionCreate();
   expectHealthcheckStart(0);
@@ -5368,7 +5528,7 @@ TEST_F(GrpcHealthCheckerImplTest, SuccessNoTraffic) {
 TEST_F(GrpcHealthCheckerImplTest, SuccessStartFailedSuccessFirst) {
   setupHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->prioritySet().getMockHostSet(0)->hosts_[0]->healthFlagSet(
       Host::HealthFlag::FAILED_ACTIVE_HC);
   cluster_->prioritySet().getMockHostSet(0)->hosts_[0]->healthFlagSet(
@@ -5394,7 +5554,7 @@ TEST_F(GrpcHealthCheckerImplTest, SuccessStartFailedSuccessFirst) {
 TEST_F(GrpcHealthCheckerImplTest, SuccessStartFailedFailFirst) {
   setupHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   cluster_->prioritySet().getMockHostSet(0)->hosts_[0]->healthFlagSet(
       Host::HealthFlag::FAILED_ACTIVE_HC);
   cluster_->prioritySet().getMockHostSet(0)->hosts_[0]->healthFlagSet(
@@ -5442,7 +5602,7 @@ TEST_F(GrpcHealthCheckerImplTest, SuccessStartFailedFailFirst) {
 TEST_F(GrpcHealthCheckerImplTest, GrpcHealthFailViaRpcRemoveHostInCallback) {
   setupHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
 
   expectSessionCreate();
   expectHealthcheckStart(0);
@@ -5463,7 +5623,7 @@ TEST_F(GrpcHealthCheckerImplTest, GrpcHealthFailViaRpcRemoveHostInCallback) {
 TEST_F(GrpcHealthCheckerImplTest, GrpcHealthFailViaGoawayRemoveHostInCallback) {
   setupHCWithUnhealthyThreshold(/*threshold=*/1);
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
 
   expectSessionCreate();
   expectHealthcheckStart(0);
@@ -5483,7 +5643,7 @@ TEST_F(GrpcHealthCheckerImplTest, GrpcHealthFailViaGoawayRemoveHostInCallback) {
 TEST_F(GrpcHealthCheckerImplTest, GrpcHealthFailViaBadResponseRemoveHostInCallback) {
   setupHCWithUnhealthyThreshold(/*threshold=*/1);
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
 
   expectSessionCreate();
   expectHealthcheckStart(0);
@@ -5505,7 +5665,7 @@ TEST_F(GrpcHealthCheckerImplTest, GrpcHealthFailViaBadResponseRemoveHostInCallba
 TEST_F(GrpcHealthCheckerImplTest, GrpcHealthFail) {
   setupHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
 
   expectSessionCreate();
   expectHealthcheckStart(0);
@@ -5544,7 +5704,7 @@ TEST_F(GrpcHealthCheckerImplTest, GrpcHealthFail) {
 TEST_F(GrpcHealthCheckerImplTest, Disconnect) {
   setupHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
 
   expectSessionCreate();
   expectHealthcheckStart(0);
@@ -5572,7 +5732,7 @@ TEST_F(GrpcHealthCheckerImplTest, Disconnect) {
 TEST_F(GrpcHealthCheckerImplTest, Timeout) {
   setupHCWithUnhealthyThreshold(1);
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
 
   expectHealthcheckStart(0);
@@ -5591,7 +5751,7 @@ TEST_F(GrpcHealthCheckerImplTest, Timeout) {
 TEST_F(GrpcHealthCheckerImplTest, DoubleTimeout) {
   setupHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   expectSessionCreate();
 
   expectHealthcheckStart(0);
@@ -5623,7 +5783,7 @@ TEST_F(GrpcHealthCheckerImplTest, DynamicAddAndRemove) {
   expectSessionCreate();
   expectStreamCreate(0);
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
   cluster_->prioritySet().getMockHostSet(0)->runCallbacks(
       {cluster_->prioritySet().getMockHostSet(0)->hosts_.back()}, {});
@@ -5638,7 +5798,7 @@ TEST_F(GrpcHealthCheckerImplTest, DynamicAddAndRemove) {
 TEST_F(GrpcHealthCheckerImplTest, HealthCheckIntervals) {
   setupHealthCheckIntervalOverridesHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://128.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://128.0.0.1:80")};
   expectSessionCreate();
   expectStreamCreate(0);
   EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
@@ -5852,7 +6012,7 @@ TEST_F(GrpcHealthCheckerImplTest, HealthCheckIntervals) {
 TEST_F(GrpcHealthCheckerImplTest, RemoteCloseBetweenChecks) {
   setupHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
 
   expectSessionCreate();
   expectHealthcheckStart(0);
@@ -5881,7 +6041,7 @@ TEST_F(GrpcHealthCheckerImplTest, RemoteCloseBetweenChecks) {
 TEST_F(GrpcHealthCheckerImplTest, DontReuseConnectionBetweenChecks) {
   setupNoReuseConnectionHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
 
   expectSessionCreate();
   expectHealthcheckStart(0);
@@ -5910,7 +6070,7 @@ TEST_F(GrpcHealthCheckerImplTest, DontReuseConnectionBetweenChecks) {
 TEST_F(GrpcHealthCheckerImplTest, DontReuseConnectionTimeout) {
   setupNoReuseConnectionHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
 
   expectSessionCreate();
   expectHealthcheckStart(0);
@@ -5940,7 +6100,7 @@ TEST_F(GrpcHealthCheckerImplTest, DontReuseConnectionTimeout) {
 TEST_F(GrpcHealthCheckerImplTest, DontReuseConnectionStreamReset) {
   setupNoReuseConnectionHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
 
   expectSessionCreate();
   expectHealthcheckStart(0);
@@ -6062,7 +6222,7 @@ TEST_F(GrpcHealthCheckerImplTest, GoAwayErrorProbeInProgress) {
 TEST_F(GrpcHealthCheckerImplTest, GoAwayProbeInProgress) {
   setupHCWithUnhealthyThreshold(/*threshold=*/1);
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
 
   expectSessionCreate();
   expectHealthcheckStart(0);
@@ -6092,7 +6252,7 @@ TEST_F(GrpcHealthCheckerImplTest, GoAwayProbeInProgress) {
 TEST_F(GrpcHealthCheckerImplTest, GoAwayProbeInProgressTimeout) {
   setupHCWithUnhealthyThreshold(/*threshold=*/1);
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
 
   expectSessionCreate();
   expectHealthcheckStart(0);
@@ -6127,7 +6287,7 @@ TEST_F(GrpcHealthCheckerImplTest, GoAwayProbeInProgressTimeout) {
 TEST_F(GrpcHealthCheckerImplTest, GoAwayProbeInProgressStreamReset) {
   setupHCWithUnhealthyThreshold(/*threshold=*/1);
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
 
   expectSessionCreate();
   expectHealthcheckStart(0);
@@ -6162,7 +6322,7 @@ TEST_F(GrpcHealthCheckerImplTest, GoAwayProbeInProgressStreamReset) {
 TEST_F(GrpcHealthCheckerImplTest, GoAwayProbeInProgressBadResponse) {
   setupHCWithUnhealthyThreshold(/*threshold=*/1);
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
 
   expectSessionCreate();
   expectHealthcheckStart(0);
@@ -6199,7 +6359,7 @@ TEST_F(GrpcHealthCheckerImplTest, GoAwayProbeInProgressBadResponse) {
 TEST_F(GrpcHealthCheckerImplTest, GoAwayProbeInProgressConnectionClose) {
   setupHCWithUnhealthyThreshold(/*threshold=*/1);
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
 
   expectSessionCreate();
   expectHealthcheckStart(0);
@@ -6234,7 +6394,7 @@ TEST_F(GrpcHealthCheckerImplTest, GoAwayProbeInProgressConnectionClose) {
 TEST_F(GrpcHealthCheckerImplTest, GoAwayBetweenChecks) {
   setupHC();
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
 
   expectSessionCreate();
   expectHealthcheckStart(0);
@@ -6387,20 +6547,16 @@ TEST(Printer, HealthTransitionPrinter) {
 }
 
 TEST(HealthCheckEventLoggerImplTest, All) {
-  AccessLog::MockAccessLogManager log_manager;
-  std::shared_ptr<AccessLog::MockAccessLogFile> file(new AccessLog::MockAccessLogFile());
-  EXPECT_CALL(log_manager, createAccessLog(Filesystem::FilePathAndType{
-                               Filesystem::DestinationType::File, "foo"}))
-      .WillOnce(Return(file));
-
   envoy::config::core::v3::HealthCheck health_check_config;
   health_check_config.set_event_log_path("foo");
 
   NiceMock<Upstream::MockClusterMockPrioritySet> cluster;
-  Runtime::MockLoader runtime;
-  Event::MockDispatcher dispatcher;
-  NiceMock<ProtobufMessage::MockValidationVisitor> validation_visitor;
-  NiceMock<Api::MockApi> api;
+  NiceMock<Server::Configuration::MockServerFactoryContext> server_context;
+
+  std::shared_ptr<AccessLog::MockAccessLogFile> file(new AccessLog::MockAccessLogFile());
+  EXPECT_CALL(server_context.access_log_manager_, createAccessLog(Filesystem::FilePathAndType{
+                                                      Filesystem::DestinationType::File, "foo"}))
+      .WillOnce(Return(file));
 
   std::shared_ptr<MockHostDescription> host(new NiceMock<MockHostDescription>());
   NiceMock<MockClusterInfo> cluster_info;
@@ -6408,66 +6564,94 @@ TEST(HealthCheckEventLoggerImplTest, All) {
   ON_CALL(*host, cluster()).WillByDefault(ReturnRef(cluster_info));
   ON_CALL(*host, metadata()).WillByDefault(Return(metadata));
 
-  HealthCheckerFactoryContextImpl context(cluster, runtime, dispatcher, validation_visitor, api,
-                                          log_manager);
+  HealthCheckerFactoryContextImpl context(cluster, server_context);
 
   Event::SimulatedTimeSystem time_system;
   // This is rendered as "2009-02-13T23:31:31.234Z".a
   time_system.setSystemTime(std::chrono::milliseconds(1234567891234));
 
-  HealthCheckEventLoggerImpl event_logger(log_manager, time_system, health_check_config, context);
+  std::unique_ptr<HealthCheckEventLoggerImpl> event_logger =
+      *HealthCheckEventLoggerImpl::create(health_check_config, context);
+
+  EXPECT_CALL(
+      *file,
+      write(absl::string_view{
+          "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
+          "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"port_value\":443,"
+          "\"resolver_name\":\"\",\"ipv4_compat\":false,\"network_namespace_filepath\":\"\"}},"
+          "\"cluster_name\":\"fake_cluster\","
+          "\"eject_unhealthy_event\":{\"failure_type\":\"ACTIVE\"},"
+          "\"timestamp\":\"2009-02-13T23:31:31.234Z\","
+          "\"metadata\":{\"filter_metadata\":{},\"typed_filter_metadata\":{}},"
+          "\"locality\":{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"}}\n"}));
+  event_logger->logEjectUnhealthy(envoy::data::core::v3::HTTP, host, envoy::data::core::v3::ACTIVE);
+
+  EXPECT_CALL(
+      *file,
+      write(absl::string_view{
+          "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
+          "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"port_value\":443,"
+          "\"resolver_name\":\"\","
+          "\"ipv4_compat\":false,\"network_namespace_filepath\":\"\"}},\"cluster_name\":\"fake_"
+          "cluster\",\"add_healthy_event\":{\"first_check\":false},"
+          "\"timestamp\":\"2009-02-13T23:31:31.234Z\","
+          "\"metadata\":"
+          "{\"filter_metadata\":{},\"typed_filter_metadata\":{}},\"locality\":"
+          "{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"}}\n"}));
+  event_logger->logAddHealthy(envoy::data::core::v3::HTTP, host, false);
+
+  EXPECT_CALL(
+      *file,
+      write(absl::string_view{
+          "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
+          "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"port_value\":443,"
+          "\"resolver_name\":\"\","
+          "\"ipv4_compat\":false,\"network_namespace_filepath\":\"\"}},\"cluster_name\":\"fake_"
+          "cluster\","
+          "\"timestamp\":\"2009-02-13T23:31:31.234Z\","
+          "\"metadata\":"
+          "{\"filter_metadata\":{},\"typed_filter_metadata\":{}},\"locality\":"
+          "{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"},"
+          "\"successful_health_check_event\":{}}\n"}));
+  event_logger->logSuccessfulHealthCheck(envoy::data::core::v3::HTTP, host);
 
   EXPECT_CALL(*file, write(absl::string_view{
                          "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
-                         "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"resolver_name\":\"\","
-                         "\"ipv4_compat\":false,\"port_value\":443}},\"cluster_name\":\"fake_"
-                         "cluster\",\"eject_unhealthy_event\":{\"failure_type\":\"ACTIVE\"},"
-                         "\"metadata\":{\"filter_metadata\":{},\"typed_filter_metadata\":{}},"
-                         "\"locality\":{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"},"
-                         "\"timestamp\":\"2009-02-13T23:31:31.234Z\"}\n"}));
-  event_logger.logEjectUnhealthy(envoy::data::core::v3::HTTP, host, envoy::data::core::v3::ACTIVE);
-
-  EXPECT_CALL(*file, write(absl::string_view{
-                         "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
-                         "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"resolver_name\":\"\","
-                         "\"ipv4_compat\":false,\"port_value\":443}},\"cluster_name\":\"fake_"
-                         "cluster\",\"add_healthy_event\":{\"first_check\":false},\"metadata\":"
-                         "{\"filter_metadata\":{},\"typed_filter_metadata\":{}},\"locality\":"
-                         "{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"},\"timestamp\":"
-                         "\"2009-02-13T23:31:31.234Z\"}\n"}));
-  event_logger.logAddHealthy(envoy::data::core::v3::HTTP, host, false);
-
-  EXPECT_CALL(*file, write(absl::string_view{
-                         "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
-                         "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"resolver_name\":\"\","
-                         "\"ipv4_compat\":false,\"port_value\":443}},\"cluster_name\":\"fake_"
-                         "cluster\",\"health_check_failure_event\":{\"failure_type\":\"ACTIVE\","
+                         "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"port_value\":443,"
+                         "\"resolver_name\":\"\","
+                         "\"ipv4_compat\":false,\"network_namespace_filepath\":\"\"}},\"cluster_"
+                         "name\":\"fake_cluster\","
+                         "\"timestamp\":\"2009-02-13T23:31:31.234Z\","
+                         "\"health_check_failure_event\":{\"failure_type\":\"ACTIVE\","
                          "\"first_check\":false},"
                          "\"metadata\":{\"filter_metadata\":{},\"typed_filter_metadata\":{}},"
-                         "\"locality\":{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"},"
-                         "\"timestamp\":\"2009-02-13T23:31:31.234Z\"}\n"}));
-  event_logger.logUnhealthy(envoy::data::core::v3::HTTP, host, envoy::data::core::v3::ACTIVE,
-                            false);
+                         "\"locality\":{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"}}\n"}));
+  event_logger->logUnhealthy(envoy::data::core::v3::HTTP, host, envoy::data::core::v3::ACTIVE,
+                             false);
 
   EXPECT_CALL(*file, write(absl::string_view{
                          "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
-                         "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"resolver_name\":\"\","
-                         "\"ipv4_compat\":false,\"port_value\":443}},\"cluster_name\":\"fake_"
-                         "cluster\",\"degraded_healthy_host\":{},"
+                         "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"port_value\":443,"
+                         "\"resolver_name\":\"\","
+                         "\"ipv4_compat\":false,\"network_namespace_filepath\":\"\"}},\"cluster_"
+                         "name\":\"fake_cluster\","
+                         "\"timestamp\":\"2009-02-13T23:31:31.234Z\","
+                         "\"degraded_healthy_host\":{},"
                          "\"metadata\":{\"filter_metadata\":{},\"typed_filter_metadata\":{}},"
-                         "\"locality\":{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"},"
-                         "\"timestamp\":\"2009-02-13T23:31:31.234Z\"}\n"}));
-  event_logger.logDegraded(envoy::data::core::v3::HTTP, host);
+                         "\"locality\":{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"}}\n"}));
+  event_logger->logDegraded(envoy::data::core::v3::HTTP, host);
 
   EXPECT_CALL(*file, write(absl::string_view{
                          "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
-                         "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"resolver_name\":\"\","
-                         "\"ipv4_compat\":false,\"port_value\":443}},\"cluster_name\":\"fake_"
-                         "cluster\",\"no_longer_degraded_host\":{},"
+                         "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"port_value\":443,"
+                         "\"resolver_name\":\"\","
+                         "\"ipv4_compat\":false,\"network_namespace_filepath\":\"\"}},\"cluster_"
+                         "name\":\"fake_cluster\","
+                         "\"timestamp\":\"2009-02-13T23:31:31.234Z\","
+                         "\"no_longer_degraded_host\":{},"
                          "\"metadata\":{\"filter_metadata\":{},\"typed_filter_metadata\":{}},"
-                         "\"locality\":{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"},"
-                         "\"timestamp\":\"2009-02-13T23:31:31.234Z\"}\n"}));
-  event_logger.logNoLongerDegraded(envoy::data::core::v3::HTTP, host);
+                         "\"locality\":{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"}}\n"}));
+  event_logger->logNoLongerDegraded(envoy::data::core::v3::HTTP, host);
 }
 
 TEST(HealthCheckEventLoggerImplTest, OneEventLogger) {
@@ -6477,15 +6661,12 @@ TEST(HealthCheckEventLoggerImplTest, OneEventLogger) {
   config.set_event_log_path("foo");
   event_log->mutable_typed_config()->PackFrom(config);
 
-  NiceMock<AccessLog::MockAccessLogManager> log_manager;
+  NiceMock<Server::Configuration::MockServerFactoryContext> server_context;
   StringViewSaver file_log_data;
-  ON_CALL(*log_manager.file_, write(_)).WillByDefault(SaveArg<0>(&file_log_data));
+  ON_CALL(*server_context.access_log_manager_.file_, write(_))
+      .WillByDefault(SaveArg<0>(&file_log_data));
 
   NiceMock<Upstream::MockClusterMockPrioritySet> cluster;
-  Runtime::MockLoader runtime;
-  Event::MockDispatcher dispatcher;
-  NiceMock<ProtobufMessage::MockValidationVisitor> validation_visitor;
-  NiceMock<Api::MockApi> api;
 
   std::shared_ptr<MockHostDescription> host(new NiceMock<MockHostDescription>());
   NiceMock<MockClusterInfo> cluster_info;
@@ -6493,62 +6674,87 @@ TEST(HealthCheckEventLoggerImplTest, OneEventLogger) {
   ON_CALL(*host, cluster()).WillByDefault(ReturnRef(cluster_info));
   ON_CALL(*host, metadata()).WillByDefault(Return(metadata));
 
-  HealthCheckerFactoryContextImpl context(cluster, runtime, dispatcher, validation_visitor, api,
-                                          log_manager);
+  HealthCheckerFactoryContextImpl context(cluster, server_context);
 
   Event::SimulatedTimeSystem time_system;
   // This is rendered as "2009-02-13T23:31:31.234Z".a
   time_system.setSystemTime(std::chrono::milliseconds(1234567891234));
 
-  HealthCheckEventLoggerImpl event_logger(log_manager, time_system, health_check_config, context);
+  std::unique_ptr<HealthCheckEventLoggerImpl> event_logger =
+      *HealthCheckEventLoggerImpl::create(health_check_config, context);
 
-  event_logger.logEjectUnhealthy(envoy::data::core::v3::HTTP, host, envoy::data::core::v3::ACTIVE);
-  EXPECT_EQ(file_log_data, "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
-                           "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"resolver_name\":\"\","
-                           "\"ipv4_compat\":false,\"port_value\":443}},\"cluster_name\":\"fake_"
-                           "cluster\",\"eject_unhealthy_event\":{\"failure_type\":\"ACTIVE\"},"
-                           "\"metadata\":{\"filter_metadata\":{},\"typed_filter_metadata\":{}},"
-                           "\"locality\":{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"},"
-                           "\"timestamp\":\"2009-02-13T23:31:31.234Z\"}\n");
+  event_logger->logEjectUnhealthy(envoy::data::core::v3::HTTP, host, envoy::data::core::v3::ACTIVE);
+  EXPECT_EQ(
+      file_log_data.value(),
+      "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
+      "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"port_value\":443,\"resolver_name\":\"\","
+      "\"ipv4_compat\":false,\"network_namespace_filepath\":\"\"}},\"cluster_name\":\"fake_"
+      "cluster\","
+      "\"eject_unhealthy_event\":{\"failure_type\":\"ACTIVE\"},"
+      "\"timestamp\":\"2009-02-13T23:31:31.234Z\","
+      "\"metadata\":{\"filter_metadata\":{},\"typed_filter_metadata\":{}},"
+      "\"locality\":{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"}}\n");
 
-  event_logger.logAddHealthy(envoy::data::core::v3::HTTP, host, false);
-  EXPECT_EQ(file_log_data, "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
-                           "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"resolver_name\":\"\","
-                           "\"ipv4_compat\":false,\"port_value\":443}},\"cluster_name\":\"fake_"
-                           "cluster\",\"add_healthy_event\":{\"first_check\":false},\"metadata\":"
-                           "{\"filter_metadata\":{},\"typed_filter_metadata\":{}},\"locality\":"
-                           "{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"},\"timestamp\":"
-                           "\"2009-02-13T23:31:31.234Z\"}\n");
+  event_logger->logAddHealthy(envoy::data::core::v3::HTTP, host, false);
+  EXPECT_EQ(
+      file_log_data.value(),
+      "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
+      "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"port_value\":443,\"resolver_name\":\"\","
+      "\"ipv4_compat\":false,\"network_namespace_filepath\":\"\"}},\"cluster_name\":\"fake_"
+      "cluster\",\"add_healthy_event\":{\"first_check\":false},"
+      "\"timestamp\":\"2009-02-13T23:31:31.234Z\","
+      "\"metadata\":"
+      "{\"filter_metadata\":{},\"typed_filter_metadata\":{}},\"locality\":"
+      "{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"}}\n");
 
-  event_logger.logUnhealthy(envoy::data::core::v3::HTTP, host, envoy::data::core::v3::ACTIVE,
-                            false);
-  EXPECT_EQ(file_log_data.value(),
-            "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
-            "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"resolver_name\":\"\","
-            "\"ipv4_compat\":false,\"port_value\":443}},\"cluster_name\":\"fake_"
-            "cluster\",\"health_check_failure_event\":{\"failure_type\":\"ACTIVE\","
-            "\"first_check\":false},"
-            "\"metadata\":{\"filter_metadata\":{},\"typed_filter_metadata\":{}},"
-            "\"locality\":{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"},"
-            "\"timestamp\":\"2009-02-13T23:31:31.234Z\"}\n");
+  event_logger->logSuccessfulHealthCheck(envoy::data::core::v3::HTTP, host);
+  EXPECT_EQ(
+      file_log_data.value(),
+      "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
+      "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"port_value\":443,\"resolver_name\":\"\","
+      "\"ipv4_compat\":false,\"network_namespace_filepath\":\"\"}},\"cluster_name\":\"fake_"
+      "cluster\",\"timestamp\":\"2009-02-13T23:31:31.234Z\","
+      "\"metadata\":"
+      "{\"filter_metadata\":{},\"typed_filter_metadata\":{}},\"locality\":"
+      "{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"},\"successful_health_check_event\":{}}\n");
 
-  event_logger.logDegraded(envoy::data::core::v3::HTTP, host);
-  EXPECT_EQ(file_log_data, "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
-                           "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"resolver_name\":\"\","
-                           "\"ipv4_compat\":false,\"port_value\":443}},\"cluster_name\":\"fake_"
-                           "cluster\",\"degraded_healthy_host\":{},"
-                           "\"metadata\":{\"filter_metadata\":{},\"typed_filter_metadata\":{}},"
-                           "\"locality\":{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"},"
-                           "\"timestamp\":\"2009-02-13T23:31:31.234Z\"}\n");
+  event_logger->logUnhealthy(envoy::data::core::v3::HTTP, host, envoy::data::core::v3::ACTIVE,
+                             false);
+  EXPECT_EQ(
+      file_log_data.value(),
+      "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
+      "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"port_value\":443,\"resolver_name\":\"\","
+      "\"ipv4_compat\":false,\"network_namespace_filepath\":\"\"}},\"cluster_name\":\"fake_"
+      "cluster\","
+      "\"timestamp\":\"2009-02-13T23:31:31.234Z\","
+      "\"health_check_failure_event\":{\"failure_type\":\"ACTIVE\","
+      "\"first_check\":false},"
+      "\"metadata\":{\"filter_metadata\":{},\"typed_filter_metadata\":{}},"
+      "\"locality\":{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"}}\n");
 
-  event_logger.logNoLongerDegraded(envoy::data::core::v3::HTTP, host);
-  EXPECT_EQ(file_log_data, "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
-                           "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"resolver_name\":\"\","
-                           "\"ipv4_compat\":false,\"port_value\":443}},\"cluster_name\":\"fake_"
-                           "cluster\",\"no_longer_degraded_host\":{},"
-                           "\"metadata\":{\"filter_metadata\":{},\"typed_filter_metadata\":{}},"
-                           "\"locality\":{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"},"
-                           "\"timestamp\":\"2009-02-13T23:31:31.234Z\"}\n");
+  event_logger->logDegraded(envoy::data::core::v3::HTTP, host);
+  EXPECT_EQ(
+      file_log_data.value(),
+      "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
+      "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"port_value\":443,\"resolver_name\":\"\","
+      "\"ipv4_compat\":false,\"network_namespace_filepath\":\"\"}},\"cluster_name\":\"fake_"
+      "cluster\","
+      "\"timestamp\":\"2009-02-13T23:31:31.234Z\","
+      "\"degraded_healthy_host\":{},"
+      "\"metadata\":{\"filter_metadata\":{},\"typed_filter_metadata\":{}},"
+      "\"locality\":{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"}}\n");
+
+  event_logger->logNoLongerDegraded(envoy::data::core::v3::HTTP, host);
+  EXPECT_EQ(
+      file_log_data.value(),
+      "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
+      "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"port_value\":443,\"resolver_name\":\"\","
+      "\"ipv4_compat\":false,\"network_namespace_filepath\":\"\"}},\"cluster_name\":\"fake_"
+      "cluster\","
+      "\"timestamp\":\"2009-02-13T23:31:31.234Z\","
+      "\"no_longer_degraded_host\":{},"
+      "\"metadata\":{\"filter_metadata\":{},\"typed_filter_metadata\":{}},"
+      "\"locality\":{\"region\":\"\",\"zone\":\"\",\"sub_zone\":\"\"}}\n");
 }
 
 // Validate that the proto constraints don't allow zero length edge durations.
@@ -6645,6 +6851,402 @@ TEST(HealthCheckProto, Validation) {
     EXPECT_THROW_WITH_REGEX(TestUtility::validate(parseHealthCheckFromV3Yaml(yaml)), EnvoyException,
                             "Proto constraint validation failed.*value is required.*");
   }
+}
+
+// Tests for HTTP health check payload functionality.
+TEST_F(HttpHealthCheckerImplTest, PayloadPostMethod) {
+  const std::string yaml = R"EOF(
+    timeout: 1s
+    interval: 1s
+    unhealthy_threshold: 2
+    healthy_threshold: 2
+    http_health_check:
+      path: /healthcheck
+      method: POST
+      send:
+        text: "48656C6C6F20576F726C64"  # "Hello World" in hex
+    )EOF";
+
+  allocHealthChecker(yaml);
+  addCompletionCallback();
+
+  EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
+
+  cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
+  cluster_->info_->trafficStats()->upstream_cx_total_.inc();
+  expectSessionCreate();
+  expectStreamCreate(0);
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+
+  // Verify that POST method is used and body is sent.
+  Buffer::OwnedImpl expected_payload;
+  expected_payload.add("Hello World");
+
+  EXPECT_CALL(test_sessions_[0]->request_encoder_, encodeHeaders(_, false))
+      .WillOnce(Invoke([&](const Http::RequestHeaderMap& headers, bool end_stream) -> Http::Status {
+        EXPECT_EQ(headers.getMethodValue(), "POST");
+        EXPECT_EQ(headers.getPathValue(), "/healthcheck");
+        EXPECT_EQ(headers.getContentLengthValue(), "11"); // "Hello World" is 11 bytes
+        EXPECT_FALSE(end_stream); // Should not end stream yet as we have body to send
+        return Http::okStatus();
+      }));
+
+  EXPECT_CALL(test_sessions_[0]->request_encoder_, encodeData(_, true))
+      .WillOnce(Invoke([&](Buffer::Instance& data, bool end_stream) -> void {
+        EXPECT_EQ(data.toString(), "Hello World");
+        EXPECT_TRUE(end_stream); // Should end stream after sending body
+      }));
+
+  health_checker_->start();
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.max_interval", _));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.min_interval", _))
+      .WillOnce(Return(45000));
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_,
+              enableTimer(std::chrono::milliseconds(45000), _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+  respond(0, "200", false, false, true);
+  EXPECT_EQ(Host::Health::Healthy,
+            cluster_->prioritySet().getMockHostSet(0)->hosts_[0]->coarseHealth());
+}
+
+TEST_F(HttpHealthCheckerImplTest, PayloadPutMethod) {
+  const std::string yaml = R"EOF(
+    timeout: 1s
+    interval: 1s
+    unhealthy_threshold: 2
+    healthy_threshold: 2
+    http_health_check:
+      path: /api/health
+      method: PUT
+      send:
+        text: "7B0A20202270696E67223A20226F6B220A7D"  # {"ping": "ok"} in hex
+    )EOF";
+
+  allocHealthChecker(yaml);
+  addCompletionCallback();
+
+  EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
+
+  cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
+  cluster_->info_->trafficStats()->upstream_cx_total_.inc();
+  expectSessionCreate();
+  expectStreamCreate(0);
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+
+  // Verify that PUT method is used and JSON body is sent.
+  const std::string expected_json = "{\n  \"ping\": \"ok\"\n}";
+
+  EXPECT_CALL(test_sessions_[0]->request_encoder_, encodeHeaders(_, false))
+      .WillOnce(Invoke([&](const Http::RequestHeaderMap& headers, bool end_stream) -> Http::Status {
+        EXPECT_EQ(headers.getMethodValue(), "PUT");
+        EXPECT_EQ(headers.getPathValue(), "/api/health");
+        EXPECT_EQ(headers.getContentLengthValue(), std::to_string(expected_json.length()));
+        EXPECT_FALSE(end_stream);
+        return Http::okStatus();
+      }));
+
+  EXPECT_CALL(test_sessions_[0]->request_encoder_, encodeData(_, true))
+      .WillOnce(Invoke([&](Buffer::Instance& data, bool end_stream) -> void {
+        EXPECT_EQ(data.toString(), expected_json);
+        EXPECT_TRUE(end_stream);
+      }));
+
+  health_checker_->start();
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.max_interval", _));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.min_interval", _))
+      .WillOnce(Return(45000));
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_,
+              enableTimer(std::chrono::milliseconds(45000), _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+  respond(0, "200", false, false, true);
+  EXPECT_EQ(Host::Health::Healthy,
+            cluster_->prioritySet().getMockHostSet(0)->hosts_[0]->coarseHealth());
+}
+
+TEST_F(HttpHealthCheckerImplTest, PayloadGetMethodThrowsError) {
+  const std::string yaml = R"EOF(
+    timeout: 1s
+    interval: 1s
+    unhealthy_threshold: 2
+    healthy_threshold: 2
+    http_health_check:
+      path: /healthcheck
+      method: GET
+      send:
+        text: "48656C6C6F"  # "Hello" in hex
+    )EOF";
+
+  EXPECT_THROW_WITH_MESSAGE(
+      allocHealthChecker(yaml), EnvoyException,
+      "HTTP health check cannot specify a request payload with method 'GET'. "
+      "Only methods that support a request body (POST, PUT, PATCH, OPTIONS) can "
+      "be used with payload.");
+}
+
+TEST_F(HttpHealthCheckerImplTest, PayloadHeadMethodThrowsError) {
+  const std::string yaml = R"EOF(
+    timeout: 1s
+    interval: 1s
+    unhealthy_threshold: 2
+    healthy_threshold: 2
+    http_health_check:
+      path: /healthcheck
+      method: HEAD
+      send:
+        text: "48656C6C6F"  # "Hello" in hex
+    )EOF";
+
+  EXPECT_THROW_WITH_MESSAGE(
+      allocHealthChecker(yaml), EnvoyException,
+      "HTTP health check cannot specify a request payload with method 'HEAD'. "
+      "Only methods that support a request body (POST, PUT, PATCH, OPTIONS) can be used with "
+      "payload.");
+}
+
+TEST_F(HttpHealthCheckerImplTest, PayloadDeleteMethodThrowsError) {
+  const std::string yaml = R"EOF(
+    timeout: 1s
+    interval: 1s
+    unhealthy_threshold: 2
+    healthy_threshold: 2
+    http_health_check:
+      path: /healthcheck
+      method: DELETE
+      send:
+        text: "48656C6C6F"  # "Hello" in hex
+    )EOF";
+
+  EXPECT_THROW_WITH_MESSAGE(
+      allocHealthChecker(yaml), EnvoyException,
+      "HTTP health check cannot specify a request payload with method 'DELETE'. "
+      "Only methods that support a request body (POST, PUT, PATCH, OPTIONS) can be used with "
+      "payload.");
+}
+
+TEST_F(HttpHealthCheckerImplTest, PayloadTraceMethodThrowsError) {
+  const std::string yaml = R"EOF(
+    timeout: 1s
+    interval: 1s
+    unhealthy_threshold: 2
+    healthy_threshold: 2
+    http_health_check:
+      path: /healthcheck
+      method: TRACE
+      send:
+        text: "48656C6C6F"  # "Hello" in hex
+    )EOF";
+
+  EXPECT_THROW_WITH_MESSAGE(
+      allocHealthChecker(yaml), EnvoyException,
+      "HTTP health check cannot specify a request payload with method 'TRACE'. "
+      "Only methods that support a request body (POST, PUT, PATCH, OPTIONS) can be used with "
+      "payload.");
+}
+
+TEST_F(HttpHealthCheckerImplTest, PayloadOptionsMethodSuccess) {
+  const std::string yaml = R"EOF(
+    timeout: 1s
+    interval: 1s
+    unhealthy_threshold: 2
+    healthy_threshold: 2
+    http_health_check:
+      path: /healthcheck
+      method: OPTIONS
+      send:
+        text: "48656C6C6F"  # "Hello" in hex
+    )EOF";
+
+  allocHealthChecker(yaml);
+  addCompletionCallback();
+
+  EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
+
+  cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
+  cluster_->info_->trafficStats()->upstream_cx_total_.inc();
+  expectSessionCreate();
+  expectStreamCreate(0);
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+
+  EXPECT_CALL(test_sessions_[0]->request_encoder_, encodeHeaders(_, false))
+      .WillOnce(Invoke([&](const Http::RequestHeaderMap& headers, bool end_stream) -> Http::Status {
+        EXPECT_EQ(headers.getMethodValue(), "OPTIONS");
+        EXPECT_EQ(headers.getContentLengthValue(), "5"); // "Hello" is 5 bytes
+        EXPECT_FALSE(end_stream);
+        return Http::okStatus();
+      }));
+
+  EXPECT_CALL(test_sessions_[0]->request_encoder_, encodeData(_, true))
+      .WillOnce(Invoke([&](Buffer::Instance& data, bool end_stream) -> void {
+        EXPECT_EQ(data.toString(), "Hello");
+        EXPECT_TRUE(end_stream);
+      }));
+
+  health_checker_->start();
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.max_interval", _));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.min_interval", _))
+      .WillOnce(Return(45000));
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_,
+              enableTimer(std::chrono::milliseconds(45000), _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+  respond(0, "200", false, false, true);
+  EXPECT_EQ(Host::Health::Healthy,
+            cluster_->prioritySet().getMockHostSet(0)->hosts_[0]->coarseHealth());
+}
+
+TEST_F(HttpHealthCheckerImplTest, PayloadPatchMethodSuccess) {
+  const std::string yaml = R"EOF(
+    timeout: 1s
+    interval: 1s
+    unhealthy_threshold: 2
+    healthy_threshold: 2
+    http_health_check:
+      path: /healthcheck
+      method: PATCH
+      send:
+        text: "7B2274657374223A2274727565227D"  # {"test":"true"} in hex
+    )EOF";
+
+  allocHealthChecker(yaml);
+  addCompletionCallback();
+
+  EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
+
+  cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
+  cluster_->info_->trafficStats()->upstream_cx_total_.inc();
+  expectSessionCreate();
+  expectStreamCreate(0);
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+
+  EXPECT_CALL(test_sessions_[0]->request_encoder_, encodeHeaders(_, false))
+      .WillOnce(Invoke([&](const Http::RequestHeaderMap& headers, bool end_stream) -> Http::Status {
+        EXPECT_EQ(headers.getMethodValue(), "PATCH");
+        EXPECT_EQ(headers.getContentLengthValue(), "15"); // {"test":"true"} is 15 bytes
+        EXPECT_FALSE(end_stream);
+        return Http::okStatus();
+      }));
+
+  EXPECT_CALL(test_sessions_[0]->request_encoder_, encodeData(_, true))
+      .WillOnce(Invoke([&](Buffer::Instance& data, bool end_stream) -> void {
+        EXPECT_EQ(data.toString(), "{\"test\":\"true\"}");
+        EXPECT_TRUE(end_stream);
+      }));
+
+  health_checker_->start();
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.max_interval", _));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.min_interval", _))
+      .WillOnce(Return(45000));
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_,
+              enableTimer(std::chrono::milliseconds(45000), _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+  respond(0, "200", false, false, true);
+  EXPECT_EQ(Host::Health::Healthy,
+            cluster_->prioritySet().getMockHostSet(0)->hosts_[0]->coarseHealth());
+}
+
+TEST_F(HttpHealthCheckerImplTest, NoPayloadGetMethodDefault) {
+  const std::string yaml = R"EOF(
+    timeout: 1s
+    interval: 1s
+    unhealthy_threshold: 2
+    healthy_threshold: 2
+    http_health_check:
+      path: /healthcheck
+    )EOF";
+
+  allocHealthChecker(yaml);
+  addCompletionCallback();
+
+  EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
+
+  cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
+  cluster_->info_->trafficStats()->upstream_cx_total_.inc();
+  expectSessionCreate();
+  expectStreamCreate(0);
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+
+  // Verify that when no payload is specified, GET method works normally and no body is sent.
+  EXPECT_CALL(test_sessions_[0]->request_encoder_, encodeHeaders(_, true))
+      .WillOnce(Invoke([&](const Http::RequestHeaderMap& headers, bool end_stream) -> Http::Status {
+        EXPECT_EQ(headers.getMethodValue(), "GET");
+        EXPECT_EQ(headers.getPathValue(), "/healthcheck");
+        EXPECT_EQ(headers.ContentLength(), nullptr); // No Content-Length header should be set
+        EXPECT_TRUE(end_stream);                     // Should end stream as there's no body to send
+        return Http::okStatus();
+      }));
+
+  health_checker_->start();
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.max_interval", _));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.min_interval", _))
+      .WillOnce(Return(45000));
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_,
+              enableTimer(std::chrono::milliseconds(45000), _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+  respond(0, "200", false, false, true);
+  EXPECT_EQ(Host::Health::Healthy,
+            cluster_->prioritySet().getMockHostSet(0)->hosts_[0]->coarseHealth());
+}
+
+TEST_F(HttpHealthCheckerImplTest, MinimalPayloadPostMethod) {
+  const std::string yaml = R"EOF(
+    timeout: 1s
+    interval: 1s
+    unhealthy_threshold: 2
+    healthy_threshold: 2
+    http_health_check:
+      path: /healthcheck
+      method: POST
+      send:
+        text: "31"  # "1" in hex - minimal valid payload
+    )EOF";
+
+  allocHealthChecker(yaml);
+  addCompletionCallback();
+
+  EXPECT_CALL(*this, onHostStatus(_, HealthTransition::Unchanged));
+
+  cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
+      makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
+  cluster_->info_->trafficStats()->upstream_cx_total_.inc();
+  expectSessionCreate();
+  expectStreamCreate(0);
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, enableTimer(_, _));
+
+  // Verify that minimal payload is sent correctly.
+  EXPECT_CALL(test_sessions_[0]->request_encoder_, encodeHeaders(_, false))
+      .WillOnce(Invoke([&](const Http::RequestHeaderMap& headers, bool end_stream) -> Http::Status {
+        EXPECT_EQ(headers.getMethodValue(), "POST");
+        EXPECT_EQ(headers.getContentLengthValue(), "1"); // "1" is 1 byte
+        EXPECT_FALSE(end_stream);
+        return Http::okStatus();
+      }));
+
+  EXPECT_CALL(test_sessions_[0]->request_encoder_, encodeData(_, true))
+      .WillOnce(Invoke([&](Buffer::Instance& data, bool end_stream) -> void {
+        EXPECT_EQ(data.toString(), "1");
+        EXPECT_TRUE(end_stream);
+      }));
+
+  health_checker_->start();
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.max_interval", _));
+  EXPECT_CALL(runtime_.snapshot_, getInteger("health_check.min_interval", _))
+      .WillOnce(Return(45000));
+  EXPECT_CALL(*test_sessions_[0]->interval_timer_,
+              enableTimer(std::chrono::milliseconds(45000), _));
+  EXPECT_CALL(*test_sessions_[0]->timeout_timer_, disableTimer());
+  respond(0, "200", false, false, true);
+  EXPECT_EQ(Host::Health::Healthy,
+            cluster_->prioritySet().getMockHostSet(0)->hosts_[0]->coarseHealth());
 }
 
 } // namespace

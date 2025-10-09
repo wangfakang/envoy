@@ -20,6 +20,7 @@
 namespace Envoy {
 namespace {
 
+const char kTestKey[] = "test_key";
 const char ClusterName1[] = "cluster_1";
 const char ClusterName2[] = "cluster_2";
 const int UpstreamIndex1 = 1;
@@ -30,7 +31,8 @@ const int UpstreamIndex2 = 2;
  */
 #define ALL_TEST_XDS_TRACKER_STATS(COUNTER)                                                        \
   COUNTER(on_config_accepted)                                                                      \
-  COUNTER(on_config_rejected)
+  COUNTER(on_config_rejected)                                                                      \
+  COUNTER(on_config_metadata_read)
 
 /**
  * Struct definition for stats. @see stats_macros.h
@@ -48,14 +50,42 @@ public:
   TestXdsConfigTracker(Stats::Scope& scope) : stats_(generateStats("test_xds_tracker", scope)) {}
 
   void onConfigAccepted(const absl::string_view,
-                        const std::vector<Config::DecodedResourcePtr>&) override {
+                        const std::vector<Config::DecodedResourcePtr>& decoded_resources) override {
     stats_.on_config_accepted_.inc();
+    test::envoy::config::xds::TestTrackerMetadata test_metadata;
+    for (const auto& resource : decoded_resources) {
+      if (resource->metadata().has_value()) {
+        const auto& config_typed_metadata = resource->metadata()->typed_filter_metadata();
+        if (const auto& metadata_it = config_typed_metadata.find(kTestKey);
+            metadata_it != config_typed_metadata.end()) {
+          const auto status = Envoy::MessageUtil::unpackTo(metadata_it->second, test_metadata);
+          if (!status.ok()) {
+            continue;
+          }
+          stats_.on_config_metadata_read_.inc();
+        }
+      }
+    }
   }
 
   void onConfigAccepted(const absl::string_view,
-                        const Protobuf::RepeatedPtrField<envoy::service::discovery::v3::Resource>&,
+                        absl::Span<const envoy::service::discovery::v3::Resource* const> resources,
                         const Protobuf::RepeatedPtrField<std::string>&) override {
     stats_.on_config_accepted_.inc();
+    test::envoy::config::xds::TestTrackerMetadata test_metadata;
+    for (const auto* resource : resources) {
+      if (resource->has_metadata()) {
+        const auto& config_typed_metadata = resource->metadata().typed_filter_metadata();
+        if (const auto& metadata_it = config_typed_metadata.find(kTestKey);
+            metadata_it != config_typed_metadata.end()) {
+          const auto status = Envoy::MessageUtil::unpackTo(metadata_it->second, test_metadata);
+          if (!status.ok()) {
+            continue;
+          }
+          stats_.on_config_metadata_read_.inc();
+        }
+      }
+    }
   }
 
   void onConfigRejected(const envoy::service::discovery::v3::DiscoveryResponse&,
@@ -83,11 +113,10 @@ public:
 
   std::string name() const override { return "envoy.config.xds.test_xds_tracker"; };
 
-  Config::XdsConfigTrackerPtr createXdsConfigTracker(const ProtobufWkt::Any&,
+  Config::XdsConfigTrackerPtr createXdsConfigTracker(const Protobuf::Any&,
                                                      ProtobufMessage::ValidationVisitor&,
-                                                     Event::Dispatcher&,
-                                                     Stats::Scope& stats) override {
-    return std::make_unique<TestXdsConfigTracker>(stats);
+                                                     Api::Api& api, Event::Dispatcher&) override {
+    return std::make_unique<TestXdsConfigTracker>(api.rootScope());
   }
 };
 
@@ -168,16 +197,42 @@ TEST_P(XdsConfigTrackerIntegrationTest, XdsConfigTrackerSuccessCount) {
   Registry::InjectFactory<Config::XdsConfigTrackerFactory> registered(factory);
 
   initialize();
-  EXPECT_TRUE(compareDiscoveryRequest(Config::TypeUrl::get().Cluster, "", {}, {}, {}, true));
+  EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Cluster, "", {}, {}, {}, true));
 
   sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(
-      Config::TypeUrl::get().Cluster, {cluster1_, cluster2_}, {cluster1_, cluster2_}, {}, "1");
+      Config::TestTypeUrl::get().Cluster, {cluster1_, cluster2_}, {cluster1_, cluster2_}, {}, "1");
 
   // 3 because the statically specified CDS server itself counts as a cluster.
   test_server_->waitForGaugeGe("cluster_manager.active_clusters", 3);
 
   // onConfigAccepted is called when all the resources are accepted.
   test_server_->waitForCounterEq("test_xds_tracker.on_config_accepted", 1);
+  test_server_->waitForCounterEq("test_xds_tracker.on_config_metadata_read", 0);
+  EXPECT_EQ(1, test_server_->counter("test_xds_tracker.on_config_accepted")->value());
+}
+
+// This is to test the Resource wrapper usage with metadata field.
+TEST_P(XdsConfigTrackerIntegrationTest, XdsConfigTrackerSuccessCountWithWrapper) {
+  TestXdsConfigTrackerFactory factory;
+  Registry::InjectFactory<Config::XdsConfigTrackerFactory> registered(factory);
+
+  initialize();
+  EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Cluster, "", {}, {}, {}, true));
+
+  // Add a typed metadata to the Resource wrapper.
+  test::envoy::config::xds::TestTrackerMetadata test_metadata;
+  Protobuf::Any packed_value;
+  packed_value.PackFrom(test_metadata);
+  sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(
+      Config::TestTypeUrl::get().Cluster, {cluster1_, cluster2_}, {cluster1_, cluster2_}, {}, "1",
+      {{kTestKey, packed_value}});
+
+  // 3 because the statically specified CDS server itself counts as a cluster.
+  test_server_->waitForGaugeGe("cluster_manager.active_clusters", 3);
+
+  // onConfigAccepted is called when all the resources are accepted.
+  test_server_->waitForCounterEq("test_xds_tracker.on_config_accepted", 1);
+  test_server_->waitForCounterEq("test_xds_tracker.on_config_metadata_read", 2);
   EXPECT_EQ(1, test_server_->counter("test_xds_tracker.on_config_accepted")->value());
 }
 
@@ -186,24 +241,22 @@ TEST_P(XdsConfigTrackerIntegrationTest, XdsConfigTrackerFailureCount) {
   Registry::InjectFactory<Config::XdsConfigTrackerFactory> registered(factory);
 
   initialize();
-  EXPECT_TRUE(compareDiscoveryRequest(Config::TypeUrl::get().Cluster, "", {}, {}, {}, true));
+  EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Cluster, "", {}, {}, {}, true));
 
   const auto route_config =
       TestUtility::parseYaml<envoy::config::route::v3::RouteConfiguration>(R"EOF(
     name: my_route
     vhds:
       config_source:
-        resource_api_version: V3
         api_config_source:
           api_type: GRPC
-          transport_api_version: V3
           grpc_services:
             envoy_grpc:
               cluster_name: xds_cluster
     )EOF");
 
   sendDiscoveryResponse<envoy::config::route::v3::RouteConfiguration>(
-      Config::TypeUrl::get().Cluster, {route_config}, {route_config}, {}, "3");
+      Config::TestTypeUrl::get().Cluster, {route_config}, {route_config}, {}, "3");
 
   // Resources are rejected because Message's TypeUrl != Resource's
   test_server_->waitForCounterEq("test_xds_tracker.on_config_rejected", 1);
@@ -217,9 +270,9 @@ TEST_P(XdsConfigTrackerIntegrationTest, XdsConfigTrackerPartialUpdate) {
   initialize();
   // The first of duplicates has already been successfully applied,
   // and a duplicate exception should be threw.
-  EXPECT_TRUE(compareDiscoveryRequest(Config::TypeUrl::get().Cluster, "", {}, {}, {}, true));
+  EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Cluster, "", {}, {}, {}, true));
   sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(
-      Config::TypeUrl::get().Cluster, {cluster1_, cluster1_, cluster2_},
+      Config::TestTypeUrl::get().Cluster, {cluster1_, cluster1_, cluster2_},
       {cluster1_, cluster1_, cluster2_}, {}, "5");
 
   // For Delta, the response will be rejected when checking the message due to the duplication.

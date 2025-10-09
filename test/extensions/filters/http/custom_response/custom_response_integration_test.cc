@@ -24,8 +24,8 @@ using LocalResponsePolicyProto =
 using RedirectPolicyProto =
     envoy::extensions::http::custom_response::redirect_policy::v3::RedirectPolicy;
 using RedirectActionProto = envoy::config::route::v3::RedirectAction;
+using Envoy::Protobuf::Any;
 using Envoy::Protobuf::MapPair;
-using Envoy::ProtobufWkt::Any;
 
 namespace {
 
@@ -240,7 +240,7 @@ json_format:
       sendRequestAndWaitForResponse(default_request_headers_, 0, unauthorized_response_, 0);
   // Verify that we get the modified status value.
   EXPECT_EQ("499", response->headers().getStatusValue());
-  EXPECT_EQ("not allowed", response->body());
+  EXPECT_EQ("{\"message\":\"not allowed\"}\n", response->body());
   EXPECT_EQ(
       "x-bar",
       response->headers().get(::Envoy::Http::LowerCaseString("foo"))[0]->value().getStringView());

@@ -1,23 +1,46 @@
 #include "source/common/quic/envoy_quic_server_connection.h"
 
+#include <memory>
+
 #include "source/common/network/listen_socket_impl.h"
 #include "source/common/quic/envoy_quic_utils.h"
 #include "source/common/quic/quic_io_handle_wrapper.h"
 
+#include "quiche/quic/core/quic_packet_writer_wrapper.h"
+#include "quiche/quic/core/quic_packets.h"
+
 namespace Envoy {
 namespace Quic {
+
+namespace {
+std::unique_ptr<quic::QuicPacketWriterWrapper>
+wrapWriter(quic::QuicPacketWriter* writer,
+           quic::QuicPacketWriterWrapper::OnWriteDoneCallback on_write_done) {
+  auto wrapper = std::make_unique<quic::QuicPacketWriterWrapper>();
+  wrapper->set_non_owning_writer(writer);
+  wrapper->set_on_write_done(std::move(on_write_done));
+  return wrapper;
+}
+} // namespace
 
 EnvoyQuicServerConnection::EnvoyQuicServerConnection(
     const quic::QuicConnectionId& server_connection_id,
     quic::QuicSocketAddress initial_self_address, quic::QuicSocketAddress initial_peer_address,
     quic::QuicConnectionHelperInterface& helper, quic::QuicAlarmFactory& alarm_factory,
-    quic::QuicPacketWriter* writer, bool owns_writer,
-    const quic::ParsedQuicVersionVector& supported_versions,
-    Network::ConnectionSocketPtr connection_socket, quic::ConnectionIdGeneratorInterface& generator)
-    : quic::QuicConnection(server_connection_id, initial_self_address, initial_peer_address,
-                           &helper, &alarm_factory, writer, owns_writer,
-                           quic::Perspective::IS_SERVER, supported_versions, generator),
-      QuicNetworkConnection(std::move(connection_socket)) {
+    quic::QuicPacketWriter* writer, const quic::ParsedQuicVersionVector& supported_versions,
+    Network::ConnectionSocketPtr connection_socket, quic::ConnectionIdGeneratorInterface& generator,
+    std::unique_ptr<QuicListenerFilterManagerImpl> listener_filter_manager)
+    : quic::QuicConnection(
+          server_connection_id, initial_self_address, initial_peer_address, &helper, &alarm_factory,
+          // Wrap the packet writer to get notified when a packet is written.
+          wrapWriter(writer,
+                     [this](size_t packet_size, const quic::WriteResult& result) {
+                       OnWritePacketDone(packet_size, result);
+                     })
+              .release(),
+          /*owns_writer=*/true, quic::Perspective::IS_SERVER, supported_versions, generator),
+      QuicNetworkConnection(std::move(connection_socket)),
+      listener_filter_manager_(std::move(listener_filter_manager)) {
 #ifndef WIN32
   // Defer sending while processing UDP packets till the end of the current event loop to optimize
   // UDP GSO sendmsg efficiency. But this optimization causes some test failures under Windows,
@@ -43,9 +66,37 @@ bool EnvoyQuicServerConnection::OnPacketHeader(const quic::QuicPacketHeader& hea
   return true;
 }
 
+void EnvoyQuicServerConnection::OnWritePacketDone(size_t packet_size,
+                                                  const quic::WriteResult& /*result*/) {
+  if (hasConnectionStats()) {
+    connectionStats().write_total_.add(packet_size);
+  }
+}
+
 void EnvoyQuicServerConnection::OnCanWrite() {
   quic::QuicConnection::OnCanWrite();
   onWriteEventDone();
+}
+
+void EnvoyQuicServerConnection::ProcessUdpPacket(const quic::QuicSocketAddress& self_address,
+                                                 const quic::QuicSocketAddress& peer_address,
+                                                 const quic::QuicReceivedPacket& packet) {
+  if (!first_packet_received_) {
+    if (listener_filter_manager_ != nullptr) {
+      listener_filter_manager_->onFirstPacketReceived(packet);
+    }
+    first_packet_received_ = true;
+  }
+
+  quic::QuicConnection::ProcessUdpPacket(self_address, peer_address, packet);
+};
+
+void EnvoyQuicServerConnection::OnEffectivePeerMigrationValidated(bool is_migration_linkable) {
+  quic::QuicConnection::OnEffectivePeerMigrationValidated(is_migration_linkable);
+  if (listener_filter_manager_ != nullptr && networkConnection() != nullptr) {
+    // This connection might become closed after this call.
+    listener_filter_manager_->onPeerAddressChanged(effective_peer_address(), *networkConnection());
+  }
 }
 
 } // namespace Quic

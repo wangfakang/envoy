@@ -36,6 +36,26 @@ In the case of HTTP/1.1, the codec translates the serial/pipelining capabilities
 that looks like HTTP/2 to higher layers. This means that the majority of the code does not need to
 understand whether a stream originated on an HTTP/1.1, HTTP/2, or HTTP/3 connection.
 
+HTTP lifecycle
+--------------
+
+Proxying of the request begins when the downstream HTTP codec has successfully decoded request header map.
+
+The point at which the proxying completes and the stream is destroyed depends on the upstream protocol and
+whether independent half close is enabled.
+
+If independent half-close is enabled and the upstream protocol is either HTTP/2 or HTTP/3 protocols the stream
+is destroyed after both request and response are complete i.e. reach their respective end-of-stream,
+by receiving trailers or the header/body with end-stream set in both directions AND response has
+success (2xx) status code.
+
+For HTTP/1 upstream protocol or if independent half-close is disabled the stream is destroyed when the response
+is complete and reaches its end-of-stream, i.e. when trailers or the response header/body with
+end-stream set are received, even if the request has not yet completed. If the request was incomplete at response
+completion, the stream is reset.
+
+Note that proxying can stop early when an error or timeout occurred or when a peer reset HTTP/2 or HTTP/3 stream.
+
 HTTP header sanitizing
 ----------------------
 
@@ -242,6 +262,10 @@ upstream will be modified by:
 
 #. Putting the fully qualified original request URL in the ``x-envoy-original-url`` header.
 #. Replacing the ``Authority``/``Host``, ``Scheme``, and ``Path`` headers with the values from the ``Location`` header.
+#. Copying any headers listed in
+   :ref:`response_headers_to_copy<envoy_v3_api_field_config.route.v3.InternalRedirectPolicy.response_headers_to_copy>`
+   from the redirect response into the headers that will be used in the
+   subsequent request.
 
 The altered request headers will then have a new route selected, be sent through a new filter chain,
 and then shipped upstream with all of the normal Envoy request sanitization taking place.
@@ -251,6 +275,11 @@ and then shipped upstream with all of the normal Envoy request sanitization taki
   applied once. Per-route header modifications will be applied on both the original route and the
   second route, even if they are the same, so be careful configuring header modification rules to
   avoid duplicating undesired header values.
+
+.. warning::
+  Note that no downstream filters will see the response that triggers the internal redirect. If there is a need
+  to pass data between the redirect response and the followup request, see
+  :ref:`response_headers_to_copy<envoy_v3_api_field_config.route.v3.InternalRedirectPolicy.response_headers_to_copy>`.
 
 A sample redirect flow might look like this:
 

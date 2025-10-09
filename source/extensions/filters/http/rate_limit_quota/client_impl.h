@@ -4,19 +4,19 @@
 
 #include "envoy/config/core/v3/grpc_service.pb.h"
 #include "envoy/grpc/async_client_manager.h"
-#include "envoy/service/rate_limit_quota/v3/rlqs.pb.h"
 
 #include "source/common/grpc/typed_async_client.h"
 #include "source/extensions/filters/http/common/factory_base.h"
-#include "source/extensions/filters/http/rate_limit_quota/client.h"
-
-#include "absl/status/status.h"
+#include "source/extensions/filters/http/rate_limit_quota/global_client_impl.h"
+#include "source/extensions/filters/http/rate_limit_quota/quota_bucket_cache.h"
 
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
 namespace RateLimitQuota {
 
+using ::envoy::service::rate_limit_quota::v3::BucketId;
+using ::envoy::service::rate_limit_quota::v3::RateLimitQuotaResponse;
 using ::envoy::service::rate_limit_quota::v3::RateLimitQuotaUsageReports;
 using BucketQuotaUsage =
     ::envoy::service::rate_limit_quota::v3::RateLimitQuotaUsageReports::BucketQuotaUsage;
@@ -24,50 +24,40 @@ using GrpcAsyncClient =
     Grpc::AsyncClient<envoy::service::rate_limit_quota::v3::RateLimitQuotaUsageReports,
                       envoy::service::rate_limit_quota::v3::RateLimitQuotaResponse>;
 
-// Grpc bidirectional streaming client which handles the communication with RLS server.
-class RateLimitClientImpl : public RateLimitClient,
-                            public Grpc::AsyncStreamCallbacks<
-                                envoy::service::rate_limit_quota::v3::RateLimitQuotaResponse>,
-                            public Logger::Loggable<Logger::Id::rate_limit_quota> {
+// A RateLimitClient that should be created locally in each worker thread. It
+// knows to write by posting GlobalRateLimitClientImpl calls to the main thread
+// and it knows how to read current values from TLS.
+class LocalRateLimitClientImpl : public RateLimitClient,
+                                 public Logger::Loggable<Logger::Id::rate_limit_quota> {
 public:
-  RateLimitClientImpl(const envoy::config::core::v3::GrpcService& grpc_service,
-                      Server::Configuration::FactoryContext& context)
-      : aync_client_(context.clusterManager().grpcAsyncClientManager().getOrCreateRawAsyncClient(
-            grpc_service, context.scope(), true)) {}
+  explicit LocalRateLimitClientImpl(
+      GlobalRateLimitClientImpl* global_client,
+      Envoy::ThreadLocal::TypedSlot<ThreadLocalBucketsCache>& buckets_cache_tls)
+      : global_client_(global_client), buckets_cache_tls_(buckets_cache_tls) {}
 
-  void onReceiveMessage(RateLimitQuotaResponsePtr&& response) override;
-
-  // RawAsyncStreamCallbacks
-  void onCreateInitialMetadata(Http::RequestHeaderMap&) override {}
-  void onReceiveInitialMetadata(Http::ResponseHeaderMapPtr&&) override {}
-  void onReceiveTrailingMetadata(Http::ResponseTrailerMapPtr&&) override {}
-  void onRemoteClose(Grpc::Status::GrpcStatus status, const std::string& message) override;
-
-  // RateLimitClient
-  void rateLimit(RateLimitQuotaCallbacks& callbacks) override;
-
-  absl::Status startStream(const StreamInfo::StreamInfo& stream_info);
-  void closeStream();
-  void send(envoy::service::rate_limit_quota::v3::RateLimitQuotaUsageReports&& reports,
-            bool end_stream);
+  void createBucket(const BucketId& bucket_id, size_t id, const BucketAction& default_bucket_action,
+                    std::unique_ptr<envoy::type::v3::RateLimitStrategy> fallback_action,
+                    std::chrono::milliseconds fallback_ttl, bool initial_request_allowed) override;
+  // Note: returns null if the global resources (client or bucket) are
+  // unavailable. Resource creation is left to createBucket(). The CachedBucket*
+  // is safe to reference so long as the local client exists.
+  std::shared_ptr<CachedBucket> getBucket(size_t id) override;
 
 private:
-  // Store the client as the bare object since there is no ownership transfer involved.
-  GrpcAsyncClient aync_client_;
-  Grpc::AsyncStream<RateLimitQuotaUsageReports> stream_{};
-  RateLimitQuotaCallbacks* callbacks_{};
-  // TODO(tyxia) Further look at the use of this flag later.
-  bool stream_closed_ = false;
+  inline std::shared_ptr<BucketsCache> getBucketsCache() {
+    return (buckets_cache_tls_.get().has_value()) ? buckets_cache_tls_.get()->quota_buckets_
+                                                  : nullptr;
+  }
+
+  // Lockless access to global resources via TLS.
+  GlobalRateLimitClientImpl* global_client_;
+  ThreadLocal::TypedSlot<ThreadLocalBucketsCache>& buckets_cache_tls_;
 };
 
-using RateLimitClientPtr = std::unique_ptr<RateLimitClientImpl>;
-/**
- * Create the rate limit client. It is uniquely owned by each worker thread.
- */
-inline RateLimitClientPtr
-createRateLimitClient(Server::Configuration::FactoryContext& context,
-                      const envoy::config::core::v3::GrpcService& grpc_service) {
-  return std::make_unique<RateLimitClientImpl>(grpc_service, context);
+inline std::unique_ptr<RateLimitClient>
+createLocalRateLimitClient(GlobalRateLimitClientImpl* global_client,
+                           ThreadLocal::TypedSlot<ThreadLocalBucketsCache>& buckets_cache_tls_) {
+  return std::make_unique<LocalRateLimitClientImpl>(global_client, buckets_cache_tls_);
 }
 
 } // namespace RateLimitQuota

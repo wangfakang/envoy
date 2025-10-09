@@ -4,6 +4,7 @@
 #include "envoy/config/bootstrap/v3/bootstrap.pb.h"
 #include "envoy/config/cluster/v3/cluster.pb.h"
 #include "envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.pb.h"
+#include "envoy/extensions/filters/network/tcp_proxy/v3/tcp_proxy.pb.h"
 #include "envoy/network/address.h"
 
 #include "source/common/buffer/buffer_impl.h"
@@ -35,8 +36,6 @@ namespace {
 #if defined(__SANITIZE_ADDRESS__)
 #define ASANITIZED /* Sanitized by GCC */
 #endif
-
-using testing::HasSubstr;
 
 std::string protocolTestParamsAndBoolToString(
     const ::testing::TestParamInfo<std::tuple<HttpProtocolTestParams, bool>>& params) {
@@ -78,7 +77,7 @@ void runOnWorkerThreadsAndWaitforCompletion(Server::Instance& server, std::funct
 
 void waitForNumTurns(std::vector<uint64_t>& turns, absl::Mutex& mu, uint32_t expected_size) {
 
-  absl::MutexLock l(&mu);
+  absl::MutexLock l(mu);
   auto check_data_in_connection_output_buffer = [&turns, &mu, expected_size]() {
     mu.AssertHeld();
     return turns.size() == expected_size;
@@ -138,11 +137,7 @@ public:
     }
 
     const HttpProtocolTestParams& protocol_test_params = std::get<0>(GetParam());
-    setupHttp1ImplOverrides(protocol_test_params.http1_implementation);
     setupHttp2ImplOverrides(protocol_test_params.http2_implementation);
-    config_helper_.addRuntimeOverride(
-        Runtime::defer_processing_backedup_streams,
-        protocol_test_params.defer_processing_backedup_streams ? "true" : "false");
 
     setServerBufferFactory(buffer_factory_);
     setUpstreamProtocol(protocol_test_params.upstream_protocol);
@@ -153,9 +148,6 @@ protected:
   std::shared_ptr<Buffer::TrackedWatermarkBufferFactory> buffer_factory_;
 
   bool streamBufferAccounting() { return std::get<1>(GetParam()); }
-  bool deferProcessingBackedUpStreams() {
-    return Runtime::runtimeFeatureEnabled(Runtime::defer_processing_backedup_streams);
-  }
 
   std::string printAccounts() {
     std::stringstream stream;
@@ -373,7 +365,6 @@ TEST_P(Http2BufferWatermarksTest, ShouldTrackAllocatedBytesToShadowUpstream) {
   const uint32_t request_body_size = 4096;
   const uint32_t response_body_size = 4096;
   TestScopedRuntime scoped_runtime;
-  scoped_runtime.mergeValues({{"envoy.reloadable_features.streaming_shadow", "true"}});
 
   autonomous_upstream_ = true;
   autonomous_allow_incomplete_streams_ = true;
@@ -486,7 +477,6 @@ public:
       buffer_factory_ = std::make_shared<Buffer::TrackedWatermarkBufferFactory>();
     }
     const HttpProtocolTestParams& protocol_test_params = std::get<0>(GetParam());
-    setupHttp1ImplOverrides(protocol_test_params.http1_implementation);
     setupHttp2ImplOverrides(protocol_test_params.http2_implementation);
     setServerBufferFactory(buffer_factory_);
     setUpstreamProtocol(protocol_test_params.upstream_protocol);
@@ -604,6 +594,82 @@ TEST_P(ProtocolsBufferWatermarksTest, ResettingStreamUnregistersAccount) {
   } else {
     EXPECT_TRUE(buffer_factory_->waitForExpectedAccountUnregistered(0));
   }
+}
+
+class TcpTunnelingWatermarkIntegrationTest : public Http2BufferWatermarksTest {
+public:
+  void SetUp() override {
+    enableHalfClose(true);
+
+    setDownstreamProtocol(std::get<0>(GetParam()).downstream_protocol);
+    setUpstreamProtocol(std::get<0>(GetParam()).upstream_protocol);
+
+    config_helper_.addConfigModifier(
+        [&](envoy::config::bootstrap::v3::Bootstrap& bootstrap) -> void {
+          envoy::extensions::filters::network::tcp_proxy::v3::TcpProxy proxy_config;
+          proxy_config.set_stat_prefix("tcp_stats");
+          proxy_config.set_cluster("cluster_0");
+          proxy_config.mutable_tunneling_config()->set_hostname("foo.lyft.com:80");
+
+          auto* listener = bootstrap.mutable_static_resources()->add_listeners();
+          listener->set_name("tcp_proxy");
+          auto* socket_address = listener->mutable_address()->mutable_socket_address();
+          socket_address->set_address(Network::Test::getLoopbackAddressString(version_));
+          socket_address->set_port_value(0);
+
+          auto* filter_chain = listener->add_filter_chains();
+          auto* filter = filter_chain->add_filters();
+          filter->mutable_typed_config()->PackFrom(proxy_config);
+          filter->set_name("envoy.filters.network.tcp_proxy");
+
+          RELEASE_ASSERT(bootstrap.mutable_static_resources()->clusters_size() >= 1, "");
+          ConfigHelper::HttpProtocolOptions protocol_options;
+          auto* options =
+              protocol_options.mutable_explicit_http_config()->mutable_http2_protocol_options();
+          options->mutable_initial_stream_window_size()->set_value(65536);
+          ConfigHelper::setProtocolOptions(
+              *bootstrap.mutable_static_resources()->mutable_clusters(0), protocol_options);
+        });
+  }
+
+  void runTest() {
+    config_helper_.setBufferLimits(16384, 131072);
+    initialize();
+
+    write_matcher_->setDestinationPort(fake_upstreams_[0]->localAddress()->ip()->port());
+
+    tcp_client_ = makeTcpConnection(lookupPort("tcp_proxy"));
+    ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+    ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+    ASSERT_TRUE(upstream_request_->waitForHeadersComplete());
+    upstream_request_->encodeHeaders(default_response_headers_, false);
+
+    write_matcher_->setWriteReturnsEgain();
+    ASSERT_TRUE(tcp_client_->write(std::string(524288, 'a'), false));
+    test_server_->waitForCounterEq("tcp.tcp_stats.downstream_flow_control_paused_reading_total", 1);
+    tcp_client_->close();
+  }
+
+protected:
+  IntegrationTcpClientPtr tcp_client_;
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    IpVersions, TcpTunnelingWatermarkIntegrationTest,
+    testing::Combine(testing::ValuesIn(HttpProtocolIntegrationTest::getProtocolTestParams(
+                         {Http::CodecType::HTTP2}, {FakeHttpConnection::Type::HTTP2})),
+                     testing::Bool()),
+    protocolTestParamsAndBoolToString);
+
+TEST_P(TcpTunnelingWatermarkIntegrationTest, MultipleReadDisableCallsIncrementsStatsOnce) {
+  config_helper_.setBufferLimits(16384, 131072);
+  runTest();
+}
+
+TEST_P(TcpTunnelingWatermarkIntegrationTest,
+       MultipleReadDisableCallsIncrementsStatsOnceWithUpstreamFilters) {
+  config_helper_.addRuntimeOverride(Runtime::upstream_http_filters_with_tcp_proxy, "true");
+  runTest();
 }
 
 class Http2OverloadManagerIntegrationTest : public Http2BufferWatermarksTest,
@@ -812,105 +878,6 @@ TEST_P(Http2OverloadManagerIntegrationTest,
   EXPECT_EQ(smallest_response->headers().getStatusValue(), "200");
 }
 
-TEST_P(Http2OverloadManagerIntegrationTest, CanResetStreamIfEnvoyLevelStreamEnded) {
-  // This test is not applicable if expand_agnostic_stream_lifetime is enabled
-  // as the gap between lifetimes of the codec level and envoy level stream
-  // shrinks.
-  if (Runtime::runtimeFeatureEnabled(Runtime::expand_agnostic_stream_lifetime)) {
-    return;
-  }
-
-  useAccessLog("%RESPONSE_CODE%");
-  initializeOverloadManagerInBootstrap(
-      TestUtility::parseYaml<envoy::config::overload::v3::OverloadAction>(R"EOF(
-      name: "envoy.overload_actions.reset_high_memory_stream"
-      triggers:
-        - name: "envoy.resource_monitors.testonly.fake_resource_monitor"
-          scaled:
-            scaling_threshold: 0.90
-            saturation_threshold: 0.98
-    )EOF"));
-  initialize();
-
-  // Set 10MiB receive window for the client.
-  const int downstream_window_size = 10 * 1024 * 1024;
-  envoy::config::core::v3::Http2ProtocolOptions http2_options =
-      ::Envoy::Http2::Utility::initializeAndValidateOptions(
-          envoy::config::core::v3::Http2ProtocolOptions());
-  http2_options.mutable_initial_stream_window_size()->set_value(downstream_window_size);
-  http2_options.mutable_initial_connection_window_size()->set_value(downstream_window_size);
-  codec_client_ = makeRawHttpConnection(makeClientConnection(lookupPort("http")), http2_options);
-
-  // Makes us have Envoy's writes to downstream return EAGAIN
-  write_matcher_->setSourcePort(lookupPort("http"));
-  write_matcher_->setWriteReturnsEgain();
-
-  // Send a request
-  auto encoder_decoder = codec_client_->startRequest(Http::TestRequestHeaderMapImpl{
-      {":method", "POST"},
-      {":path", "/"},
-      {":scheme", "http"},
-      {":authority", "host"},
-      {"content-length", "10"},
-  });
-  auto& encoder = encoder_decoder.first;
-  const std::string data(10, 'a');
-  codec_client_->sendData(encoder, data, true);
-  auto response = std::move(encoder_decoder.second);
-
-  waitForNextUpstreamRequest();
-  FakeStreamPtr upstream_request_for_response = std::move(upstream_request_);
-
-  // Send the responses back. It is larger than the downstream's receive window
-  // size. Thus, the codec will not end the stream, but the Envoy level stream
-  // should.
-  upstream_request_for_response->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}},
-                                               false);
-  const int response_size = downstream_window_size + 1024; // Slightly over the window size.
-  upstream_request_for_response->encodeData(response_size, true);
-
-  if (streamBufferAccounting()) {
-    if (deferProcessingBackedUpStreams()) {
-      // Wait for an accumulation of data, as we cannot rely on the access log
-      // output since we're deferring the processing of the stream data.
-      EXPECT_TRUE(buffer_factory_->waitUntilTotalBufferedExceeds(10 * 10 * 1024));
-
-    } else {
-      // Wait for access log to know the Envoy level stream has been deleted.
-      EXPECT_THAT(waitForAccessLog(access_log_name_), HasSubstr("200"));
-    }
-  }
-
-  // Set the pressure so the overload action kills the response if doing stream
-  // accounting
-  updateResource(0.95);
-  test_server_->waitForGaugeEq(
-      "overload.envoy.overload_actions.reset_high_memory_stream.scale_percent", 62);
-
-  if (streamBufferAccounting()) {
-    test_server_->waitForCounterGe("envoy.overload_actions.reset_high_memory_stream.count", 1);
-  }
-
-  // Reduce resource pressure
-  updateResource(0.80);
-  test_server_->waitForGaugeEq(
-      "overload.envoy.overload_actions.reset_high_memory_stream.scale_percent", 0);
-
-  // Resume writes to downstream.
-  write_matcher_->setResumeWrites();
-
-  if (streamBufferAccounting()) {
-    EXPECT_TRUE(response->waitForReset());
-    EXPECT_TRUE(response->reset());
-  } else {
-    // If we're not doing the accounting, we didn't end up resetting the
-    // streams.
-    ASSERT_TRUE(response->waitForEndStream());
-    ASSERT_TRUE(response->complete());
-    EXPECT_EQ(response->headers().getStatusValue(), "200");
-  }
-}
-
 class Http2DeferredProcessingIntegrationTest : public Http2BufferWatermarksTest {
 public:
   Http2DeferredProcessingIntegrationTest() : registered_tee_factory_(tee_filter_factory_) {
@@ -948,7 +915,7 @@ protected:
     test_server_->waitForCounterEq("http.config_test.downstream_flow_control_resumed_reading_total",
                                    0);
     EXPECT_TRUE(tee_filter_factory_.inspectStreamTee(1, [](const StreamTee& tee) {
-      absl::MutexLock l{&tee.mutex_};
+      absl::MutexLock l{tee.mutex_};
       EXPECT_EQ(tee.request_body_.length(), 1000);
     }));
 
@@ -1002,7 +969,7 @@ protected:
     test_server_->waitForCounterEq("cluster.cluster_0.upstream_flow_control_resumed_reading_total",
                                    0);
     EXPECT_TRUE(tee_filter_factory_.inspectStreamTee(1, [](const StreamTee& tee) {
-      absl::MutexLock l{&tee.mutex_};
+      absl::MutexLock l{tee.mutex_};
       EXPECT_EQ(tee.response_body_.length(), 1000);
     }));
 
@@ -1059,9 +1026,6 @@ INSTANTIATE_TEST_SUITE_P(
 TEST_P(Http2DeferredProcessingIntegrationTest, CanBufferInDownstreamCodec) {
   config_helper_.setBufferLimits(1000, 1000);
   initialize();
-  if (!deferProcessingBackedUpStreams()) {
-    return;
-  }
 
   // Stop writes to the upstream.
   write_matcher_->setDestinationPort(fake_upstreams_[0]->localAddress()->ip()->port());
@@ -1085,7 +1049,7 @@ TEST_P(Http2DeferredProcessingIntegrationTest, CanBufferInDownstreamCodec) {
   test_server_->waitForCounterEq("http.config_test.downstream_flow_control_resumed_reading_total",
                                  0);
   EXPECT_TRUE(tee_filter_factory_.inspectStreamTee(1, [](const StreamTee& tee) {
-    absl::MutexLock l{&tee.mutex_};
+    absl::MutexLock l{tee.mutex_};
     EXPECT_EQ(tee.request_body_.length(), 1000);
   }));
 
@@ -1104,9 +1068,6 @@ TEST_P(Http2DeferredProcessingIntegrationTest, CanBufferInDownstreamCodec) {
 TEST_P(Http2DeferredProcessingIntegrationTest, CanBufferInUpstreamCodec) {
   config_helper_.setBufferLimits(1000, 1000);
   initialize();
-  if (!deferProcessingBackedUpStreams()) {
-    return;
-  }
 
   // Stop writes to the downstream.
   write_matcher_->setSourcePort(lookupPort("http"));
@@ -1131,7 +1092,7 @@ TEST_P(Http2DeferredProcessingIntegrationTest, CanBufferInUpstreamCodec) {
   test_server_->waitForCounterEq("cluster.cluster_0.upstream_flow_control_resumed_reading_total",
                                  0);
   EXPECT_TRUE(tee_filter_factory_.inspectStreamTee(1, [](const StreamTee& tee) {
-    absl::MutexLock l{&tee.mutex_};
+    absl::MutexLock l{tee.mutex_};
     EXPECT_EQ(tee.response_body_.length(), 1000);
   }));
 
@@ -1149,9 +1110,6 @@ TEST_P(Http2DeferredProcessingIntegrationTest, CanBufferInUpstreamCodec) {
 TEST_P(Http2DeferredProcessingIntegrationTest, CanDeferOnStreamCloseForUpstream) {
   config_helper_.setBufferLimits(1000, 1000);
   initialize();
-  if (!deferProcessingBackedUpStreams()) {
-    return;
-  }
 
   // Stop writes to the downstream.
   write_matcher_->setSourcePort(lookupPort("http"));
@@ -1176,7 +1134,7 @@ TEST_P(Http2DeferredProcessingIntegrationTest, CanDeferOnStreamCloseForUpstream)
   test_server_->waitForCounterEq("cluster.cluster_0.upstream_flow_control_resumed_reading_total",
                                  0);
   EXPECT_TRUE(tee_filter_factory_.inspectStreamTee(1, [](const StreamTee& tee) {
-    absl::MutexLock l{&tee.mutex_};
+    absl::MutexLock l{tee.mutex_};
     EXPECT_EQ(tee.response_body_.length(), 1000);
   }));
 
@@ -1194,9 +1152,6 @@ TEST_P(Http2DeferredProcessingIntegrationTest,
        ShouldCloseDeferredUpstreamOnStreamCloseIfLocalReply) {
   config_helper_.setBufferLimits(9000, 9000);
   initialize();
-  if (!deferProcessingBackedUpStreams()) {
-    return;
-  }
 
   // Stop writes to the downstream.
   write_matcher_->setSourcePort(lookupPort("http"));
@@ -1235,7 +1190,7 @@ TEST_P(Http2DeferredProcessingIntegrationTest,
   test_server_->waitForCounterEq("cluster.cluster_0.upstream_flow_control_resumed_reading_total",
                                  0);
   EXPECT_TRUE(tee_filter_factory_.inspectStreamTee(1, [](const StreamTee& tee) {
-    absl::MutexLock l{&tee.mutex_};
+    absl::MutexLock l{tee.mutex_};
     EXPECT_EQ(tee.response_body_.length(), 9000);
   }));
 
@@ -1253,9 +1208,6 @@ TEST_P(Http2DeferredProcessingIntegrationTest,
        ShouldCloseDeferredUpstreamOnStreamCloseIfResetByDownstream) {
   config_helper_.setBufferLimits(1000, 1000);
   initialize();
-  if (!deferProcessingBackedUpStreams()) {
-    return;
-  }
 
   // Stop writes to the downstream.
   write_matcher_->setSourcePort(lookupPort("http"));
@@ -1285,7 +1237,7 @@ TEST_P(Http2DeferredProcessingIntegrationTest,
   test_server_->waitForCounterEq("cluster.cluster_0.upstream_flow_control_resumed_reading_total",
                                  0);
   EXPECT_TRUE(tee_filter_factory_.inspectStreamTee(1, [](const StreamTee& tee) {
-    absl::MutexLock l{&tee.mutex_};
+    absl::MutexLock l{tee.mutex_};
     EXPECT_EQ(tee.response_body_.length(), 1000);
   }));
 
@@ -1300,9 +1252,6 @@ TEST_P(Http2DeferredProcessingIntegrationTest,
 TEST_P(Http2DeferredProcessingIntegrationTest, CanRoundRobinBetweenStreams) {
   config_helper_.setBufferLimits(10000, 10000);
   initialize();
-  if (!deferProcessingBackedUpStreams()) {
-    return;
-  }
 
   // Stop writes to the upstream.
   write_matcher_->setDestinationPort(fake_upstreams_[0]->localAddress()->ip()->port());
@@ -1338,7 +1287,7 @@ TEST_P(Http2DeferredProcessingIntegrationTest, CanRoundRobinBetweenStreams) {
       [&turns, &mu](StreamTee& tee, Http::StreamDecoderFilterCallbacks* decoder_callbacks)
           ABSL_EXCLUSIVE_LOCKS_REQUIRED(tee.mutex_) -> Http::FilterDataStatus {
     (void)tee; // silence gcc unused warning (the absl annotation usage didn't mark it used.)
-    absl::MutexLock l(&mu);
+    absl::MutexLock l(mu);
     turns.push_back(decoder_callbacks->streamId());
     return Http::FilterDataStatus::Continue;
   };
@@ -1389,7 +1338,7 @@ TEST_P(Http2DeferredProcessingIntegrationTest, CanRoundRobinBetweenStreams) {
   // Check that during deferred processing we round robin between the streams.
   // Turns in the sequence 0-3 and 8-11 should match.
   {
-    absl::MutexLock l(&mu);
+    absl::MutexLock l(mu);
     for (uint32_t i = 0; i < num_requests; ++i) {
       EXPECT_EQ(turns[i], turns[i + 8]);
     }
@@ -1400,9 +1349,6 @@ TEST_P(Http2DeferredProcessingIntegrationTest, CanRoundRobinBetweenStreams) {
 TEST_P(Http2DeferredProcessingIntegrationTest, RoundRobinWithStreamsExiting) {
   config_helper_.setBufferLimits(10000, 10000);
   initialize();
-  if (!deferProcessingBackedUpStreams()) {
-    return;
-  }
 
   // Stop writes to the downstream.
   write_matcher_->setSourcePort(lookupPort("http"));
@@ -1421,7 +1367,7 @@ TEST_P(Http2DeferredProcessingIntegrationTest, RoundRobinWithStreamsExiting) {
   auto record_turns_on_encode_and_stop_writes_on_endstream =
       [this, &turns, &mu](StreamTee& tee, Http::StreamEncoderFilterCallbacks* encoder_callbacks)
           ABSL_EXCLUSIVE_LOCKS_REQUIRED(tee.mutex_) -> Http::FilterDataStatus {
-    absl::MutexLock l(&mu);
+    absl::MutexLock l(mu);
     turns.push_back(encoder_callbacks->streamId());
 
     if (tee.encode_end_stream_) {
@@ -1465,26 +1411,26 @@ TEST_P(Http2DeferredProcessingIntegrationTest, RoundRobinWithStreamsExiting) {
   // a chance.
   waitForNumTurns(turns, mu, 5);
   {
-    absl::MutexLock l(&mu);
+    absl::MutexLock l(mu);
     // Check ordering as expected.
     EXPECT_EQ(turns[3], turns[0]);
     EXPECT_EQ(turns[4], turns[1]);
   }
   tee_filter_factory_.inspectStreamTee(tee_filter_factory_.computeClientStreamId(0),
                                        [](const StreamTee& tee) {
-                                         absl::MutexLock l{&tee.mutex_};
+                                         absl::MutexLock l{tee.mutex_};
                                          EXPECT_EQ(tee.response_body_.length(), 8000);
                                        });
 
   tee_filter_factory_.inspectStreamTee(tee_filter_factory_.computeClientStreamId(1),
                                        [](const StreamTee& tee) {
-                                         absl::MutexLock l{&tee.mutex_};
+                                         absl::MutexLock l{tee.mutex_};
                                          EXPECT_TRUE(tee.encode_end_stream_);
                                        });
 
   tee_filter_factory_.inspectStreamTee(tee_filter_factory_.computeClientStreamId(2),
                                        [](const StreamTee& tee) {
-                                         absl::MutexLock l{&tee.mutex_};
+                                         absl::MutexLock l{tee.mutex_};
                                          EXPECT_EQ(tee.response_body_.length(), 4000);
                                        });
 
@@ -1500,12 +1446,12 @@ TEST_P(Http2DeferredProcessingIntegrationTest, RoundRobinWithStreamsExiting) {
   // buffer stopping the 3rd stream from flushing its buffered data.
   tee_filter_factory_.inspectStreamTee(tee_filter_factory_.computeClientStreamId(2),
                                        [](const StreamTee& tee) {
-                                         absl::MutexLock l{&tee.mutex_};
+                                         absl::MutexLock l{tee.mutex_};
                                          EXPECT_TRUE(tee.encode_end_stream_);
                                        });
   tee_filter_factory_.inspectStreamTee(tee_filter_factory_.computeClientStreamId(0),
                                        [](const StreamTee& tee) {
-                                         absl::MutexLock l{&tee.mutex_};
+                                         absl::MutexLock l{tee.mutex_};
                                          EXPECT_EQ(tee.response_body_.length(), 8000);
                                        });
   // The 1st stream will finish.
@@ -1513,7 +1459,7 @@ TEST_P(Http2DeferredProcessingIntegrationTest, RoundRobinWithStreamsExiting) {
   waitForNumTurns(turns, mu, 7);
   tee_filter_factory_.inspectStreamTee(tee_filter_factory_.computeClientStreamId(0),
                                        [](const StreamTee& tee) {
-                                         absl::MutexLock l{&tee.mutex_};
+                                         absl::MutexLock l{tee.mutex_};
                                          EXPECT_TRUE(tee.encode_end_stream_);
                                        });
   // All responses would have drained to client.
@@ -1539,9 +1485,6 @@ TEST_P(Http2DeferredProcessingIntegrationTest, ChunkProcessesStreams) {
       });
 
   initialize();
-  if (!deferProcessingBackedUpStreams()) {
-    return;
-  }
 
   // Stop writes to the upstream.
   write_matcher_->setDestinationPort(fake_upstreams_[0]->localAddress()->ip()->port());
@@ -1560,7 +1503,7 @@ TEST_P(Http2DeferredProcessingIntegrationTest, ChunkProcessesStreams) {
   auto record_on_decode =
       [this, &turns, &mu](StreamTee& tee, Http::StreamDecoderFilterCallbacks* decoder_callbacks)
           ABSL_EXCLUSIVE_LOCKS_REQUIRED(tee.mutex_) -> Http::FilterDataStatus {
-    absl::MutexLock l(&mu);
+    absl::MutexLock l(mu);
     turns.emplace_back(decoder_callbacks->streamId(), tee.request_body_.length());
 
     // Allows us to build more than chunk size in a stream, as the
@@ -1617,7 +1560,7 @@ TEST_P(Http2DeferredProcessingIntegrationTest, ChunkProcessesStreams) {
   EXPECT_TRUE(upstream_requests[2]->waitForData(*dispatcher_, 131000));
 
   {
-    absl::MutexLock l(&mu);
+    absl::MutexLock l(mu);
     // The 3rd stream should have gone multiple times to drain out the 128KiB of
     // data. Each chunk drain is 10KB.
     ASSERT_GE(turns.size(), 3);
@@ -1652,12 +1595,9 @@ TEST_P(Http2DeferredProcessingIntegrationTest, ChunkProcessesStreams) {
 TEST_P(Http2DeferredProcessingIntegrationTest, CanDumpCrashInformationWhenProcessingBufferedData) {
   config_helper_.setBufferLimits(1000, 1000);
   initialize();
-  if (!deferProcessingBackedUpStreams()) {
-    return;
-  }
 
   EXPECT_DEATH(testCrashDumpWhenProcessingBufferedData(),
-               "Crashing as request body over 1000!.*"
+               "(?s)Crashing as request body over 1000!.*"
                "ActiveStream.*Http2::ConnectionImpl.*Dumping current stream.*"
                "ConnectionImpl::StreamImpl.*ConnectionImpl");
 }
@@ -1666,11 +1606,8 @@ TEST_P(Http2DeferredProcessingIntegrationTest,
        CanDumpCrashInformationWhenProcessingBufferedDataOfDeferredCloseStream) {
   config_helper_.setBufferLimits(1000, 1000);
   initialize();
-  if (!deferProcessingBackedUpStreams()) {
-    return;
-  }
   EXPECT_DEATH(testCrashDumpWhenProcessingBufferedDataOfDeferredCloseStream(),
-               "Crashing as response body over 1000!.*"
+               "(?s)Crashing as response body over 1000!.*"
                "ActiveStream.*Http2::ConnectionImpl.*Dumping 1 Active Streams.*"
                "ConnectionImpl::StreamImpl.*ConnectionImpl");
 }

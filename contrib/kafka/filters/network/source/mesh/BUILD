@@ -4,7 +4,6 @@ load(
     "envoy_cc_library",
     "envoy_contrib_package",
 )
-load("//bazel:envoy_internal.bzl", "envoy_external_dep_path")
 
 licenses(["notice"])  # Apache 2
 
@@ -237,6 +236,7 @@ envoy_cc_library(
     ],
     tags = ["skip_on_windows"],
     deps = [
+        "//envoy/common:exception_lib",
         "//source/common/common:assert_lib",
         "//source/common/common:minimal_logger_lib",
         "@envoy_api//contrib/envoy/extensions/filters/network/kafka_mesh/v3alpha:pkg_cc_proto",
@@ -252,7 +252,9 @@ envoy_cc_library(
     ],
     tags = ["skip_on_windows"],
     deps = [
-        envoy_external_dep_path("librdkafka"),
+        "//bazel/foreign_cc:librdkafka",
+        "//envoy/common:pure_lib",
+        "@com_google_absl//absl/strings",
     ],
 )
 
@@ -267,7 +269,7 @@ envoy_cc_library(
     tags = ["skip_on_windows"],
     deps = [
         ":librdkafka_utils_lib",
-        envoy_external_dep_path("librdkafka"),
+        "//bazel/foreign_cc:librdkafka",
         "//source/common/common:macros",
     ],
 )

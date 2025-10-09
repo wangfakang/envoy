@@ -28,7 +28,8 @@ public:
   bool packTraceReason() { return pack_trace_reason_; }
 
   // Envoy::Http::RequestIDExtension
-  void set(Envoy::Http::RequestHeaderMap& request_headers, bool force) override;
+  void set(Envoy::Http::RequestHeaderMap& request_headers, bool edge_request,
+           bool keep_external_id) override;
   void setInResponse(Envoy::Http::ResponseHeaderMap& response_headers,
                      const Envoy::Http::RequestHeaderMap& request_headers) override;
   absl::optional<absl::string_view>
@@ -73,12 +74,12 @@ public:
   }
   Envoy::Http::RequestIDExtensionSharedPtr
   createExtensionInstance(const Protobuf::Message& config,
-                          Server::Configuration::CommonFactoryContext& context) override {
+                          Server::Configuration::FactoryContext& context) override {
     return std::make_shared<UUIDRequestIDExtension>(
         MessageUtil::downcastAndValidate<
             const envoy::extensions::request_id::uuid::v3::UuidRequestIdConfig&>(
             config, context.messageValidationVisitor()),
-        context.api().randomGenerator());
+        context.serverFactoryContext().api().randomGenerator());
   }
 };
 

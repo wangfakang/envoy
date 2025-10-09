@@ -22,13 +22,13 @@ to be eligible for the program:
    :ref:`execution environment <arch_overview_google_vrp_ee>` and be consistent with the
    program's :ref:`threat model <arch_overview_google_vrp_threat_model>`.
 
-2. Vulnerabilities must be reported to envoy-security@googlegroups.com and be kept under embargo
-   while triage and potential security releases occur. Please follow the :repo:`disclosure guidance
-   <SECURITY.md#disclosures>` when submitting reports. Disclosure SLOs are documented :repo:`here
-   <SECURITY.md#fix-and-disclosure-slos>`. In general, security disclosures are subject to the
-   `Linux Foundation's privacy policy <https://www.linuxfoundation.org/privacy/>`_ with the added
-   proviso that VRP reports (including reporter e-mail address and name) may be freely shared with
-   Google for VRP purposes.
+2. Vulnerabilities must be reported to **both** envoy-security@googlegroups.com and via https://bughunters.google.com/report.
+   Vulenrabilities must be kept under embargo while triage and potential security releases occur.
+   Please follow the :repo:`disclosure guidance <SECURITY.md#disclosures>` when submitting reports.
+   Disclosure SLOs are documented :repo:`here <SECURITY.md#fix-and-disclosure-slos>`. In general,
+   security disclosures are subject to the `Linux Foundation's privacy policy
+   <https://www.linuxfoundation.org/privacy/>`_ with the added proviso that VRP reports (including
+   reporter e-mail address and name) may be freely shared with Google for VRP purposes.
 
 3. Vulnerabilities must not be previously known in a public forum, e.g. GitHub issues trackers,
    CVE databases (when previously associated with Envoy), etc. Existing CVEs that have not been
@@ -42,6 +42,8 @@ the above criteria. If multiple instances of the same vulnerability are reported
 independent researchers or the vulnerability is already tracked under embargo by the OSS Envoy
 security team, we will aim to fairly divide the reward amongst reporters.
 
+Rewards should be claimed from Google VRP following the corresponding Envoy security release.
+
 .. _arch_overview_google_vrp_threat_model:
 
 Threat model
@@ -53,9 +55,13 @@ attack surface for the initial stages of this program. We exclude any threat fro
 
 * Untrusted control planes.
 * Runtime services such as access logging, external authorization, etc.
-* Untrusted upstreams.
 * DoS attacks except as stipulated below.
-* Any filters apart from the HTTP connection manager network filter and HTTP router filter.
+* Any extensions in the ``contrib`` directory.
+* Any extensions that do not have ``stable`` status.
+* Any extensions that do not have security_posture ``robust_to_untrusted_downstream`` or ``robust_to_untrusted_downstream_and_upstream``
+  in the most recent `manifest <https://github.com/envoyproxy/envoy/blob/HEAD/source/extensions/extensions_metadata.yaml>`_.
+* Extensions with the ``robust_to_untrusted_downstream`` security posture do not qualify for vulnerabilties that require
+  untrusted upstream.
 * Admin console; this is disabled in the execution environment.
 
 We also explicitly exclude any local attacks (e.g. via local processes, shells, etc.) against

@@ -6,11 +6,13 @@
 #include "envoy/common/random_generator.h"
 #include "envoy/config/grpc_mux.h"
 #include "envoy/grpc/async_client.h"
+#include "envoy/grpc/status.h"
 
 #include "source/common/common/backoff_strategy.h"
 #include "source/common/common/token_bucket_impl.h"
 #include "source/common/config/utility.h"
 #include "source/common/grpc/typed_async_client.h"
+#include "source/extensions/config_subscription/grpc/grpc_stream_interface.h"
 
 namespace Envoy {
 namespace Config {
@@ -21,18 +23,28 @@ template <class ResponseProto> using ResponseProtoPtr = std::unique_ptr<Response
 // xDS variants). Reestablishes the gRPC channel when necessary, and provides rate limiting of
 // requests.
 template <class RequestProto, class ResponseProto>
-class GrpcStream : public Grpc::AsyncStreamCallbacks<ResponseProto>,
+class GrpcStream : public GrpcStreamInterface<RequestProto, ResponseProto>,
                    public Logger::Loggable<Logger::Id::config> {
 public:
-  GrpcStream(GrpcStreamCallbacks<ResponseProto>* callbacks, Grpc::RawAsyncClientPtr async_client,
+  // The entry value corresponding to the grpc stream's configuration entry index.
+  enum class ConnectedStateValue {
+    // The first entry in the config corresponds to the primary xDS source.
+    FirstEntry = 1,
+    // The second entry in the config corresponds to the failover xDS source.
+    SecondEntry
+  };
+
+  GrpcStream(GrpcStreamCallbacks<ResponseProto>* callbacks,
+             Grpc::RawAsyncClientSharedPtr&& async_client,
              const Protobuf::MethodDescriptor& service_method, Event::Dispatcher& dispatcher,
              Stats::Scope& scope, BackOffStrategyPtr backoff_strategy,
-             const RateLimitSettings& rate_limit_settings)
+             const RateLimitSettings& rate_limit_settings, ConnectedStateValue connected_state_val)
       : callbacks_(callbacks), async_client_(std::move(async_client)),
         service_method_(service_method),
         control_plane_stats_(Utility::generateControlPlaneStats(scope)),
         time_source_(dispatcher.timeSource()), backoff_strategy_(std::move(backoff_strategy)),
-        rate_limiting_enabled_(rate_limit_settings.enabled_) {
+        rate_limiting_enabled_(rate_limit_settings.enabled_),
+        connected_state_val_(connected_state_val) {
     retry_timer_ = dispatcher.createTimer([this]() -> void { establishNewStream(); });
     if (rate_limiting_enabled_) {
       // Default Bucket contains 100 tokens maximum and refills at 10 tokens/sec.
@@ -46,7 +58,8 @@ public:
     }
   }
 
-  void establishNewStream() {
+  void establishNewStream() override {
+    stream_intentionally_closed_ = false;
     ENVOY_LOG(debug, "Establishing new gRPC bidi stream to {} for {}", async_client_.destination(),
               service_method_.DebugString());
     if (stream_ != nullptr) {
@@ -58,17 +71,17 @@ public:
     if (stream_ == nullptr) {
       ENVOY_LOG(debug, "Unable to establish new stream to configuration server {}",
                 async_client_.destination());
-      callbacks_->onEstablishmentFailure();
+      callbacks_->onEstablishmentFailure(true);
       setRetryTimer();
       return;
     }
-    control_plane_stats_.connected_state_.set(1);
+    control_plane_stats_.connected_state_.set(static_cast<uint64_t>(connected_state_val_));
     callbacks_->onStreamEstablished();
   }
 
-  bool grpcStreamAvailable() const { return stream_ != nullptr; }
+  bool grpcStreamAvailable() const override { return stream_ != nullptr; }
 
-  void sendMessage(const RequestProto& request) { stream_->sendMessage(request, false); }
+  void sendMessage(const RequestProto& request) override { stream_->sendMessage(request, false); }
 
   // Grpc::AsyncStreamCallbacks
   void onCreateInitialMetadata(Http::RequestHeaderMap& metadata) override {
@@ -88,7 +101,7 @@ public:
     // Sometimes during hot restarts this stat's value becomes inconsistent and will continue to
     // have 0 until it is reconnected. Setting here ensures that it is consistent with the state of
     // management server connection.
-    control_plane_stats_.connected_state_.set(1);
+    control_plane_stats_.connected_state_.set(static_cast<uint64_t>(connected_state_val_));
     callbacks_->onDiscoveryResponse(std::move(message), control_plane_stats_);
   }
 
@@ -100,11 +113,17 @@ public:
     logClose(status, message);
     stream_ = nullptr;
     control_plane_stats_.connected_state_.set(0);
-    callbacks_->onEstablishmentFailure();
-    setRetryTimer();
+    // By default Envoy will reconnect to the same server, so pass true here.
+    // This will be overridden by the mux-failover if Envoy will reconnect to a
+    // different server.
+    callbacks_->onEstablishmentFailure(true);
+    // Only retry the timer if not intentionally closed by Envoy.
+    if (!stream_intentionally_closed_) {
+      setRetryTimer();
+    }
   }
 
-  void maybeUpdateQueueSizeStat(uint64_t size) {
+  void maybeUpdateQueueSizeStat(uint64_t size) override {
     // Although request_queue_.push() happens elsewhere, the only time the queue is non-transiently
     // non-empty is when it remains non-empty after a drain attempt. (The push() doesn't matter
     // because we always attempt this drain immediately after the push). Basically, a change in
@@ -117,7 +136,7 @@ public:
     }
   }
 
-  bool checkRateLimitAllowsDrain() {
+  bool checkRateLimitAllowsDrain() override {
     if (!rate_limiting_enabled_ || limit_request_->consume(1, false)) {
       return true;
     }
@@ -130,7 +149,25 @@ public:
     return false;
   }
 
-  absl::optional<Grpc::Status::GrpcStatus> getCloseStatus() { return last_close_status_; }
+  void closeStream() override {
+    ENVOY_LOG_MISC(debug, "Intentionally closing the gRPC stream to {}",
+                   async_client_.destination());
+    retry_timer_->disableTimer();
+    if (rate_limiting_enabled_) {
+      drain_request_timer_->disableTimer();
+    }
+    control_plane_stats_.connected_state_.set(0);
+    logClose(Grpc::Status::WellKnownGrpcStatus::Ok, "Envoy initiated close.");
+    if (stream_ != nullptr) {
+      stream_.resetStream();
+      stream_ = nullptr;
+    }
+    stream_intentionally_closed_ = true;
+  }
+
+  absl::optional<Grpc::Status::GrpcStatus> getCloseStatusForTest() const {
+    return last_close_status_;
+  }
 
 private:
   void setRetryTimer() {
@@ -235,11 +272,17 @@ private:
   const bool rate_limiting_enabled_;
   Event::TimerPtr drain_request_timer_;
 
+  // A stream value to be set in the control_plane.connected_state gauge once
+  // the gRPC-stream is establishing a connection or connected to the server.
+  ConnectedStateValue connected_state_val_;
+
   // Records the initial message and timestamp of the most recent remote closes with the same
   // status.
   absl::optional<Grpc::Status::GrpcStatus> last_close_status_;
   std::string last_close_message_;
   MonotonicTime last_close_time_;
+
+  bool stream_intentionally_closed_{false};
 };
 
 } // namespace Config

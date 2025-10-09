@@ -5,6 +5,7 @@
 #include "source/common/http/codec_client.h"
 #include "source/common/http/exception.h"
 #include "source/common/network/listen_socket_impl.h"
+#include "source/common/network/tcp_listener_impl.h"
 #include "source/common/network/utility.h"
 #include "source/common/stream_info/stream_info_impl.h"
 #include "source/common/upstream/upstream_impl.h"
@@ -30,7 +31,7 @@
 
 using testing::_;
 using testing::AtMost;
-using testing::ByMove;
+using testing::ByMove; // NOLINT(misc-unused-using-decls)
 using testing::Invoke;
 using testing::InvokeWithoutArgs;
 using testing::NiceMock;
@@ -91,7 +92,7 @@ public:
   std::shared_ptr<Upstream::MockIdleTimeEnabledClusterInfo> cluster_{
       new NiceMock<Upstream::MockIdleTimeEnabledClusterInfo>()};
   Upstream::HostDescriptionConstSharedPtr host_{
-      Upstream::makeTestHostDescription(cluster_, "tcp://127.0.0.1:80", simTime())};
+      Upstream::makeTestHostDescription(cluster_, "tcp://127.0.0.1:80")};
   NiceMock<StreamInfo::MockStreamInfo> stream_info_;
 #ifdef ENVOY_ENABLE_UHV
   NiceMock<MockClientHeaderValidator>* header_validator_{new NiceMock<MockClientHeaderValidator>};
@@ -488,15 +489,22 @@ TEST_F(CodecClientTest, ResponseHeaderValidationFailsWithConnectionClosure) {
 class CodecNetworkTest : public Event::TestUsingSimulatedTime,
                          public testing::TestWithParam<Network::Address::IpVersion> {
 public:
-  CodecNetworkTest() : api_(Api::createApiForTest()), stream_info_(api_->timeSource(), nullptr) {
+  CodecNetworkTest()
+      : api_(Api::createApiForTest()),
+        stream_info_(api_->timeSource(), nullptr, StreamInfo::FilterState::LifeSpan::Connection) {
     dispatcher_ = api_->allocateDispatcher("test_thread");
     auto socket = std::make_shared<Network::Test::TcpListenSocketImmediateListen>(
         Network::Test::getCanonicalLoopbackAddress(GetParam()));
     Network::ClientConnectionPtr client_connection = dispatcher_->createClientConnection(
         socket->connectionInfoProvider().localAddress(), source_address_,
         Network::Test::createRawBufferSocket(), nullptr, nullptr);
-    upstream_listener_ =
-        dispatcher_->createListener(std::move(socket), listener_callbacks_, runtime_, true, false);
+    NiceMock<Network::MockListenerConfig> listener_config;
+    Server::ThreadLocalOverloadStateOptRef overload_state;
+    upstream_listener_ = std::make_unique<Network::TcpListenerImpl>(
+        *dispatcher_, api_->randomGenerator(), runtime_, std::move(socket), listener_callbacks_,
+        listener_config.bindToPort(), listener_config.ignoreGlobalConnLimit(),
+        listener_config.shouldBypassOverloadManager(),
+        listener_config.maxConnectionsToAcceptPerSocketEvent(), overload_state);
     client_connection_ = client_connection.get();
     client_connection_->addConnectionCallbacks(client_callbacks_);
 
@@ -517,6 +525,7 @@ public:
             dispatcher_->exit();
           }
         }));
+    EXPECT_CALL(listener_callbacks_, recordConnectionsAcceptedOnSocketEvent(_));
 
     EXPECT_CALL(client_callbacks_, onEvent(Network::ConnectionEvent::Connected))
         .WillOnce(InvokeWithoutArgs([&]() -> void {
@@ -563,7 +572,7 @@ protected:
   std::unique_ptr<CodecClientForTest> client_;
   std::shared_ptr<Upstream::MockClusterInfo> cluster_{new NiceMock<Upstream::MockClusterInfo>()};
   Upstream::HostDescriptionConstSharedPtr host_{
-      Upstream::makeTestHostDescription(cluster_, "tcp://127.0.0.1:80", simTime())};
+      Upstream::makeTestHostDescription(cluster_, "tcp://127.0.0.1:80")};
   Network::ConnectionPtr upstream_connection_;
   NiceMock<Network::MockConnectionCallbacks> upstream_callbacks_;
   Network::ClientConnection* client_connection_{};

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # This file was imported from https://github.com/bazelbuild/bazel at d6fec93.
 
@@ -23,18 +23,22 @@
 if [ -f SOURCE_VERSION ]
 then
     echo "BUILD_SCM_REVISION $(cat SOURCE_VERSION)"
+    echo "ENVOY_BUILD_SCM_REVISION $(cat SOURCE_VERSION)"
     echo "STABLE_BUILD_SCM_REVISION $(cat SOURCE_VERSION)"
     echo "BUILD_SCM_STATUS Distribution"
     exit 0
 fi
 
-if [[ -n "$BAZEL_FAKE_SCM_REVISION" ]]; then
+if [[ -e ".BAZEL_FAKE_SCM_REVISION" ]]; then
+    BAZEL_FAKE_SCM_REVISION="$(cat .BAZEL_FAKE_SCM_REVISION)"
     echo "BUILD_SCM_REVISION $BAZEL_FAKE_SCM_REVISION"
+    echo "ENVOY_BUILD_SCM_REVISION $BAZEL_FAKE_SCM_REVISION"
     echo "STABLE_BUILD_SCM_REVISION $BAZEL_FAKE_SCM_REVISION"
 else
     # The code below presents an implementation that works for git repository
     git_rev=$(git rev-parse HEAD) || exit 1
     echo "BUILD_SCM_REVISION ${git_rev}"
+    echo "ENVOY_BUILD_SCM_REVISION ${git_rev}"
     echo "STABLE_BUILD_SCM_REVISION ${git_rev}"
 fi
 

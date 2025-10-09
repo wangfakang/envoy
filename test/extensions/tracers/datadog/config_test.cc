@@ -68,7 +68,7 @@ public:
     tracer_ = std::make_unique<Tracer>(
         datadog_config.collector_cluster(),
         DatadogTracerFactory::makeCollectorReferenceHost(datadog_config),
-        DatadogTracerFactory::makeConfig(datadog_config), cm_, *stats_.rootScope(), tls_);
+        DatadogTracerFactory::makeConfig(datadog_config), cm_, *stats_.rootScope(), tls_, time_);
   }
 
   void setupValidDriver() {
@@ -80,7 +80,7 @@ public:
   }
 
   const std::string operation_name_{"test"};
-  Http::TestRequestHeaderMapImpl request_headers_{
+  Tracing::TestTraceContextImpl request_headers_{
       {":path", "/"}, {":method", "GET"}, {"x-request-id", "foo"}};
 
   NiceMock<ThreadLocal::MockInstance> tls_;
@@ -91,7 +91,13 @@ public:
 
   NiceMock<Tracing::MockConfig> config_;
   std::unique_ptr<Tracer> tracer_;
+  Event::SimulatedTimeSystem time_;
 };
+
+TEST_F(DatadogConfigTest, DefaultConfiguration) {
+  envoy::config::trace::v3::DatadogConfig datadog_config;
+  EXPECT_EQ(datadog_config.has_remote_config(), false);
+}
 
 TEST_F(DatadogConfigTest, ConfigureTracer) {
   {
@@ -109,11 +115,42 @@ TEST_F(DatadogConfigTest, ConfigureTracer) {
   }
 
   {
-    auto datadog_config =
-        makeConfig<envoy::config::trace::v3::DatadogConfig>("collector_cluster: fake_cluster");
+    const std::string yaml_conf = R"EOF(
+      collector_cluster: fake_cluster
+      remote_config: {}
+    )EOF";
+
+    auto datadog_config = makeConfig<envoy::config::trace::v3::DatadogConfig>(yaml_conf);
 
     cm_.initializeClusters({"fake_cluster"}, {});
+
+    EXPECT_CALL(tls_.dispatcher_, createTimer_(testing::_)).Times(2);
+    Http::MockAsyncClientRequest request(&cm_.thread_local_cluster_.async_client_);
+    Http::AsyncClient::Callbacks* callbacks;
+    EXPECT_CALL(cm_.thread_local_cluster_.async_client_, send_(_, _, _))
+        .WillOnce(
+            Invoke([&](Http::RequestMessagePtr&, Http::AsyncClient::Callbacks& callbacks_arg,
+                       const Http::AsyncClient::RequestOptions&) -> Http::AsyncClient::Request* {
+              callbacks = &callbacks_arg;
+              return &request;
+            }));
+
     setup(datadog_config, true);
+
+    Http::ResponseMessagePtr msg(new Http::ResponseMessageImpl(
+        Http::ResponseHeaderMapPtr{new Http::TestResponseHeaderMapImpl{{":status", "202"}}}));
+    msg->body().add("{}");
+    callbacks->onSuccess(request, std::move(msg));
+
+    EXPECT_CALL(cm_.thread_local_cluster_.async_client_, send_(_, _, _))
+        .WillOnce(
+            Invoke([&](Http::RequestMessagePtr&, Http::AsyncClient::Callbacks& callbacks_arg,
+                       const Http::AsyncClient::RequestOptions&) -> Http::AsyncClient::Request* {
+              callbacks = &callbacks_arg;
+              return &request;
+            }));
+    EXPECT_CALL(request, cancel());
+    tracer_.reset();
   }
 }
 
@@ -128,6 +165,8 @@ TEST_F(DatadogConfigTest, ConfigureViaFactory) {
       "@type": type.googleapis.com/envoy.config.trace.v3.DatadogConfig
       collector_cluster: fake_cluster
       service_name: fake_file
+      remote_config:
+        polling_interval: "10s"
    )EOF");
 
   DatadogTracerFactory factory;
@@ -144,7 +183,33 @@ TEST_F(DatadogConfigTest, AllowCollectorClusterToBeAddedViaApi) {
   auto datadog_config =
       makeConfig<envoy::config::trace::v3::DatadogConfig>("collector_cluster: fake_cluster");
 
+  EXPECT_CALL(tls_.dispatcher_, createTimer_(testing::_));
+  Http::MockAsyncClientRequest request(&cm_.thread_local_cluster_.async_client_);
+  Http::AsyncClient::Callbacks* callbacks;
+  EXPECT_CALL(cm_.thread_local_cluster_.async_client_, send_(_, _, _))
+      .WillOnce(
+          Invoke([&](Http::RequestMessagePtr&, Http::AsyncClient::Callbacks& callbacks_arg,
+                     const Http::AsyncClient::RequestOptions&) -> Http::AsyncClient::Request* {
+            callbacks = &callbacks_arg;
+            return &request;
+          }));
+
   setup(datadog_config, true);
+
+  Http::ResponseMessagePtr msg(new Http::ResponseMessageImpl(
+      Http::ResponseHeaderMapPtr{new Http::TestResponseHeaderMapImpl{{":status", "202"}}}));
+  msg->body().add("{}");
+  callbacks->onSuccess(request, std::move(msg));
+
+  EXPECT_CALL(cm_.thread_local_cluster_.async_client_, send_(_, _, _))
+      .WillOnce(
+          Invoke([&](Http::RequestMessagePtr&, Http::AsyncClient::Callbacks& callbacks_arg,
+                     const Http::AsyncClient::RequestOptions&) -> Http::AsyncClient::Request* {
+            callbacks = &callbacks_arg;
+            return &request;
+          }));
+  EXPECT_CALL(request, cancel());
+  tracer_.reset();
 }
 
 TEST_F(DatadogConfigTest, CollectorHostname) {
@@ -155,17 +220,33 @@ TEST_F(DatadogConfigTest, CollectorHostname) {
   collector_hostname: fake_host
   )EOF");
   cm_.initializeClusters({"fake_cluster"}, {});
+
+  EXPECT_CALL(tls_.dispatcher_, createTimer_(testing::_));
+  Http::MockAsyncClientRequest request(&cm_.thread_local_cluster_.async_client_);
+  Http::AsyncClient::Callbacks* callbacks;
+  EXPECT_CALL(cm_.thread_local_cluster_.async_client_, send_(_, _, _))
+      .WillOnce(
+          Invoke([&](Http::RequestMessagePtr& message, Http::AsyncClient::Callbacks& callbacks_arg,
+                     const Http::AsyncClient::RequestOptions&) -> Http::AsyncClient::Request* {
+            callbacks = &callbacks_arg;
+
+            EXPECT_EQ("fake_host", message->headers().getHostValue());
+
+            return &request;
+          }));
+
   setup(datadog_config, true);
 
-  Http::MockAsyncClientRequest request(&cm_.thread_local_cluster_.async_client_);
-  Http::AsyncClient::Callbacks* callback;
-  const absl::optional<std::chrono::milliseconds> timeout(std::chrono::seconds(1));
-  EXPECT_CALL(cm_.thread_local_cluster_.async_client_,
-              send_(_, _, Http::AsyncClient::RequestOptions().setTimeout(timeout)))
+  Http::ResponseMessagePtr msg(new Http::ResponseMessageImpl(
+      Http::ResponseHeaderMapPtr{new Http::TestResponseHeaderMapImpl{{":status", "202"}}}));
+  msg->body().add("{}");
+  callbacks->onSuccess(request, std::move(msg));
+
+  EXPECT_CALL(cm_.thread_local_cluster_.async_client_, send_(_, _, _))
       .WillOnce(
-          Invoke([&](Http::RequestMessagePtr& message, Http::AsyncClient::Callbacks& callbacks,
+          Invoke([&](Http::RequestMessagePtr& message, Http::AsyncClient::Callbacks& callbacks_arg,
                      const Http::AsyncClient::RequestOptions&) -> Http::AsyncClient::Request* {
-            callback = &callbacks;
+            callbacks = &callbacks_arg;
 
             // This is the crux of this test.
             EXPECT_EQ("fake_host", message->headers().getHostValue());
@@ -182,9 +263,23 @@ TEST_F(DatadogConfigTest, CollectorHostname) {
 
   timer_->invokeCallback();
 
-  Http::ResponseMessagePtr msg(new Http::ResponseMessageImpl(Http::ResponseHeaderMapPtr{
-      new Http::TestResponseHeaderMapImpl{{":status", "200"}, {"content-length", "0"}}}));
-  callback->onSuccess(request, std::move(msg));
+  msg = std::make_unique<Http::ResponseMessageImpl>(
+      Http::ResponseHeaderMapPtr{new Http::TestResponseHeaderMapImpl{{":status", "200"}}});
+  msg->body().add("{}");
+  callbacks->onSuccess(request, std::move(msg));
+
+  EXPECT_CALL(cm_.thread_local_cluster_.async_client_, send_(_, _, _))
+      .WillOnce(
+          Invoke([&](Http::RequestMessagePtr& message, Http::AsyncClient::Callbacks& callbacks_arg,
+                     const Http::AsyncClient::RequestOptions&) -> Http::AsyncClient::Request* {
+            callbacks = &callbacks_arg;
+
+            EXPECT_EQ("fake_host", message->headers().getHostValue());
+
+            return &request;
+          }));
+  EXPECT_CALL(request, cancel());
+  tracer_.reset();
 }
 
 } // namespace

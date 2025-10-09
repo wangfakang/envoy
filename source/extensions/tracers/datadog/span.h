@@ -31,7 +31,7 @@ namespace Datadog {
  */
 class Span : public Tracing::Span {
 public:
-  explicit Span(datadog::tracing::Span&& span);
+  explicit Span(datadog::tracing::Span&& span, bool use_local_decision = false);
 
   const datadog::tracing::Optional<datadog::tracing::Span>& impl() const;
 
@@ -41,16 +41,19 @@ public:
   void log(SystemTime, const std::string&) override;
   void finishSpan() override;
   void injectContext(Tracing::TraceContext& trace_context,
-                     const Upstream::HostDescriptionConstSharedPtr& upstream) override;
+                     const Tracing::UpstreamContext& upstream) override;
   Tracing::SpanPtr spawnChild(const Tracing::Config& config, const std::string& name,
                               SystemTime start_time) override;
   void setSampled(bool sampled) override;
+  bool useLocalDecision() const override { return use_local_decision_; }
   std::string getBaggage(absl::string_view key) override;
   void setBaggage(absl::string_view key, absl::string_view value) override;
-  std::string getTraceIdAsHex() const override;
+  std::string getTraceId() const override;
+  std::string getSpanId() const override;
 
 private:
   datadog::tracing::Optional<datadog::tracing::Span> span_;
+  const bool use_local_decision_{false};
 };
 
 } // namespace Datadog

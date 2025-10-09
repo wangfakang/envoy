@@ -27,6 +27,9 @@ namespace Envoy {
 namespace StreamInfo {
 namespace {
 
+REGISTER_CUSTOM_RESPONSE_FLAG(CF, CustomFlag);
+REGISTER_CUSTOM_RESPONSE_FLAG(CF2, CustomFlag2);
+
 std::chrono::nanoseconds checkDuration(std::chrono::nanoseconds last,
                                        absl::optional<std::chrono::nanoseconds> timing) {
   EXPECT_TRUE(timing);
@@ -37,8 +40,13 @@ std::chrono::nanoseconds checkDuration(std::chrono::nanoseconds last,
 class StreamInfoImplTest : public testing::Test {
 protected:
   void assertStreamInfoSize(StreamInfoImpl stream_info) {
-    ASSERT_TRUE(sizeof(stream_info) == 840 || sizeof(stream_info) == 856 ||
-                sizeof(stream_info) == 888)
+    ASSERT_TRUE(
+        // with --config=docker-msan
+        sizeof(stream_info) == 728 ||
+        // with --config=docker-clang
+        sizeof(stream_info) == 736 ||
+        // with --config=docker-clang-libc++
+        sizeof(stream_info) == 704)
         << "If adding fields to StreamInfoImpl, please check to see if you "
            "need to add them to setFromForRecreateStream or setFrom! Current size "
         << sizeof(stream_info);
@@ -48,7 +56,8 @@ protected:
 
 TEST_F(StreamInfoImplTest, TimingTest) {
   MonotonicTime pre_start = test_time_.timeSystem().monotonicTime();
-  StreamInfoImpl info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr);
+  StreamInfoImpl info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr,
+                      FilterState::LifeSpan::FilterChain);
   info.setUpstreamInfo(std::make_shared<UpstreamInfoImpl>());
   UpstreamTiming& upstream_timing = info.upstreamInfo()->upstreamTiming();
   MonotonicTime post_start = test_time_.timeSystem().monotonicTime();
@@ -80,6 +89,10 @@ TEST_F(StreamInfoImplTest, TimingTest) {
   upstream_timing.onLastUpstreamRxByteReceived(test_time_.timeSystem());
   dur = checkDuration(dur, timing.lastUpstreamRxByteReceived());
 
+  EXPECT_FALSE(timing.lastDownstreamHeaderRxByteReceived());
+  info.downstreamTiming().onLastDownstreamHeaderRxByteReceived(test_time_.timeSystem());
+  dur = checkDuration(dur, timing.lastDownstreamHeaderRxByteReceived());
+
   EXPECT_FALSE(timing.firstDownstreamTxByteSent());
   info.downstreamTiming().onFirstDownstreamTxByteSent(test_time_.timeSystem());
   dur = checkDuration(dur, timing.firstDownstreamTxByteSent());
@@ -106,7 +119,8 @@ TEST_F(StreamInfoImplTest, TimingTest) {
 }
 
 TEST_F(StreamInfoImplTest, BytesTest) {
-  StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr);
+  StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr,
+                             FilterState::LifeSpan::FilterChain);
 
   const uint64_t bytes_sent = 7;
   const uint64_t bytes_received = 12;
@@ -118,44 +132,155 @@ TEST_F(StreamInfoImplTest, BytesTest) {
   EXPECT_EQ(bytes_received, stream_info.bytesReceived());
 }
 
-TEST_F(StreamInfoImplTest, ResponseFlagTest) {
-  const std::vector<ResponseFlag> responseFlags = {FailedLocalHealthCheck,
-                                                   NoHealthyUpstream,
-                                                   UpstreamRequestTimeout,
-                                                   LocalReset,
-                                                   UpstreamRemoteReset,
-                                                   UpstreamConnectionFailure,
-                                                   UpstreamConnectionTermination,
-                                                   UpstreamOverflow,
-                                                   NoRouteFound,
-                                                   DelayInjected,
-                                                   FaultInjected,
-                                                   RateLimited};
+// This is used to ensure the new extendable response flags are compatible with the legacy one
+// and the legacyResponseFlags() method works as expected.
+// TODO(wbpcode): remove this class and related test after the legacyResponseFlags() method is
+// removed.
+enum LegacyResponseFlag {
+  // Local server healthcheck failed.
+  FailedLocalHealthCheck = 0x1,
+  // No healthy upstream.
+  NoHealthyUpstream = 0x2,
+  // Request timeout on upstream.
+  UpstreamRequestTimeout = 0x4,
+  // Local codec level reset was sent on the stream.
+  LocalReset = 0x8,
+  // Remote codec level reset was received on the stream.
+  UpstreamRemoteReset = 0x10,
+  // Local reset by a connection pool due to an initial connection failure.
+  UpstreamConnectionFailure = 0x20,
+  // If the stream was locally reset due to connection termination.
+  UpstreamConnectionTermination = 0x40,
+  // The stream was reset because of a resource overflow.
+  UpstreamOverflow = 0x80,
+  // No route found for a given request.
+  NoRouteFound = 0x100,
+  // Request was delayed before proxying.
+  DelayInjected = 0x200,
+  // Abort with error code was injected.
+  FaultInjected = 0x400,
+  // Request was ratelimited locally by rate limit filter.
+  RateLimited = 0x800,
+  // Request was unauthorized by external authorization service.
+  UnauthorizedExternalService = 0x1000,
+  // Unable to call Ratelimit service.
+  RateLimitServiceError = 0x2000,
+  // If the stream was reset due to a downstream connection termination.
+  DownstreamConnectionTermination = 0x4000,
+  // Exceeded upstream retry limit.
+  UpstreamRetryLimitExceeded = 0x8000,
+  // Request hit the stream idle timeout, triggering a 408.
+  StreamIdleTimeout = 0x10000,
+  // Request specified x-envoy-* header values that failed strict header checks.
+  InvalidEnvoyRequestHeaders = 0x20000,
+  // Downstream request had an HTTP protocol error
+  DownstreamProtocolError = 0x40000,
+  // Upstream request reached to user defined max stream duration.
+  UpstreamMaxStreamDurationReached = 0x80000,
+  // True if the response was served from an Envoy cache filter.
+  ResponseFromCacheFilter = 0x100000,
+  // Filter config was not received within the permitted warming deadline.
+  NoFilterConfigFound = 0x200000,
+  // Request or connection exceeded the downstream connection duration.
+  DurationTimeout = 0x400000,
+  // Upstream response had an HTTP protocol error
+  UpstreamProtocolError = 0x800000,
+  // No cluster found for a given request.
+  NoClusterFound = 0x1000000,
+  // Overload Manager terminated the stream.
+  OverloadManager = 0x2000000,
+  // DNS resolution failed.
+  DnsResolutionFailed = 0x4000000,
+  // Drop certain percentage of overloaded traffic.
+  DropOverLoad = 0x8000000,
+  // Downstream remote codec level reset was received on the stream.
+  DownstreamRemoteReset = 0x10000000,
+  // Unconditionally drop all traffic due to drop_overload is set to 100%.
+  UnconditionalDropOverload = 0x20000000,
+  // ATTENTION: MAKE SURE THIS REMAINS EQUAL TO THE LAST FLAG.
+  LastFlag = UnconditionalDropOverload,
+};
 
-  StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr);
+TEST_F(StreamInfoImplTest, LegacyResponseFlagTest) {
+  StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr,
+                             FilterState::LifeSpan::FilterChain);
+
+  absl::flat_hash_map<LegacyResponseFlag, CoreResponseFlag> flags = {
+      {LegacyResponseFlag::FailedLocalHealthCheck, CoreResponseFlag::FailedLocalHealthCheck},
+      {LegacyResponseFlag::NoHealthyUpstream, CoreResponseFlag::NoHealthyUpstream},
+      {LegacyResponseFlag::UpstreamRequestTimeout, CoreResponseFlag::UpstreamRequestTimeout},
+      {LegacyResponseFlag::LocalReset, CoreResponseFlag::LocalReset},
+      {LegacyResponseFlag::UpstreamRemoteReset, CoreResponseFlag::UpstreamRemoteReset},
+      {LegacyResponseFlag::UpstreamConnectionFailure, CoreResponseFlag::UpstreamConnectionFailure},
+      {LegacyResponseFlag::UpstreamConnectionTermination,
+       CoreResponseFlag::UpstreamConnectionTermination},
+      {LegacyResponseFlag::UpstreamOverflow, CoreResponseFlag::UpstreamOverflow},
+      {LegacyResponseFlag::NoRouteFound, CoreResponseFlag::NoRouteFound},
+      {LegacyResponseFlag::DelayInjected, CoreResponseFlag::DelayInjected},
+      {LegacyResponseFlag::FaultInjected, CoreResponseFlag::FaultInjected},
+      {LegacyResponseFlag::RateLimited, CoreResponseFlag::RateLimited},
+      {LegacyResponseFlag::UnauthorizedExternalService,
+       CoreResponseFlag::UnauthorizedExternalService},
+      {LegacyResponseFlag::RateLimitServiceError, CoreResponseFlag::RateLimitServiceError},
+      {LegacyResponseFlag::DownstreamConnectionTermination,
+       CoreResponseFlag::DownstreamConnectionTermination},
+      {LegacyResponseFlag::UpstreamRetryLimitExceeded,
+       CoreResponseFlag::UpstreamRetryLimitExceeded},
+      {LegacyResponseFlag::StreamIdleTimeout, CoreResponseFlag::StreamIdleTimeout},
+      {LegacyResponseFlag::InvalidEnvoyRequestHeaders,
+       CoreResponseFlag::InvalidEnvoyRequestHeaders},
+      {LegacyResponseFlag::DownstreamProtocolError, CoreResponseFlag::DownstreamProtocolError},
+      {LegacyResponseFlag::UpstreamMaxStreamDurationReached,
+       CoreResponseFlag::UpstreamMaxStreamDurationReached},
+      {LegacyResponseFlag::ResponseFromCacheFilter, CoreResponseFlag::ResponseFromCacheFilter},
+      {LegacyResponseFlag::NoFilterConfigFound, CoreResponseFlag::NoFilterConfigFound},
+      {LegacyResponseFlag::DurationTimeout, CoreResponseFlag::DurationTimeout},
+      {LegacyResponseFlag::UpstreamProtocolError, CoreResponseFlag::UpstreamProtocolError},
+      {LegacyResponseFlag::NoClusterFound, CoreResponseFlag::NoClusterFound},
+      {LegacyResponseFlag::OverloadManager, CoreResponseFlag::OverloadManager},
+      {LegacyResponseFlag::DnsResolutionFailed, CoreResponseFlag::DnsResolutionFailed},
+      {LegacyResponseFlag::DropOverLoad, CoreResponseFlag::DropOverLoad},
+      {LegacyResponseFlag::DownstreamRemoteReset, CoreResponseFlag::DownstreamRemoteReset},
+      {LegacyResponseFlag::UnconditionalDropOverload, CoreResponseFlag::UnconditionalDropOverload},
+  };
+
+  for (auto& flag : flags) {
+    stream_info.setResponseFlag(flag.second);
+    EXPECT_TRUE(stream_info.hasResponseFlag(flag.second));
+
+    EXPECT_EQ(static_cast<uint64_t>(flag.first), stream_info.legacyResponseFlags());
+
+    stream_info.response_flags_.clear();
+  }
+}
+
+TEST_F(StreamInfoImplTest, ResponseFlagTest) {
+  StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr,
+                             FilterState::LifeSpan::FilterChain);
 
   EXPECT_FALSE(stream_info.hasAnyResponseFlag());
-  EXPECT_FALSE(stream_info.intersectResponseFlags(0));
-  for (ResponseFlag flag : responseFlags) {
+  for (auto& flag : ResponseFlagUtils::responseFlagsVec()) {
     // Test cumulative setting of response flags.
-    EXPECT_FALSE(stream_info.hasResponseFlag(flag))
-        << fmt::format("Flag: {} was already set", flag);
-    stream_info.setResponseFlag(flag);
-    EXPECT_TRUE(stream_info.hasResponseFlag(flag))
-        << fmt::format("Flag: {} was expected to be set", flag);
+    EXPECT_FALSE(stream_info.hasResponseFlag(flag.flag_))
+        << fmt::format("Flag: {} was already set", flag.short_string_);
+    stream_info.setResponseFlag(flag.flag_);
+    EXPECT_TRUE(stream_info.hasResponseFlag(flag.flag_))
+        << fmt::format("Flag: {} was expected to be set", flag.short_string_);
   }
   EXPECT_TRUE(stream_info.hasAnyResponseFlag());
-  EXPECT_EQ(0xFFF, stream_info.responseFlags());
 
-  StreamInfoImpl stream_info2(Http::Protocol::Http2, test_time_.timeSystem(), nullptr);
-  stream_info2.setResponseFlag(FailedLocalHealthCheck);
+  for (size_t i = 0; i < ResponseFlagUtils::responseFlagsVec().size(); i++) {
+    EXPECT_EQ(ResponseFlagUtils::responseFlagsVec()[i].flag_.value(),
+              stream_info.responseFlags()[i].value());
+  }
 
-  EXPECT_TRUE(stream_info2.intersectResponseFlags(FailedLocalHealthCheck));
+  EXPECT_EQ(0x3FFFFFFF, stream_info.legacyResponseFlags());
 }
 
 TEST_F(StreamInfoImplTest, MiscSettersAndGetters) {
   {
-    StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr);
+    StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr,
+                               FilterState::LifeSpan::FilterChain);
 
     EXPECT_EQ(nullptr, stream_info.upstreamInfo());
     EXPECT_EQ(Http::Protocol::Http2, stream_info.protocol().value());
@@ -165,7 +290,7 @@ TEST_F(StreamInfoImplTest, MiscSettersAndGetters) {
     EXPECT_EQ(Http::Protocol::Http10, stream_info.protocol().value());
 
     EXPECT_FALSE(stream_info.responseCode());
-    stream_info.response_code_ = 200;
+    stream_info.setResponseCode(200);
     ASSERT_TRUE(stream_info.responseCode());
     EXPECT_EQ(200, stream_info.responseCode().value());
 
@@ -178,6 +303,9 @@ TEST_F(StreamInfoImplTest, MiscSettersAndGetters) {
     stream_info.setResponseCodeDetails(ResponseCodeDetails::get().ViaUpstream);
     ASSERT_TRUE(stream_info.responseCodeDetails().has_value());
     EXPECT_EQ(ResponseCodeDetails::get().ViaUpstream, stream_info.responseCodeDetails().value());
+    stream_info.setResponseCodeDetails("response code details");
+    ASSERT_TRUE(stream_info.responseCodeDetails().has_value());
+    EXPECT_EQ("response code details", stream_info.responseCodeDetails().value());
 
     EXPECT_FALSE(stream_info.connectionTerminationDetails().has_value());
     stream_info.setConnectionTerminationDetails("access_denied");
@@ -194,6 +322,16 @@ TEST_F(StreamInfoImplTest, MiscSettersAndGetters) {
     EXPECT_TRUE(stream_info.healthCheck());
 
     EXPECT_EQ(nullptr, stream_info.route());
+    EXPECT_EQ(nullptr, stream_info.virtualHost());
+
+    std::shared_ptr<NiceMock<Router::MockVirtualHost>> vhost =
+        std::make_shared<NiceMock<Router::MockVirtualHost>>();
+
+    stream_info.vhost_ = vhost;
+
+    // If the route is invalid then the vhost will be used.
+    EXPECT_EQ(vhost, stream_info.virtualHost());
+
     std::shared_ptr<NiceMock<Router::MockRoute>> route =
         std::make_shared<NiceMock<Router::MockRoute>>();
     stream_info.route_ = route;
@@ -241,7 +379,8 @@ TEST_F(StreamInfoImplTest, MiscSettersAndGetters) {
 }
 
 TEST_F(StreamInfoImplTest, SetFromForRecreateStream) {
-  StreamInfoImpl s1(Http::Protocol::Http2, test_time_.timeSystem(), nullptr);
+  StreamInfoImpl s1(Http::Protocol::Http2, test_time_.timeSystem(), nullptr,
+                    FilterState::LifeSpan::FilterChain);
 
   s1.addBytesReceived(1);
   s1.downstreamTiming().onLastDownstreamRxByteReceived(test_time_.timeSystem());
@@ -256,7 +395,8 @@ TEST_F(StreamInfoImplTest, SetFromForRecreateStream) {
 #endif
 #endif
 
-  StreamInfoImpl s2(Http::Protocol::Http11, test_time_.timeSystem(), nullptr);
+  StreamInfoImpl s2(Http::Protocol::Http11, test_time_.timeSystem(), nullptr,
+                    FilterState::LifeSpan::FilterChain);
   s2.setFromForRecreateStream(s1);
   EXPECT_EQ(s1.startTime(), s2.startTime());
   EXPECT_EQ(s1.startTimeMonotonic(), s2.startTimeMonotonic());
@@ -271,7 +411,8 @@ TEST_F(StreamInfoImplTest, SetFromForRecreateStream) {
 }
 
 TEST_F(StreamInfoImplTest, SetFrom) {
-  StreamInfoImpl s1(Http::Protocol::Http2, test_time_.timeSystem(), nullptr);
+  StreamInfoImpl s1(Http::Protocol::Http2, test_time_.timeSystem(), nullptr,
+                    FilterState::LifeSpan::FilterChain);
 
   // setFromForRecreateStream
   s1.addBytesReceived(1);
@@ -280,7 +421,6 @@ TEST_F(StreamInfoImplTest, SetFrom) {
   s1.addPacketsRetransmitted(1);
 
   // setFrom
-  s1.setRouteName("foo");
   s1.setVirtualClusterName(absl::optional<std::string>("bar"));
   s1.setResponseCode(200);
   s1.setResponseCodeDetails("OK");
@@ -288,7 +428,7 @@ TEST_F(StreamInfoImplTest, SetFrom) {
   s1.setUpstreamInfo(std::make_shared<UpstreamInfoImpl>());
   s1.upstreamInfo()->upstreamTiming().onLastUpstreamTxByteSent(test_time_.timeSystem());
   s1.onRequestComplete();
-  s1.setResponseFlag(FailedLocalHealthCheck);
+  s1.setResponseFlag(CoreResponseFlag::FailedLocalHealthCheck);
   s1.healthCheck(true);
   s1.route_ = std::make_shared<NiceMock<Router::MockRoute>>();
   s1.setDynamicMetadata("com.test", MessageUtil::keyValueStruct("test_key", "test_value"));
@@ -301,11 +441,12 @@ TEST_F(StreamInfoImplTest, SetFrom) {
   s1.setStreamIdProvider(
       std::make_shared<StreamIdProviderImpl>("a121e9e1-feae-4136-9e0e-6fac343d56c9"));
   s1.setTraceReason(Tracing::Reason::ClientForced);
-  s1.setFilterChainName("foobar");
   s1.setAttemptCount(5);
   s1.setDownstreamTransportFailureReason("error");
   s1.addBytesSent(1);
   s1.setIsShadow(true);
+  s1.addCustomFlag("test_flag");
+  s1.addCustomFlag("test_flag2");
 
 #ifdef __clang__
 #if defined(__linux__)
@@ -315,7 +456,8 @@ TEST_F(StreamInfoImplTest, SetFrom) {
 #endif
 #endif
 
-  StreamInfoImpl s2(Http::Protocol::Http11, test_time_.timeSystem(), nullptr);
+  StreamInfoImpl s2(Http::Protocol::Http11, test_time_.timeSystem(), nullptr,
+                    FilterState::LifeSpan::FilterChain);
   Http::TestRequestHeaderMapImpl headers2;
   s2.setFrom(s1, &headers2);
 
@@ -357,23 +499,25 @@ TEST_F(StreamInfoImplTest, SetFrom) {
   EXPECT_EQ(s1.getStreamIdProvider().value().get().toStringView().value(),
             s2.getStreamIdProvider().value().get().toStringView().value());
   EXPECT_EQ(s1.traceReason(), s2.traceReason());
-  EXPECT_EQ(s1.filterChainName(), s2.filterChainName());
   EXPECT_EQ(s1.attemptCount(), s2.attemptCount());
   EXPECT_EQ(s1.getUpstreamBytesMeter(), s2.getUpstreamBytesMeter());
   EXPECT_EQ(s1.bytesSent(), s2.bytesSent());
   EXPECT_EQ(s1.isShadow(), s2.isShadow());
+  EXPECT_EQ(s1.customFlags(), s2.customFlags());
+  EXPECT_EQ("test_flag,test_flag2", s1.customFlags());
 }
 
 TEST_F(StreamInfoImplTest, DynamicMetadataTest) {
-  StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr);
+  StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr,
+                             FilterState::LifeSpan::FilterChain);
 
   EXPECT_EQ(0, stream_info.dynamicMetadata().filter_metadata_size());
   stream_info.setDynamicMetadata("com.test", MessageUtil::keyValueStruct("test_key", "test_value"));
   EXPECT_EQ("test_value",
             Config::Metadata::metadataValue(&stream_info.dynamicMetadata(), "com.test", "test_key")
                 .string_value());
-  ProtobufWkt::Struct struct_obj2;
-  ProtobufWkt::Value val2;
+  Protobuf::Struct struct_obj2;
+  Protobuf::Value val2;
   val2.set_string_value("another_value");
   (*struct_obj2.mutable_fields())["another_key"] = val2;
   stream_info.setDynamicMetadata("com.test", struct_obj2);
@@ -394,7 +538,8 @@ TEST_F(StreamInfoImplTest, DynamicMetadataTest) {
 }
 
 TEST_F(StreamInfoImplTest, DumpStateTest) {
-  StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr);
+  StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr,
+                             FilterState::LifeSpan::FilterChain);
   std::string prefix = "";
 
   for (int i = 0; i < 7; ++i) {
@@ -408,7 +553,8 @@ TEST_F(StreamInfoImplTest, DumpStateTest) {
 }
 
 TEST_F(StreamInfoImplTest, RequestHeadersTest) {
-  StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr);
+  StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr,
+                             FilterState::LifeSpan::FilterChain);
   EXPECT_FALSE(stream_info.getRequestHeaders());
 
   Http::TestRequestHeaderMapImpl headers;
@@ -417,12 +563,12 @@ TEST_F(StreamInfoImplTest, RequestHeadersTest) {
 }
 
 TEST_F(StreamInfoImplTest, DefaultStreamIdProvider) {
-  StreamInfoImpl stream_info(test_time_.timeSystem(), nullptr);
+  StreamInfoImpl stream_info(test_time_.timeSystem(), nullptr, FilterState::LifeSpan::FilterChain);
   EXPECT_EQ(false, stream_info.getStreamIdProvider().has_value());
 }
 
 TEST_F(StreamInfoImplTest, StreamIdProvider) {
-  StreamInfoImpl stream_info(test_time_.timeSystem(), nullptr);
+  StreamInfoImpl stream_info(test_time_.timeSystem(), nullptr, FilterState::LifeSpan::FilterChain);
   stream_info.setStreamIdProvider(
       std::make_shared<StreamIdProviderImpl>("a121e9e1-feae-4136-9e0e-6fac343d56c9"));
 
@@ -433,7 +579,7 @@ TEST_F(StreamInfoImplTest, StreamIdProvider) {
 }
 
 TEST_F(StreamInfoImplTest, Details) {
-  StreamInfoImpl stream_info(test_time_.timeSystem(), nullptr);
+  StreamInfoImpl stream_info(test_time_.timeSystem(), nullptr, FilterState::LifeSpan::FilterChain);
   EXPECT_FALSE(stream_info.responseCodeDetails().has_value());
   stream_info.setResponseCodeDetails("two_words");
   ASSERT_TRUE(stream_info.responseCodeDetails().has_value());
@@ -441,7 +587,7 @@ TEST_F(StreamInfoImplTest, Details) {
 }
 
 TEST_F(StreamInfoImplTest, DownstreamTransportFailureReason) {
-  StreamInfoImpl stream_info(test_time_.timeSystem(), nullptr);
+  StreamInfoImpl stream_info(test_time_.timeSystem(), nullptr, FilterState::LifeSpan::FilterChain);
   EXPECT_TRUE(stream_info.downstreamTransportFailureReason().empty());
   stream_info.setDownstreamTransportFailureReason("TLS error");
   EXPECT_FALSE(stream_info.downstreamTransportFailureReason().empty());

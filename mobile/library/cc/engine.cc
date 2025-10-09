@@ -1,15 +1,16 @@
 #include "engine.h"
 
-#include "library/common/main_interface.h"
+#include "absl/strings/string_view.h"
+#include "library/common/internal_engine.h"
 #include "library/common/types/c_types.h"
 
 namespace Envoy {
 namespace Platform {
 
-Engine::Engine(envoy_engine_t engine) : engine_(engine), terminated_(false) {}
+Engine::Engine(::Envoy::InternalEngine* engine) : engine_(engine) {}
 
 Engine::~Engine() {
-  if (!terminated_) {
+  if (!engine_->isTerminated()) {
     terminate();
   }
 }
@@ -22,15 +23,22 @@ StreamClientSharedPtr Engine::streamClient() {
   return std::make_shared<StreamClient>(shared_from_this());
 }
 
-PulseClientSharedPtr Engine::pulseClient() { return std::make_shared<PulseClient>(); }
+std::string Engine::dumpStats() { return engine_->dumpStats(); }
 
-envoy_status_t Engine::terminate() {
-  if (terminated_) {
-    throw std::runtime_error("attempting to double terminate Engine");
-  }
-  envoy_status_t ret = terminate_engine(engine_, /* release */ false);
-  terminated_ = true;
-  return ret;
+envoy_status_t Engine::terminate() { return engine_->terminate(); }
+
+void Engine::onDefaultNetworkChangeEvent(int network) {
+  engine_->onDefaultNetworkChangeEvent(network);
+}
+
+void Engine::onDefaultNetworkChanged(int network) { engine_->onDefaultNetworkChanged(network); }
+
+void Engine::onDefaultNetworkUnavailable() { engine_->onDefaultNetworkUnavailable(); }
+
+void Engine::onDefaultNetworkAvailable() { engine_->onDefaultNetworkAvailable(); }
+
+envoy_status_t Engine::setProxySettings(absl::string_view host, const uint16_t port) {
+  return engine_->setProxySettings(host, port);
 }
 
 } // namespace Platform

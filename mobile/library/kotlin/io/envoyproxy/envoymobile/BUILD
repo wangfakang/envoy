@@ -1,10 +1,11 @@
-load("@envoy//bazel:envoy_build_system.bzl", "envoy_select_admin_functionality", "envoy_select_enable_http3", "envoy_select_envoy_mobile_request_compression")
+load("@envoy//bazel:envoy_build_system.bzl", "envoy_mobile_package")
 load("@envoy_mobile//bazel:android_artifacts.bzl", "android_artifacts")
-load("@envoy_mobile//bazel:kotlin_lib.bzl", "envoy_mobile_kt_library")
-load("@io_bazel_rules_kotlin//kotlin:android.bzl", "kt_android_library")
 load("@rules_detekt//detekt:defs.bzl", "detekt")
+load("@rules_kotlin//kotlin:android.bzl", "kt_android_library")
 
 licenses(["notice"])  # Apache 2
+
+envoy_mobile_package()
 
 android_artifacts(
     name = "envoy_aar",
@@ -12,10 +13,14 @@ android_artifacts(
     archive_name = "envoy",
     manifest = "EnvoyManifest.xml",
     native_deps = select({
-        "@envoy//bazel:opt_build": ["//library/common/jni:libenvoy_jni.so.debug_info"],
-        "//conditions:default": ["//library/common/jni:libenvoy_jni.so"],
+        "@envoy//bazel:opt_build": ["//library/jni:libenvoy_jni.so.debug_info"],
+        "//conditions:default": ["//library/jni:libenvoy_jni.so"],
     }),
     proguard_rules = "//library:proguard_rules",
+    substitutions = {
+        "{pom_artifact_id}": "envoy",
+        "{pom_extra_dependencies}": "",
+    },
     visibility = ["//visibility:public"],
 )
 
@@ -34,10 +39,11 @@ kt_android_library(
         "//library/java/io/envoyproxy/envoymobile/engine:envoy_engine_lib",
         "//library/java/io/envoyproxy/envoymobile/engine/types:envoy_c_types_lib",
         "//library/java/io/envoyproxy/envoymobile/utilities",
+        "//library/java/io/envoyproxy/envoymobile/utilities:network_utilities",
     ],
 )
 
-envoy_mobile_kt_library(
+kt_android_library(
     name = "envoy_interfaces_lib",
     srcs = glob([
         "Engine.kt",
@@ -73,21 +79,8 @@ envoy_mobile_kt_library(
         "Trailers.kt",
         "filters/*.kt",
         "grpc/*.kt",
-        "mocks/*.kt",
         "stats/*.kt",
-    ]) + envoy_select_envoy_mobile_request_compression(
-        [
-            "CompressionAlgorithm.kt",
-            "RequestHeadersBuilderCompressionUtil.kt",
-        ],
-        "@envoy",
-    ) + envoy_select_enable_http3(
-        ["EngineBuilderHTTP3Util.kt"],
-        "@envoy",
-    ) + envoy_select_admin_functionality(
-        ["EngineBuilderAdminUtil.kt"],
-        "@envoy",
-    ),
+    ]),
     visibility = ["//visibility:public"],
     deps = [
         "//library/java/io/envoyproxy/envoymobile/engine:envoy_base_engine_lib",

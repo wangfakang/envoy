@@ -13,6 +13,7 @@ envoy_cc_fuzz_test(
     name = "original_dst_fuzz_test",
     srcs = ["original_dst_fuzz_test.cc"],
     corpus = "original_dst_corpus",
+    rbe_pool = "6gig",
     deps = [
         "//source/extensions/filters/listener/original_dst:original_dst_lib",
         "//test/extensions/filters/listener/common/fuzz:listener_filter_fuzzer_lib",
@@ -25,6 +26,7 @@ envoy_cc_test(
     srcs = [
         "original_dst_integration_test.cc",
     ],
+    rbe_pool = "6gig",
     deps = [
         "//source/common/http:header_map_lib",
         "//source/extensions/clusters/original_dst:original_dst_cluster_lib",
@@ -37,5 +39,19 @@ envoy_cc_test(
         "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
         "@envoy_api//envoy/extensions/filters/listener/original_dst/v3:pkg_cc_proto",
         "@envoy_api//envoy/extensions/filters/network/http_connection_manager/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_test(
+    name = "original_dst_test",
+    srcs = ["original_dst_test.cc"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/common/network:filter_state_dst_address_lib",
+        "//source/common/network:listener_filter_buffer_lib",
+        "//source/common/network:utility_lib",
+        "//source/extensions/filters/listener/original_dst:original_dst_lib",
+        "//test/mocks/network:network_mocks",
+        "//test/test_common:utility_lib",
     ],
 )

@@ -22,10 +22,13 @@ Tracing::DriverSharedPtr
 XRayTracerFactory::createTracerDriverTyped(const envoy::config::trace::v3::XRayConfig& proto_config,
                                            Server::Configuration::TracerFactoryContext& context) {
   std::string sampling_rules_json;
-  try {
-    sampling_rules_json = Config::DataSource::read(proto_config.sampling_rule_manifest(), true,
-                                                   context.serverFactoryContext().api());
-  } catch (EnvoyException& e) {
+  TRY_NEEDS_AUDIT {
+    sampling_rules_json =
+        THROW_OR_RETURN_VALUE(Config::DataSource::read(proto_config.sampling_rule_manifest(), true,
+                                                       context.serverFactoryContext().api()),
+                              std::string);
+  }
+  END_TRY catch (EnvoyException& e) {
     ENVOY_LOG(error, "Failed to read sampling rules manifest because of {}.", e.what());
   }
 
@@ -41,7 +44,7 @@ XRayTracerFactory::createTracerDriverTyped(const envoy::config::trace::v3::XRayC
   const std::string endpoint = fmt::format("{}:{}", proto_config.daemon_endpoint().address(),
                                            proto_config.daemon_endpoint().port_value());
 
-  auto aws = absl::flat_hash_map<std::string, ProtobufWkt::Value>{};
+  auto aws = absl::flat_hash_map<std::string, Protobuf::Value>{};
   for (const auto& field : proto_config.segment_fields().aws().fields()) {
     aws.emplace(field.first, field.second);
   }

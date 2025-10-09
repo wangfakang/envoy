@@ -25,8 +25,10 @@ public:
   void setup(const std::string& yaml) {
     envoy::extensions::filters::http::bandwidth_limit::v3::BandwidthLimit config;
     TestUtility::loadFromYaml(yaml, config);
-    config_ =
-        std::make_shared<FilterConfig>(config, *stats_.rootScope(), runtime_, time_system_, true);
+    auto config_or_status =
+        FilterConfig::create(config, *stats_.rootScope(), runtime_, time_system_, true);
+    EXPECT_TRUE(config_or_status.ok());
+    config_ = *config_or_status;
     filter_ = std::make_shared<BandwidthLimiter>(config_);
     filter_->setDecoderFilterCallbacks(decoder_filter_callbacks_);
     filter_->setEncoderFilterCallbacks(encoder_filter_callbacks_);
@@ -63,7 +65,7 @@ public:
 };
 
 TEST_F(FilterTest, Disabled) {
-  const std::string config_yaml = R"(
+  constexpr absl::string_view config_yaml = R"(
   stat_prefix: test
   runtime_enabled:
     default_value: false
@@ -92,7 +94,7 @@ TEST_F(FilterTest, Disabled) {
 }
 
 TEST_F(FilterTest, LimitOnDecode) {
-  const std::string config_yaml = R"(
+  constexpr absl::string_view config_yaml = R"(
   stat_prefix: test
   runtime_enabled:
     default_value: true
@@ -215,7 +217,7 @@ TEST_F(FilterTest, LimitOnDecode) {
 }
 
 TEST_F(FilterTest, LimitOnEncode) {
-  const std::string config_yaml = R"(
+  constexpr absl::string_view config_yaml = R"(
   stat_prefix: test
   runtime_enabled:
     default_value: true
@@ -339,7 +341,7 @@ TEST_F(FilterTest, LimitOnEncode) {
 }
 
 TEST_F(FilterTest, LimitOnDecodeAndEncode) {
-  const std::string config_yaml = R"(
+  constexpr absl::string_view config_yaml = R"(
   stat_prefix: test
   runtime_enabled:
     default_value: true
@@ -477,7 +479,7 @@ TEST_F(FilterTest, LimitOnDecodeAndEncode) {
 }
 
 TEST_F(FilterTest, WithTrailers) {
-  const std::string config_yaml = R"(
+  constexpr absl::string_view config_yaml = R"(
   stat_prefix: test
   runtime_enabled:
     default_value: true
@@ -553,7 +555,7 @@ TEST_F(FilterTest, WithTrailers) {
 }
 
 TEST_F(FilterTest, WithTrailersNoEndStream) {
-  const std::string config_yaml = R"(
+  constexpr absl::string_view config_yaml = R"(
   stat_prefix: test
   runtime_enabled:
     default_value: true

@@ -46,7 +46,12 @@ public:
   virtual bool onSSLRequest() PURE;
   virtual bool shouldEncryptUpstream() const PURE;
   virtual void sendUpstream(Buffer::Instance&) PURE;
-  virtual void encryptUpstream(bool, Buffer::Instance&) PURE;
+  virtual bool encryptUpstream(bool, Buffer::Instance&) PURE;
+  /**
+   * If downstream SSL is required but client didn't initiate SSL,
+   * close the downstream connection.
+   */
+  virtual void verifyDownstreamSSL() PURE;
 };
 
 // Postgres message decoder.

@@ -7,17 +7,18 @@
 // porting layer for QUICHE.
 
 #include <cstddef>
-#include <iostream>
+#include <iosfwd>
 #include <memory>
 
 #include "source/common/buffer/buffer_impl.h"
 
 #include "quiche/common/quiche_buffer_allocator.h"
+#include "quiche/common/quiche_callbacks.h"
 
 namespace quiche {
 
 // Implements the interface required by
-// https://github.com/google/quiche/blob/main/common/platform/api/quiche_mem_slice.h
+// https://github.com/google/quiche/blob/main/quiche/common/quiche_mem_slice.h
 class QuicheMemSliceImpl {
 public:
   // Constructs an empty QuicheMemSliceImpl.
@@ -28,6 +29,7 @@ public:
   // Constructs a QuicheMemSliceImpl by taking ownership of the memory in `buffer`.
   QuicheMemSliceImpl(quiche::QuicheBuffer buffer);
   QuicheMemSliceImpl(std::unique_ptr<char[]> buffer, size_t length);
+  QuicheMemSliceImpl(const char* buffer, size_t length, SingleUseCallback<void(const char*)>);
 
   // Constructs a QuicheMemSliceImpl and moves the first slice of `buffer` into
   // it. Prerequisite: `buffer` must be non-empty, and its first slice must

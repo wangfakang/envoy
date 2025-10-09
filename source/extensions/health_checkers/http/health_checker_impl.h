@@ -17,6 +17,7 @@
 #include "source/common/common/logger.h"
 #include "source/common/grpc/codec.h"
 #include "source/common/http/codec_client.h"
+#include "source/common/http/response_decoder_impl_base.h"
 #include "source/common/router/header_parser.h"
 #include "source/common/stream_info/stream_info_impl.h"
 #include "source/common/upstream/health_checker_impl.h"
@@ -39,14 +40,16 @@ public:
   }
 };
 
+DECLARE_FACTORY(HttpHealthCheckerFactory);
+
 /**
  * HTTP health checker implementation. Connection keep alive is used where possible.
  */
 class HttpHealthCheckerImpl : public HealthCheckerImplBase {
 public:
   HttpHealthCheckerImpl(const Cluster& cluster, const envoy::config::core::v3::HealthCheck& config,
-                        Event::Dispatcher& dispatcher, Runtime::Loader& runtime,
-                        Random::RandomGenerator& random, HealthCheckEventLoggerPtr&& event_logger);
+                        Server::Configuration::HealthCheckerFactoryContext& context,
+                        HealthCheckEventLoggerPtr&& event_logger);
 
   // Returns the HTTP protocol used for the health checker.
   Http::Protocol protocol() const;
@@ -75,7 +78,7 @@ public:
 
 private:
   struct HttpActiveHealthCheckSession : public ActiveHealthCheckSession,
-                                        public Http::ResponseDecoder,
+                                        public Http::ResponseDecoderImplBase,
                                         public Http::StreamCallbacks {
     HttpActiveHealthCheckSession(HttpHealthCheckerImpl& parent, const HostSharedPtr& host);
     ~HttpActiveHealthCheckSession() override;
@@ -164,11 +167,11 @@ private:
 
   const std::string path_;
   const std::string host_value_;
-  const PayloadMatcher::MatchSegments receive_bytes_;
+  Buffer::OwnedImpl request_payload_;
+  PayloadMatcher::MatchSegments receive_bytes_;
   const envoy::config::core::v3::RequestMethod method_;
   uint64_t response_buffer_size_;
-  absl::optional<Matchers::StringMatcherImpl<envoy::type::matcher::v3::StringMatcher>>
-      service_name_matcher_;
+  absl::optional<Matchers::StringMatcherImpl> service_name_matcher_;
   Router::HeaderParserPtr request_headers_parser_;
   const HttpStatusChecker http_status_checker_;
 

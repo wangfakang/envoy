@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
-#include <iostream>
+#include <iosfwd>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -13,7 +13,7 @@
 #include "envoy/common/pure.h"
 #include "envoy/common/union_string.h"
 #include "envoy/http/header_formatter.h"
-#include "envoy/tracing/trace_context.h"
+#include "envoy/stream_info/filter_state.h"
 
 #include "source/common/common/assert.h"
 #include "source/common/common/hash.h"
@@ -101,7 +101,14 @@ using LowerCaseStrPairVector =
 
 class HeaderStringValidator {
 public:
-  bool operator()(absl::string_view view) { return validHeaderString(view); }
+  bool operator()(absl::string_view view) {
+    return disable_validation_for_tests_ ? true : validHeaderString(view);
+  }
+
+  // This flag allows disabling the check for the NUL, CR and LF characters in the
+  // header names or values in the DEBUG builds to prevent the `ASSERT(valid())` in the
+  // HeaderString constructor from failing tests.
+  static bool disable_validation_for_tests_;
 };
 
 class HeaderString : public UnionStringBase<HeaderStringValidator> {
@@ -184,6 +191,7 @@ private:
   HEADER_FUNC(EnvoyRetriableHeaderNames)                                                           \
   HEADER_FUNC(EnvoyIsTimeoutRetry)                                                                 \
   HEADER_FUNC(EnvoyOriginalPath)                                                                   \
+  HEADER_FUNC(EnvoyOriginalHost)                                                                   \
   HEADER_FUNC(EnvoyOriginalUrl)                                                                    \
   HEADER_FUNC(EnvoyUpstreamAltStatName)                                                            \
   HEADER_FUNC(EnvoyUpstreamRequestTimeoutAltResponse)                                              \
@@ -450,6 +458,16 @@ public:
   virtual uint64_t byteSize() const PURE;
 
   /**
+   * @return uint32_t the max size of the header map in kilobyte.
+   */
+  virtual uint32_t maxHeadersKb() const PURE;
+
+  /**
+   * @return uint32_t the max count of headers in a header map.
+   */
+  virtual uint32_t maxHeadersCount() const PURE;
+
+  /**
    * This is a wrapper for the return result from get(). It avoids a copy when translating from
    * non-const HeaderEntry to const HeaderEntry and only provides const access to the result.
    */
@@ -711,8 +729,7 @@ public:
 // Request headers.
 class RequestHeaderMap
     : public RequestOrResponseHeaderMap,
-      public CustomInlineHeaderBase<CustomInlineHeaderRegistry::Type::RequestHeaders>,
-      public Tracing::TraceContext {
+      public CustomInlineHeaderBase<CustomInlineHeaderRegistry::Type::RequestHeaders> {
 public:
   INLINE_REQ_STRING_HEADERS(DEFINE_INLINE_STRING_HEADER)
   INLINE_REQ_NUMERIC_HEADERS(DEFINE_INLINE_NUMERIC_HEADER)
@@ -728,6 +745,8 @@ class RequestTrailerMap
     : public HeaderMap,
       public CustomInlineHeaderBase<CustomInlineHeaderRegistry::Type::RequestTrailers> {};
 using RequestTrailerMapPtr = std::unique_ptr<RequestTrailerMap>;
+using RequestTrailerMapSharedPtr = std::shared_ptr<RequestTrailerMap>;
+using RequestTrailerMapConstSharedPtr = std::shared_ptr<const RequestTrailerMap>;
 using RequestTrailerMapOptRef = OptRef<RequestTrailerMap>;
 using RequestTrailerMapOptConstRef = OptRef<const RequestTrailerMap>;
 
@@ -765,6 +784,14 @@ using ResponseTrailerMapSharedPtr = std::shared_ptr<ResponseTrailerMap>;
 using ResponseTrailerMapConstSharedPtr = std::shared_ptr<const ResponseTrailerMap>;
 using ResponseTrailerMapOptRef = OptRef<ResponseTrailerMap>;
 using ResponseTrailerMapOptConstRef = OptRef<const ResponseTrailerMap>;
+
+/**
+ * Base class for both tunnel response headers and trailers.
+ */
+class TunnelResponseHeadersOrTrailers : public StreamInfo::FilterState::Object {
+public:
+  virtual const HeaderMap& value() const PURE;
+};
 
 /**
  * Convenient container type for storing Http::LowerCaseString and std::string key/value pairs.

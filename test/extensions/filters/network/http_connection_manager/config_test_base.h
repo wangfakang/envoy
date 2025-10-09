@@ -37,9 +37,12 @@ public:
   HttpConnectionManagerConfigTest() {
     scoped_runtime_.mergeValues(
         {{"envoy.reloadable_features.no_extension_lookup_by_name", "false"}});
+    ON_CALL(context_, listenerInfo()).WillByDefault(testing::ReturnRef(listener_info_));
   }
+  NiceMock<Network::MockListenerInfo> listener_info_;
   NiceMock<Server::Configuration::MockFactoryContext> context_;
-  Http::SlowDateProviderImpl date_provider_{context_.mainThreadDispatcher().timeSource()};
+  Http::SlowDateProviderImpl date_provider_{
+      context_.server_factory_context_.mainThreadDispatcher().timeSource()};
   NiceMock<Router::MockRouteConfigProviderManager> route_config_provider_manager_;
   NiceMock<Config::MockConfigProviderManager> scoped_routes_config_provider_manager_;
   NiceMock<Tracing::MockTracerManager> tracer_manager_;
@@ -48,11 +51,14 @@ public:
       std::make_shared<NiceMock<Tracing::MockTracer>>()};
   TestScopedRuntime scoped_runtime_;
   void createHttpConnectionManagerConfig(const std::string& yaml) {
+    creation_status_ = absl::OkStatus();
     HttpConnectionManagerConfig(parseHttpConnectionManagerFromYaml(yaml), context_, date_provider_,
                                 route_config_provider_manager_,
-                                scoped_routes_config_provider_manager_, tracer_manager_,
-                                filter_config_provider_manager_);
+                                &scoped_routes_config_provider_manager_, tracer_manager_,
+                                filter_config_provider_manager_, creation_status_);
+    THROW_IF_NOT_OK(creation_status_);
   }
+  absl::Status creation_status_{absl::OkStatus()};
 };
 
 class PassThroughFilterFactory : public Extensions::HttpFilters::Common::FactoryBase<

@@ -29,7 +29,7 @@ namespace Http {
 namespace {
 
 absl::string_view getScheme(absl::string_view forwarded_proto, bool is_ssl) {
-  if (HeaderUtility::schemeIsValid(forwarded_proto)) {
+  if (Utility::schemeIsValid(forwarded_proto)) {
     return forwarded_proto;
   }
   return is_ssl ? Headers::get().SchemeValues.Https : Headers::get().SchemeValues.Http;
@@ -38,7 +38,7 @@ absl::string_view getScheme(absl::string_view forwarded_proto, bool is_ssl) {
 } // namespace
 std::string ConnectionManagerUtility::determineNextProtocol(Network::Connection& connection,
                                                             const Buffer::Instance& data) {
-  const std::string next_protocol = connection.nextProtocol();
+  std::string next_protocol = connection.nextProtocol();
   if (!next_protocol.empty()) {
     return next_protocol;
   }
@@ -76,6 +76,16 @@ ServerConnectionPtr ConnectionManagerUtility::autoCreateCodec(
   }
 }
 
+void ConnectionManagerUtility::appendXff(RequestHeaderMap& request_headers,
+                                         Network::Connection& connection,
+                                         ConnectionManagerConfig& config) {
+  if (Network::Utility::isLoopbackAddress(*connection.connectionInfoProvider().remoteAddress())) {
+    Utility::appendXff(request_headers, config.localAddress());
+  } else {
+    Utility::appendXff(request_headers, *connection.connectionInfoProvider().remoteAddress());
+  }
+}
+
 ConnectionManagerUtility::MutateRequestHeadersResult ConnectionManagerUtility::mutateRequestHeaders(
     RequestHeaderMap& request_headers, Network::Connection& connection,
     ConnectionManagerConfig& config, const Router::Config& route_config,
@@ -92,6 +102,8 @@ ConnectionManagerUtility::MutateRequestHeadersResult ConnectionManagerUtility::m
   if (!Utility::isUpgrade(request_headers)) {
     request_headers.removeConnection();
     request_headers.removeUpgrade();
+
+    sanitizeTEHeader(request_headers);
   }
 
   // Clean proxy headers.
@@ -132,12 +144,7 @@ ConnectionManagerUtility::MutateRequestHeadersResult ConnectionManagerUtility::m
       final_remote_address = connection.connectionInfoProvider().remoteAddress();
     }
     if (!config.skipXffAppend()) {
-      if (Network::Utility::isLoopbackAddress(
-              *connection.connectionInfoProvider().remoteAddress())) {
-        Utility::appendXff(request_headers, config.localAddress());
-      } else {
-        Utility::appendXff(request_headers, *connection.connectionInfoProvider().remoteAddress());
-      }
+      appendXff(request_headers, connection, config);
     }
     // If the prior hop is not a trusted proxy, overwrite any
     // x-forwarded-proto/x-forwarded-port value it set as untrusted. Alternately if no
@@ -168,6 +175,9 @@ ConnectionManagerUtility::MutateRequestHeadersResult ConnectionManagerUtility::m
 
       if (result.reject_options.has_value()) {
         return {nullptr, result.reject_options};
+      }
+      if (!result.skip_xff_append) {
+        appendXff(request_headers, connection, config);
       }
 
       if (result.detected_remote_address) {
@@ -207,6 +217,7 @@ ConnectionManagerUtility::MutateRequestHeadersResult ConnectionManagerUtility::m
     request_headers.setScheme(
         getScheme(request_headers.getForwardedProtoValue(), connection.ssl() != nullptr));
   }
+  request_headers.setScheme(absl::AsciiStrToLower(request_headers.getSchemeValue()));
 
   // At this point we can determine whether this is an internal or external request. The
   // determination of internal status uses the following:
@@ -267,11 +278,8 @@ ConnectionManagerUtility::MutateRequestHeadersResult ConnectionManagerUtility::m
 
   // Generate x-request-id for all edge requests, or if there is none.
   if (config.generateRequestId()) {
-    auto rid_extension = config.requestIDExtension();
-    // Unconditionally set a request ID if we are allowed to override it from
-    // the edge. Otherwise just ensure it is set.
-    const bool force_set = !config.preserveExternalRequestId() && edge_request;
-    rid_extension->set(request_headers, force_set);
+    config.requestIDExtension()->set(request_headers, edge_request,
+                                     config.preserveExternalRequestId());
   }
 
   if (connection.connecting() && request_headers.get(Headers::get().EarlyData).empty()) {
@@ -286,18 +294,42 @@ ConnectionManagerUtility::MutateRequestHeadersResult ConnectionManagerUtility::m
   return {final_remote_address, absl::nullopt};
 }
 
+void ConnectionManagerUtility::sanitizeTEHeader(RequestHeaderMap& request_headers) {
+  absl::string_view te_header = request_headers.getTEValue();
+  if (te_header.empty()) {
+    return;
+  }
+
+  // If the TE header contains the "trailers" value, set the TE header to "trailers" only.
+  std::vector<absl::string_view> te_values = absl::StrSplit(te_header, ',');
+  for (const absl::string_view& te_value : te_values) {
+    bool is_trailers =
+        absl::StripAsciiWhitespace(te_value) == Http::Headers::get().TEValues.Trailers;
+
+    if (is_trailers) {
+      request_headers.setTE(Http::Headers::get().TEValues.Trailers);
+      return;
+    }
+  }
+
+  // If the TE header does not contain the "trailers" value, remove the TE header.
+  request_headers.removeTE();
+}
+
 void ConnectionManagerUtility::cleanInternalHeaders(
     RequestHeaderMap& request_headers, bool edge_request,
-    const std::list<Http::LowerCaseString>& internal_only_headers) {
+    const std::vector<Http::LowerCaseString>& internal_only_headers) {
   if (edge_request) {
     // Headers to be stripped from edge requests, i.e. to sanitize so
     // clients can't inject values.
     request_headers.removeEnvoyDecoratorOperation();
     request_headers.removeEnvoyDownstreamServiceCluster();
     request_headers.removeEnvoyDownstreamServiceNode();
-    if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.sanitize_original_path")) {
-      request_headers.removeEnvoyOriginalPath();
-    }
+
+    // TODO(wbpcode): Envoy may should always remove these headers from client because
+    // these headers are hop by hop headers and should not be sent to upstream.
+    request_headers.removeEnvoyOriginalPath();
+    request_headers.removeEnvoyOriginalHost();
   }
 
   // Headers to be stripped from edge *and* intermediate-hop external requests.

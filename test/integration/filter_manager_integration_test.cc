@@ -254,7 +254,7 @@ public:
   explicit DispenserFilterConfigFactory(const std::string& name) : name_(name) {}
 
   // NamedNetworkFilterConfigFactory
-  Network::FilterFactoryCb
+  absl::StatusOr<Network::FilterFactoryCb>
   createFilterFactoryFromProto(const Protobuf::Message&,
                                Server::Configuration::FactoryContext&) override {
     return [](Network::FilterManager& filter_manager) -> void {
@@ -265,7 +265,7 @@ public:
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
     // Using Struct instead of a custom per-filter empty config proto
     // This is only allowed in tests.
-    return ProtobufTypes::MessagePtr{new Envoy::ProtobufWkt::Struct()};
+    return ProtobufTypes::MessagePtr{new Envoy::Protobuf::Struct()};
   }
 
   std::string name() const override { return name_; }

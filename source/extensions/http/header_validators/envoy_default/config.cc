@@ -15,13 +15,13 @@ namespace EnvoyDefault {
 ::Envoy::Http::HeaderValidatorFactoryPtr HeaderValidatorFactoryConfig::createFromProto(
     const Protobuf::Message& message, Server::Configuration::ServerFactoryContext& server_context) {
   auto mptr = ::Envoy::Config::Utility::translateAnyToFactoryConfig(
-      dynamic_cast<const ProtobufWkt::Any&>(message), server_context.messageValidationVisitor(),
+      dynamic_cast<const Protobuf::Any&>(message), server_context.messageValidationVisitor(),
       *this);
   const auto& proto_config =
       MessageUtil::downcastAndValidate<const ::envoy::extensions::http::header_validators::
                                            envoy_default::v3::HeaderValidatorConfig&>(
           *mptr, server_context.messageValidationVisitor());
-  return std::make_unique<HeaderValidatorFactory>(proto_config);
+  return std::make_unique<HeaderValidatorFactory>(proto_config, server_context);
 }
 
 ProtobufTypes::MessagePtr HeaderValidatorFactoryConfig::createEmptyConfigProto() {

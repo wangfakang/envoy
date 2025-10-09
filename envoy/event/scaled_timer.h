@@ -80,6 +80,12 @@ enum class ScaledTimerType {
   // report connection establishment before the connection is closed. This corresponds to the
   // TRANSPORT_SOCKET_CONNECT_TIMEOUT TimerType in overload.proto.
   TransportSocketConnectTimeout,
+  // The max time an HTTP connection to a downstream client can be connected at all. This
+  // corresponds to the HTTP_DOWNSTREAM_CONNECTION_MAX TimerType in overload.proto.
+  HttpDownstreamMaxConnectionTimeout,
+  // The max time the downstream codec will wait to flush an ended response stream. This corresponds
+  // to HTTP_DOWNSTREAM_STREAM_FLUSH TimerType in overload.proto.
+  HttpDownstreamStreamFlush,
 };
 
 using ScaledTimerTypeMap = absl::flat_hash_map<ScaledTimerType, ScaledTimerMinimum>;

@@ -89,7 +89,7 @@ public:
   // Methods which are applied to each connection attempt.
   void enableHalfClose(bool enabled) override;
   void noDelay(bool enable) override;
-  void readDisable(bool disable) override;
+  ReadDisableStatus readDisable(bool disable) override;
   void detectEarlyCloseWhenReadDisabled(bool value) override;
   void setConnectionStats(const ConnectionStats& stats) override;
   void setDelayedCloseTimeout(std::chrono::milliseconds timeout) override;
@@ -101,6 +101,7 @@ public:
 
   // Simple getters which always delegate to the first connection in connections_.
   bool isHalfCloseEnabled() const override;
+  bool setSocketOption(Network::SocketOptionName name, absl::Span<uint8_t> value) override;
   std::string nextProtocol() const override;
   // Note, this might change before connect finishes.
   ConnectionInfoSetter& connectionInfoSetter() override;
@@ -124,13 +125,16 @@ public:
 
   // Methods implemented largely by this class itself.
   uint64_t id() const override;
-  Event::Dispatcher& dispatcher() override;
+  Event::Dispatcher& dispatcher() const override;
   void close(ConnectionCloseType type) override { close(type, ""); }
   void close(ConnectionCloseType type, absl::string_view details) override;
+  DetectedCloseType detectedCloseType() const override;
   bool readEnabled() const override;
   bool aboveHighWatermark() const override;
   void hashKey(std::vector<uint8_t>& hash_key) const override;
   void dumpState(std::ostream& os, int indent_level) const override;
+
+  const Network::ConnectionSocketPtr& getSocket() const override { PANIC("not implemented"); }
 
 private:
   // ConnectionCallbacks which will be set on an ClientConnection which

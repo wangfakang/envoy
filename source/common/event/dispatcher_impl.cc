@@ -26,8 +26,7 @@
 #include "source/common/filesystem/watcher_impl.h"
 #include "source/common/network/address_impl.h"
 #include "source/common/network/connection_impl.h"
-#include "source/common/network/tcp_listener_impl.h"
-#include "source/common/network/udp_listener_impl.h"
+#include "source/common/network/utility.h"
 #include "source/common/runtime/runtime_features.h"
 
 #include "event2/event.h"
@@ -57,21 +56,20 @@ DispatcherImpl::DispatcherImpl(const std::string& name, Api::Api& api,
                                Event::TimeSystem& time_system,
                                const ScaledRangeTimerManagerFactory& scaled_timer_factory,
                                const Buffer::WatermarkFactorySharedPtr& watermark_factory)
-    : DispatcherImpl(name, api.threadFactory(), api.timeSource(), api.randomGenerator(),
-                     api.fileSystem(), time_system, scaled_timer_factory,
+    : DispatcherImpl(name, api.threadFactory(), api.timeSource(), api.fileSystem(), time_system,
+                     scaled_timer_factory,
                      watermark_factory != nullptr
                          ? watermark_factory
                          : std::make_shared<Buffer::WatermarkBufferFactory>(
                                api.bootstrap().overload_manager().buffer_factory_config())) {}
 
 DispatcherImpl::DispatcherImpl(const std::string& name, Thread::ThreadFactory& thread_factory,
-                               TimeSource& time_source, Random::RandomGenerator& random_generator,
-                               Filesystem::Instance& file_system, Event::TimeSystem& time_system,
+                               TimeSource& time_source, Filesystem::Instance& file_system,
+                               Event::TimeSystem& time_system,
                                const ScaledRangeTimerManagerFactory& scaled_timer_factory,
                                const Buffer::WatermarkFactorySharedPtr& watermark_factory)
     : name_(name), thread_factory_(thread_factory), time_source_(time_source),
-      random_generator_(random_generator), file_system_(file_system),
-      buffer_factory_(watermark_factory),
+      file_system_(file_system), buffer_factory_(watermark_factory),
       scheduler_(time_system.createScheduler(base_scheduler_, base_scheduler_)),
       thread_local_delete_cb_(
           base_scheduler_.createSchedulableCallback([this]() -> void { runThreadLocalDelete(); })),
@@ -82,7 +80,7 @@ DispatcherImpl::DispatcherImpl(const std::string& name, Thread::ThreadFactory& t
   ASSERT(!name_.empty());
   FatalErrorHandler::registerFatalErrorHandler(*this);
   updateApproximateMonotonicTimeInternal();
-  base_scheduler_.registerOnPrepareCallback(
+  base_scheduler_.registerOnCheckCallback(
       std::bind(&DispatcherImpl::updateApproximateMonotonicTime, this));
 }
 
@@ -165,11 +163,31 @@ Network::ClientConnectionPtr DispatcherImpl::createClientConnection(
 
   auto* factory = Config::Utility::getFactoryByName<Network::ClientConnectionFactory>(
       std::string(address->addressType()));
+
   // The target address is usually offered by EDS and the EDS api should reject the unsupported
   // address.
   // TODO(lambdai): Return a closed connection if the factory is not found. Note that the caller
   // expects a non-null connection as of today so we cannot gracefully handle unsupported address
   // type.
+#if defined(__linux__)
+  // For Linux, the source address' network namespace is relevant for client connections, since that
+  // is where the netns would be specified.
+  if (source_address && source_address->networkNamespace().has_value()) {
+    auto f = [&]() -> Network::ClientConnectionPtr {
+      return factory->createClientConnection(
+          *this, address, source_address, std::move(transport_socket), options, transport_options);
+    };
+    auto result = Network::Utility::execInNetworkNamespace(
+        std::move(f), source_address->networkNamespace()->c_str());
+    if (!result.ok()) {
+      ENVOY_LOG(error, "failed to create connection in network namespace {}: {}",
+                source_address->networkNamespace().value(), result.status().ToString());
+      return nullptr;
+    }
+    return *std::move(result);
+  }
+#endif
+
   return factory->createClientConnection(*this, address, source_address,
                                          std::move(transport_socket), options, transport_options);
 }
@@ -181,7 +199,7 @@ FileEventPtr DispatcherImpl::createFileEvent(os_fd_t fd, FileReadyCb cb, FileTri
       *this, fd,
       [this, cb](uint32_t events) {
         touchWatchdog();
-        cb(events);
+        return cb(events);
       },
       trigger, events)};
 }
@@ -189,25 +207,6 @@ FileEventPtr DispatcherImpl::createFileEvent(os_fd_t fd, FileReadyCb cb, FileTri
 Filesystem::WatcherPtr DispatcherImpl::createFilesystemWatcher() {
   ASSERT(isThreadSafe());
   return Filesystem::WatcherPtr{new Filesystem::WatcherImpl(*this, file_system_)};
-}
-
-Network::ListenerPtr DispatcherImpl::createListener(Network::SocketSharedPtr&& socket,
-                                                    Network::TcpListenerCallbacks& cb,
-                                                    Runtime::Loader& runtime, bool bind_to_port,
-                                                    bool ignore_global_conn_limit) {
-  ASSERT(isThreadSafe());
-  return std::make_unique<Network::TcpListenerImpl>(*this, random_generator_, runtime,
-                                                    std::move(socket), cb, bind_to_port,
-                                                    ignore_global_conn_limit);
-}
-
-Network::UdpListenerPtr
-DispatcherImpl::createUdpListener(Network::SocketSharedPtr socket,
-                                  Network::UdpListenerCallbacks& cb,
-                                  const envoy::config::core::v3::UdpSocketConfig& config) {
-  ASSERT(isThreadSafe());
-  return std::make_unique<Network::UdpListenerImpl>(*this, std::move(socket), cb, timeSource(),
-                                                    config);
 }
 
 TimerPtr DispatcherImpl::createTimer(TimerCb cb) {

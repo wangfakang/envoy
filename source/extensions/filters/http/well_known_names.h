@@ -16,6 +16,8 @@ public:
   const std::string Buffer = "envoy.filters.http.buffer";
   // Bandwidth limit filter
   const std::string BandwidthLimit = "envoy.filters.http.bandwidth_limit";
+  // Basic Auth filter
+  const std::string BasicAuth = "envoy.filters.http.basic_auth";
   // Cache filter
   const std::string Cache = "envoy.filters.http.cache";
   // CDN Loop filter
@@ -26,6 +28,8 @@ public:
   const std::string Cors = "envoy.filters.http.cors";
   // Composite filter
   const std::string Composite = "envoy.filters.http.composite";
+  // Credential Injector filter
+  const std::string CredentialInjector = "envoy.filters.http.credential_injector";
   // CSRF filter
   const std::string Csrf = "envoy.filters.http.csrf";
   // Custom Response filter
@@ -40,10 +44,16 @@ public:
   const std::string GcpAuthn = "envoy.filters.http.gcp_authn";
   // GRPC http1 bridge filter
   const std::string GrpcHttp1Bridge = "envoy.filters.http.grpc_http1_bridge";
+  // GRPC json reverse transcoder filter
+  const std::string GrpcJsonReverseTranscoder = "envoy.filters.http.grpc_json_reverse_transcoder";
   // GRPC json transcoder filter
   const std::string GrpcJsonTranscoder = "envoy.filters.http.grpc_json_transcoder";
   // GRPC web filter
   const std::string GrpcWeb = "envoy.filters.http.grpc_web";
+  // GRPC Field Extraction filter
+  const std::string GrpcFieldExtraction = "envoy.filters.http.grpc_field_extraction";
+  // Proto Message Extraction filter
+  const std::string ProtoMessageExtraction = "envoy.filters.http.proto_message_extraction";
   // GRPC http1 reverse bridge filter
   const std::string GrpcHttp1ReverseBridge = "envoy.filters.http.grpc_http1_reverse_bridge";
   // GRPC telemetry
@@ -60,8 +70,6 @@ public:
   const std::string Lua = "envoy.filters.http.lua";
   // On-demand RDS updates filter
   const std::string OnDemand = "envoy.filters.http.on_demand";
-  // Squash filter
-  const std::string Squash = "envoy.filters.http.squash";
   // External Authorization filter
   const std::string ExtAuthorization = "envoy.filters.http.ext_authz";
   // RBAC HTTP Authorization filter
@@ -70,6 +78,10 @@ public:
   const std::string JwtAuthn = "envoy.filters.http.jwt_authn";
   // Header to metadata filter
   const std::string HeaderToMetadata = "envoy.filters.http.header_to_metadata";
+  // Json to metadata filter
+  const std::string JsonToMetadata = "envoy.filters.http.json_to_metadata";
+  // Thrift to metadata filter
+  const std::string ThriftToMetadata = "envoy.filters.http.thrift_to_metadata";
   // Tap filter
   const std::string Tap = "envoy.filters.http.tap";
   // Adaptive concurrency limit filter

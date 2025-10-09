@@ -3,6 +3,7 @@
 #include "envoy/config/bootstrap/v3/bootstrap.pb.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/extensions/access_loggers/file/v3/file.pb.h"
+#include "envoy/extensions/filters/http/router/v3/router.pb.h"
 #include "envoy/network/connection.h"
 #include "envoy/network/filter.h"
 #include "envoy/server/filter_config.h"
@@ -80,7 +81,7 @@ public:
     return std::make_unique<test::integration::upstream_socket::v3::Config>();
   }
 
-  Network::UpstreamTransportSocketFactoryPtr createTransportSocketFactory(
+  absl::StatusOr<Network::UpstreamTransportSocketFactoryPtr> createTransportSocketFactory(
       const Protobuf::Message& config,
       Server::Configuration::TransportSocketFactoryContext& context) override {
     const auto& outer_config =
@@ -96,7 +97,7 @@ public:
                                                          context.messageValidationVisitor(),
                                                          inner_config_factory);
     auto inner_transport_factory =
-        inner_config_factory.createTransportSocketFactory(*inner_factory_config, context);
+        inner_config_factory.createTransportSocketFactory(*inner_factory_config, context).value();
     return std::make_unique<SocketFactory>(std::move(inner_transport_factory));
   }
 };
@@ -116,8 +117,8 @@ INSTANTIATE_TEST_SUITE_P(Params, UpstreamAccessLogTest,
                          TestUtility::ipTestParamsToString);
 
 /*
- * Verifies that the Http Router's `upstream_log` correctly reflects the upstream filter state data
- * when the access log format has `UPSTREAM_FILTER_STATE` specifier.
+ * Verifies that the Http Router's `upstream_log` correctly reflects the upstream HTTP filter state
+ * data when the access log format has `UPSTREAM_FILTER_STATE` specifier.
  */
 TEST_P(UpstreamAccessLogTest, UpstreamFilterState) {
   auto log_file = TestEnvironment::temporaryPath(TestUtility::uniqueFilename());

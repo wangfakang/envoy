@@ -198,7 +198,7 @@ TEST_P(GuardDogDeathTest, MultiKillDeathTest) {
     time_system_->advanceTimeWait(std::chrono::milliseconds(2)); // 1 ms past multi-death.
     guard_dog_->forceCheckForTest();
   };
-  EXPECT_DEATH(die_function(), "");
+  EXPECT_DEATH(die_function(), "Watchdog MULTIKILL as 2 threads are stuck");
 }
 
 TEST_P(GuardDogAlmostDeadTest, MultiKillNoFinalCheckTest) {
@@ -579,9 +579,9 @@ protected:
 
   std::vector<std::string> actions_;
   std::vector<std::string> events_;
-  RecordGuardDogActionFactory<Envoy::ProtobufWkt::Struct> log_factory_;
+  RecordGuardDogActionFactory<Envoy::Protobuf::Struct> log_factory_;
   Registry::InjectFactory<Configuration::GuardDogActionFactory> register_log_factory_;
-  AssertGuardDogActionFactory<Envoy::ProtobufWkt::Empty> assert_factory_;
+  AssertGuardDogActionFactory<Envoy::Protobuf::Empty> assert_factory_;
   Registry::InjectFactory<Configuration::GuardDogActionFactory> register_assert_factory_;
   NiceMock<Stats::MockStore> fake_stats_;
   WatchDogSharedPtr first_dog_;

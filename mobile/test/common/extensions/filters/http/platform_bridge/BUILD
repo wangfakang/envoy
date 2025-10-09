@@ -1,4 +1,4 @@
-load("@envoy//bazel:envoy_build_system.bzl", "envoy_package")
+load("@envoy//bazel:envoy_build_system.bzl", "envoy_mobile_package")
 load(
     "@envoy//test/extensions:extensions_build_system.bzl",
     "envoy_extension_cc_test",
@@ -6,7 +6,7 @@ load(
 
 licenses(["notice"])  # Apache 2
 
-envoy_package()
+envoy_mobile_package()
 
 envoy_extension_cc_test(
     name = "platform_bridge_filter_test",
@@ -15,7 +15,7 @@ envoy_extension_cc_test(
     repository = "@envoy",
     deps = [
         "//library/common/api:external_api_lib",
-        "//library/common/data:utility_lib",
+        "//library/common/bridge:utility_lib",
         "//library/common/extensions/filters/http/platform_bridge:config",
         "//library/common/extensions/filters/http/platform_bridge:filter_cc_proto",
         "@envoy//test/mocks/event:event_mocks",
@@ -36,7 +36,7 @@ envoy_extension_cc_test(
         "//library/common/api:external_api_lib",
         "//library/common/extensions/filters/http/platform_bridge:config",
         "//library/common/extensions/filters/http/platform_bridge:filter_cc_proto",
-        "@envoy//test/integration:http_integration_lib",
+        "@envoy//test/integration:http_integration_lib_light",
         "@envoy//test/mocks/server:factory_context_mocks",
         "@envoy//test/test_common:simulated_time_system_lib",
         "@envoy//test/test_common:utility_lib",

@@ -66,7 +66,7 @@ static void handleStringRules(std::string& str, const validate::StringRules& str
     size_t unicode_len = 0;
     int char_len = 0;
     while (byte_len > 0 && unicode_len < string_rules.max_len()) {
-      char_len = Protobuf::UTF8FirstLetterNumBytes(codepoint_ptr, byte_len);
+      char_len = pgv::UTF8FirstLetterNumBytes(codepoint_ptr, byte_len);
       codepoint_ptr += char_len;
       byte_len -= char_len;
       ++unicode_len;
@@ -164,8 +164,8 @@ void ValidatedInputGenerator::handleAnyRules(
   if (any_rules.has_required() && any_rules.required()) {
     // Stop creating any message when a certain depth is reached
     if (max_depth_ > 0 && current_depth_ > max_depth_) {
-      auto* any_message = Protobuf::DynamicCastToGenerated<ProtobufWkt::Any>(msg);
-      any_message->PackFrom(ProtobufWkt::Struct());
+      auto* any_message = Protobuf::DynamicCastMessage<Protobuf::Any>(msg);
+      any_message->PackFrom(Protobuf::Struct());
       return;
     }
     const Protobuf::Descriptor* descriptor = msg->GetDescriptor();
@@ -178,7 +178,7 @@ void ValidatedInputGenerator::handleAnyRules(
         const std::string field_name = std::string(message_path_.back());
         FieldToTypeUrls::const_iterator field_to_typeurls_cand = field_to_typeurls.find(field_name);
         if (field_to_typeurls_cand != any_map_cand->second.end()) {
-          auto* any_message = Protobuf::DynamicCastToGenerated<ProtobufWkt::Any>(msg);
+          auto* any_message = Protobuf::DynamicCastMessage<Protobuf::Any>(msg);
           inner_message = ProtobufMessage::Helper::typeUrlToMessage(any_message->type_url());
           if (!inner_message || !any_message->UnpackTo(inner_message.get())) {
             const TypeUrlAndFactory& randomed_typeurl = field_to_typeurls_cand->second.at(
@@ -389,7 +389,10 @@ void ValidatedInputGenerator::onField(Protobuf::Message& msg,
     break;
   case Protobuf::FieldDescriptor::CPPTYPE_STRING: {
     handleIntrinsicTypedField<
-        std::string, &Protobuf::Reflection::GetString, &Protobuf::Reflection::SetString,
+        std::string, &Protobuf::Reflection::GetString,
+        static_cast<void (Protobuf::Reflection::*)(
+            Protobuf::Message*, const Protobuf::FieldDescriptor*, std::string) const>(
+            &Protobuf::Reflection::SetString),
         &Protobuf::Reflection::GetRepeatedString, &Protobuf::Reflection::SetRepeatedString,
         &Protobuf::Reflection::AddString, &validate::FieldRules::string, &handleStringRules>(
         msg, field, reflection, rules, force_create);
@@ -412,7 +415,7 @@ void ValidatedInputGenerator::onEnterMessage(Protobuf::Message& msg,
   const Protobuf::Descriptor* descriptor = msg.GetDescriptor();
   message_path_.push_back(field_name);
   if (descriptor->full_name() == kAny) {
-    auto* any_message = Protobuf::DynamicCastToGenerated<ProtobufWkt::Any>(&msg);
+    auto* any_message = Protobuf::DynamicCastMessage<Protobuf::Any>(&msg);
     std::unique_ptr<Protobuf::Message> inner_message =
         ProtobufMessage::Helper::typeUrlToMessage(any_message->type_url());
     if (!inner_message || !any_message->UnpackTo(inner_message.get())) {
@@ -461,7 +464,7 @@ void ValidatedInputGenerator::onLeaveMessage(Protobuf::Message&,
 ValidatedInputGenerator::AnyMap ValidatedInputGenerator::getDefaultAnyMap() {
 
   static const auto dummy_proto_msg = []() -> std::unique_ptr<Protobuf::Message> {
-    return std::make_unique<ProtobufWkt::Struct>();
+    return std::make_unique<Protobuf::Struct>();
   };
 
   static const ValidatedInputGenerator::ListOfTypeUrlAndFactory matchers = {

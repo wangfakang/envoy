@@ -6,30 +6,20 @@
 #include <vector>
 
 #include "envoy/config/bootstrap/v3/bootstrap.pb.h"
+#include "envoy/config/core/v3/base.pb.h"
+#include "envoy/config/core/v3/socket_option.pb.h"
+
+#include "source/common/protobuf/protobuf.h"
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/types/optional.h"
-#include "direct_response_testing.h"
-#include "engine.h"
-#include "engine_callbacks.h"
-#include "key_value_store.h"
-#include "library/common/types/matcher_data.h"
-#include "log_level.h"
-#include "string_accessor.h"
+#include "library/cc/engine.h"
+#include "library/cc/key_value_store.h"
+#include "library/cc/string_accessor.h"
+#include "library/common/engine_types.h"
 
 namespace Envoy {
 namespace Platform {
-
-constexpr int DefaultJwtTokenLifetimeSeconds = 31536000; // 1 year
-constexpr int DefaultXdsTimeout = 5;
-
-// Represents the locality information in the Bootstrap's node, as defined in:
-// https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/core/v3/base.proto#envoy-v3-api-msg-config-core-v3-locality
-struct NodeLocality {
-  std::string region;
-  std::string zone;
-  std::string sub_zone;
-};
 
 // The C++ Engine builder creates a structured bootstrap proto and modifies it through parameters
 // set through the EngineBuilder API calls to produce the Bootstrap config that the Engine is
@@ -37,17 +27,26 @@ struct NodeLocality {
 class EngineBuilder {
 public:
   EngineBuilder();
-  virtual ~EngineBuilder() {}
+  EngineBuilder(EngineBuilder&&) = default;
+  virtual ~EngineBuilder() = default;
+  static std::string nativeNameToConfig(absl::string_view name);
 
-  EngineBuilder& addLogLevel(LogLevel log_level);
-  EngineBuilder& setOnEngineRunning(std::function<void()> closure);
+  EngineBuilder& setLogLevel(Logger::Logger::Levels log_level);
+  EngineBuilder& setLogger(std::unique_ptr<EnvoyLogger> logger);
+  EngineBuilder& setEngineCallbacks(std::unique_ptr<EngineCallbacks> callbacks);
+  EngineBuilder& setOnEngineRunning(absl::AnyInvocable<void()> closure);
+  EngineBuilder& setOnEngineExit(absl::AnyInvocable<void()> closure);
+  EngineBuilder& setEventTracker(std::unique_ptr<EnvoyEventTracker> event_tracker);
   EngineBuilder& addConnectTimeoutSeconds(int connect_timeout_seconds);
   EngineBuilder& addDnsRefreshSeconds(int dns_refresh_seconds);
   EngineBuilder& addDnsFailureRefreshSeconds(int base, int max);
   EngineBuilder& addDnsQueryTimeoutSeconds(int dns_query_timeout_seconds);
+  EngineBuilder& setDisableDnsRefreshOnFailure(bool disable_dns_refresh_on_failure);
+  EngineBuilder& setDisableDnsRefreshOnNetworkChange(bool disable_dns_refresh_on_network_change);
   EngineBuilder& addDnsMinRefreshSeconds(int dns_min_refresh_seconds);
+  EngineBuilder& setDnsNumRetries(uint32_t dns_num_retries);
+  EngineBuilder& setGetaddrinfoNumThreads(uint32_t num_threads);
   EngineBuilder& addMaxConnectionsPerHost(int max_connections_per_host);
-  EngineBuilder& useDnsSystemResolver(bool use_system_resolver);
   EngineBuilder& addH2ConnectionKeepaliveIdleIntervalMilliseconds(
       int h2_connection_keepalive_idle_interval_milliseconds);
   EngineBuilder&
@@ -62,52 +61,74 @@ public:
   EngineBuilder& enableGzipDecompression(bool gzip_decompression_on);
   EngineBuilder& enableBrotliDecompression(bool brotli_decompression_on);
   EngineBuilder& enableSocketTagging(bool socket_tagging_on);
-#ifdef ENVOY_ENABLE_QUIC
   EngineBuilder& enableHttp3(bool http3_on);
-#endif
+  EngineBuilder& setHttp3ConnectionOptions(std::string options);
+  EngineBuilder& setHttp3ClientConnectionOptions(std::string options);
+  EngineBuilder& addQuicHint(std::string host, int port);
+  EngineBuilder& addQuicCanonicalSuffix(std::string suffix);
+  // 0 means port migration is disabled.
+  EngineBuilder& setNumTimeoutsToTriggerPortMigration(int num_timeouts);
   EngineBuilder& enableInterfaceBinding(bool interface_binding_on);
   EngineBuilder& enableDrainPostDnsRefresh(bool drain_post_dns_refresh_on);
+  EngineBuilder& setUdpSocketReceiveBufferSize(int32_t size);
+  EngineBuilder& setUdpSocketSendBufferSize(int32_t size);
   EngineBuilder& enforceTrustChainVerification(bool trust_chain_verification_on);
+  EngineBuilder& setUpstreamTlsSni(std::string sni);
   EngineBuilder& enablePlatformCertificatesValidation(bool platform_certificates_validation_on);
-#ifdef ENVOY_GOOGLE_GRPC
-  // Sets the node.id field in the Bootstrap configuration.
-  EngineBuilder& setNodeId(std::string node_id);
-  // Sets the node.locality field in the Bootstrap configuration.
-  EngineBuilder& setNodeLocality(std::string region, std::string zone, std::string sub_zone);
-  // Adds an ADS layer. Note that only the state-of-the-world gRPC protocol is supported, not Delta
-  // gRPC.
-  EngineBuilder& setAggregatedDiscoveryService(std::string address, const int port,
-                                               std::string jwt_token = "",
-                                               int jwt_token_lifetime_seconds = 0,
-                                               std::string ssl_root_certs = "");
-  // Adds an RTDS layer to default config. Requires that ADS be configured.
-  EngineBuilder& addRtdsLayer(std::string layer_name, const int timeout_seconds = 0);
-  // Adds a CDS layer to default config. Requires that ADS be configured via
-  // setAggregatedDiscoveryService(). If `cds_resources_locator` is non-empty, the xdstp namespace
-  // is used for identifying resources. If not using xdstp, then set `cds_resources_locator` to the
-  // empty string.
-  EngineBuilder& addCdsLayer(std::string cds_resources_locator = "", const int timeout_seconds = 0);
-#endif
+
   EngineBuilder& enableDnsCache(bool dns_cache_on, int save_interval_seconds = 1);
-  EngineBuilder& setForceAlwaysUsev6(bool value);
+  // Set additional socket options on the upstream cluster outbound sockets.
+  EngineBuilder& setAdditionalSocketOptions(
+      const std::vector<envoy::config::core::v3::SocketOption>& socket_options);
+  // Adds the hostnames that should be pre-resolved by DNS prior to the first request issued for
+  // that host. When invoked, any previous preresolve hostname entries get cleared and only the ones
+  // provided in the hostnames argument get set.
+  // TODO(abeyad): change this method and the other language APIs to take a {host,port} pair.
+  // E.g. addDnsPreresolveHost(std::string host, uint32_t port);
   EngineBuilder& addDnsPreresolveHostnames(const std::vector<std::string>& hostnames);
   EngineBuilder& addNativeFilter(std::string name, std::string typed_config);
-#ifdef ENVOY_ADMIN_FUNCTIONALITY
-  EngineBuilder& enableAdminInterface(bool admin_interface_on);
-#endif
+  EngineBuilder& addNativeFilter(const std::string& name, const Protobuf::Any& typed_config);
 
-#ifdef ENVOY_MOBILE_STATS_REPORTING
-  EngineBuilder& addStatsSinks(std::vector<std::string> stat_sinks);
-  EngineBuilder& addGrpcStatsDomain(std::string stats_domain);
-  EngineBuilder& addStatsFlushSeconds(int stats_flush_seconds);
-#endif
-  EngineBuilder& addPlatformFilter(std::string name);
-
-  EngineBuilder& setRuntimeGuard(std::string guard, bool value);
+  EngineBuilder& addPlatformFilter(const std::string& name);
+  // Adds a runtime guard for the `envoy.reloadable_features.<guard>`.
+  // For example if the runtime guard is `envoy.reloadable_features.use_foo`, the guard name is
+  // `use_foo`.
+  EngineBuilder& addRuntimeGuard(std::string guard, bool value);
+  // Adds a runtime guard for the `envoy.restart_features.<guard>`. Restart features cannot be
+  // changed after the Envoy applicable has started and initialized.
+  // For example if the runtime guard is `envoy.restart_features.use_foo`, the guard name is
+  // `use_foo`.
+  EngineBuilder& addRestartRuntimeGuard(std::string guard, bool value);
 
   // These functions don't affect the Bootstrap configuration but instead perform registrations.
   EngineBuilder& addKeyValueStore(std::string name, KeyValueStoreSharedPtr key_value_store);
   EngineBuilder& addStringAccessor(std::string name, StringAccessorSharedPtr accessor);
+
+  // Sets the thread priority of the Envoy main (network) thread.
+  // The value must be an integer between -20 (highest priority) and 19 (lowest priority). Values
+  // outside of this range will be ignored.
+  EngineBuilder& setNetworkThreadPriority(int thread_priority);
+
+  // Sets the QUIC connection idle timeout in seconds.
+  EngineBuilder& setQuicConnectionIdleTimeoutSeconds(int quic_connection_idle_timeout_seconds);
+
+  // Sets the QUIC connection keepalive initial interval in nanoseconds
+  EngineBuilder& setKeepAliveInitialIntervalMilliseconds(int keepalive_initial_interval_ms);
+
+  // Sets the maximum number of concurrent streams on a multiplexed connection (HTTP/2 or HTTP/3).
+  EngineBuilder& setMaxConcurrentStreams(int max_concurrent_streams);
+
+#if defined(__APPLE__)
+  // Right now, this API is only used by Apple (iOS) to register the Apple proxy resolver API for
+  // use in reading and using the system proxy settings.
+  // If/when we move Android system proxy registration to the C++ Engine Builder, we will make this
+  // API available on all platforms.
+  // The optional `refresh_interval_secs` parameter determines how often the system proxy settings
+  // are polled by the operating system; defaults to 10 seconds. If the value is <= 0, the default
+  // value will be used.
+  EngineBuilder& respectSystemProxySettings(bool value, int refresh_interval_secs = 10);
+  EngineBuilder& setIosNetworkServiceType(int ios_network_service_type);
+#endif
 
   // This is separated from build() for the sake of testability
   virtual std::unique_ptr<envoy::config::bootstrap::v3::Bootstrap> generateBootstrap() const;
@@ -117,25 +138,32 @@ public:
 private:
   struct NativeFilterConfig {
     NativeFilterConfig(std::string name, std::string typed_config)
-        : name_(std::move(name)), typed_config_(std::move(typed_config)) {}
+        : name_(std::move(name)), textproto_typed_config_(std::move(typed_config)) {}
+
+    NativeFilterConfig(const std::string& name, const Protobuf::Any& typed_config)
+        : name_(name), typed_config_(typed_config) {}
 
     std::string name_;
-    std::string typed_config_;
+    std::string textproto_typed_config_{};
+    Protobuf::Any typed_config_{};
   };
 
-  LogLevel log_level_ = LogLevel::info;
-  EngineCallbacksSharedPtr callbacks_;
+  Logger::Logger::Levels log_level_ = Logger::Logger::Levels::info;
+  std::unique_ptr<EnvoyLogger> logger_{nullptr};
+  std::unique_ptr<EngineCallbacks> callbacks_;
+  std::unique_ptr<EnvoyEventTracker> event_tracker_{nullptr};
 
-  std::string stats_domain_;
-  int connect_timeout_seconds_ = 30;
+  int connect_timeout_seconds_ = 10;
   int dns_refresh_seconds_ = 60;
   int dns_failure_refresh_seconds_base_ = 2;
   int dns_failure_refresh_seconds_max_ = 10;
-  int dns_query_timeout_seconds_ = 25;
-  bool use_system_resolver_ = true;
+  int dns_query_timeout_seconds_ = 120;
+  bool disable_dns_refresh_on_failure_{false};
+  bool disable_dns_refresh_on_network_change_{false};
+  absl::optional<uint32_t> dns_num_retries_ = 3;
+  uint32_t getaddrinfo_num_threads_ = 1;
   int h2_connection_keepalive_idle_interval_milliseconds_ = 100000000;
-  int h2_connection_keepalive_timeout_seconds_ = 10;
-  int stats_flush_seconds_ = 60;
+  int h2_connection_keepalive_timeout_seconds_ = 15;
   std::string app_version_ = "unspecified";
   std::string app_id_ = "unspecified";
   std::string device_os_ = "unspecified";
@@ -145,38 +173,53 @@ private:
   bool brotli_decompression_filter_ = false;
   bool socket_tagging_filter_ = false;
   bool platform_certificates_validation_on_ = false;
-  std::string rtds_layer_name_ = "";
-  int rtds_timeout_seconds_;
-  std::string node_id_;
-  absl::optional<NodeLocality> node_locality_ = absl::nullopt;
-  std::string ads_address_ = ""; // make absl:optional?
-  int ads_port_;
-  std::string ads_jwt_token_;
-  int ads_jwt_token_lifetime_seconds_;
-  std::string ads_ssl_root_certs_;
-  std::string cds_resources_locator_;
-  int cds_timeout_seconds_;
-  bool enable_cds_ = false;
   bool dns_cache_on_ = false;
   int dns_cache_save_interval_seconds_ = 1;
+  absl::optional<int> network_thread_priority_ = absl::nullopt;
 
   absl::flat_hash_map<std::string, KeyValueStoreSharedPtr> key_value_stores_{};
 
-  bool admin_interface_enabled_ = false;
   bool enable_interface_binding_ = false;
   bool enable_drain_post_dns_refresh_ = false;
   bool enforce_trust_chain_verification_ = true;
+  std::string upstream_tls_sni_;
   bool enable_http3_ = true;
-  bool always_use_v6_ = false;
+  std::string http3_connection_options_ = "";
+  std::string http3_client_connection_options_ = "";
+  std::vector<std::pair<std::string, int>> quic_hints_;
+  std::vector<std::string> quic_suffixes_;
+  int num_timeouts_to_trigger_port_migration_ = 0;
+#if defined(__APPLE__)
+  bool respect_system_proxy_settings_ = true;
+  int proxy_settings_refresh_interval_secs_ = 10;
+  int ios_network_service_type_ = 0;
+#endif
   int dns_min_refresh_seconds_ = 60;
   int max_connections_per_host_ = 7;
-  std::vector<std::string> stats_sinks_;
 
   std::vector<NativeFilterConfig> native_filter_chain_;
-  std::vector<std::string> dns_preresolve_hostnames_;
+  std::vector<std::pair<std::string /* host */, uint32_t /* port */>> dns_preresolve_hostnames_;
+  std::vector<envoy::config::core::v3::SocketOption> socket_options_;
 
   std::vector<std::pair<std::string, bool>> runtime_guards_;
+  std::vector<std::pair<std::string, bool>> restart_runtime_guards_;
   absl::flat_hash_map<std::string, StringAccessorSharedPtr> string_accessors_;
+
+  // This is the same value Cronet uses for QUIC:
+  // https://source.chromium.org/chromium/chromium/src/+/main:net/quic/quic_context.h;drc=ccfe61524368c94b138ddf96ae8121d7eb7096cf;l=87
+  int32_t udp_socket_receive_buffer_size_ = 1024 * 1024; // 1MB
+  // This is the same value Cronet uses for QUIC:
+  // https://source.chromium.org/chromium/chromium/src/+/main:net/quic/quic_session_pool.cc;l=790-793;drc=7f04a8e033c23dede6beae129cd212e6d4473d72
+  // https://source.chromium.org/chromium/chromium/src/+/main:net/third_party/quiche/src/quiche/quic/core/quic_constants.h;l=43-47;drc=34ad7f3844f882baf3d31a6bc6e300acaa0e3fc8
+  int32_t udp_socket_send_buffer_size_ = 1452 * 20;
+  // These are the same values Cronet uses for QUIC:
+  // https://source.chromium.org/chromium/chromium/src/+/main:net/quic/quic_context.cc;l=21-22;drc=6849bf6b37e96bd1c38a5f77f7deaa28b53779c4;bpv=1;bpt=1
+  const uint32_t initial_stream_window_size_ = 6 * 1024 * 1024;      // 6MB
+  const uint32_t initial_connection_window_size_ = 15 * 1024 * 1024; // 15MB
+  int quic_connection_idle_timeout_seconds_ = 60;
+
+  int keepalive_initial_interval_ms_ = 0;
+  int max_concurrent_streams_ = 0;
 };
 
 using EngineBuilderSharedPtr = std::shared_ptr<EngineBuilder>;

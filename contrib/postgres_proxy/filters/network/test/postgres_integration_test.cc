@@ -1,7 +1,8 @@
 #include "source/common/network/connection_impl.h"
+#include "source/common/tls/client_ssl_socket.h"
+#include "source/common/tls/server_context_config_impl.h"
+#include "source/common/tls/server_ssl_socket.h"
 #include "source/extensions/filters/network/common/factory_base.h"
-#include "source/extensions/transport_sockets/tls/context_config_impl.h"
-#include "source/extensions/transport_sockets/tls/ssl_socket.h"
 
 #include "test/integration/fake_upstream.h"
 #include "test/integration/integration.h"
@@ -26,29 +27,38 @@ namespace PostgresProxy {
 class PostgresBaseIntegrationTest : public testing::TestWithParam<Network::Address::IpVersion>,
                                     public BaseIntegrationTest {
 public:
-  // Tuple to store upstream and downstream startTLS configuration.
+  // Tuple to store downstream startTLS configuration.
   // The first string contains string to enable/disable SSL.
   // The second string contains transport socket configuration.
-  using SSLConfig = std::tuple<const absl::string_view, const absl::string_view>;
+  // The third string contains require downstream SSL config
+  using SSLConfig =
+      std::tuple<const absl::string_view, const absl::string_view, const absl::string_view>;
 
-  std::string postgresConfig(SSLConfig downstream_ssl_config, SSLConfig upstream_ssl_config,
+  // Tuple to store upstream startTLS configuration.
+  // The first string contains string to enable/disable SSL.
+  // The second string contains transport socket configuration.
+  using UpstreamSSLConfig = std::tuple<const absl::string_view, const absl::string_view>;
+
+  std::string postgresConfig(SSLConfig downstream_ssl_config, UpstreamSSLConfig upstream_ssl_config,
                              std::string additional_filters) {
     std::string main_config = fmt::format(
-        TestEnvironment::readFileToStringForTest(TestEnvironment::runfilesPath(
-            "contrib/postgres_proxy/filters/network/test/postgres_test_config.yaml-template")),
+        fmt::runtime(TestEnvironment::readFileToStringForTest(TestEnvironment::runfilesPath(
+            "contrib/postgres_proxy/filters/network/test/postgres_test_config.yaml-template"))),
         Platform::null_device_path, Network::Test::getLoopbackAddressString(GetParam()),
         Network::Test::getLoopbackAddressString(GetParam()),
         std::get<1>(upstream_ssl_config), // upstream SSL transport socket
         Network::Test::getAnyAddressString(GetParam()),
         std::get<0>(downstream_ssl_config),  // downstream SSL termination
         std::get<0>(upstream_ssl_config),    // upstream_SSL option
+        std::get<2>(downstream_ssl_config),  // require downstream SSL
         additional_filters,                  // additional filters to insert after postgres
         std::get<1>(downstream_ssl_config)); // downstream SSL transport socket
 
     return main_config;
   }
 
-  PostgresBaseIntegrationTest(SSLConfig downstream_ssl_config, SSLConfig upstream_ssl_config,
+  PostgresBaseIntegrationTest(SSLConfig downstream_ssl_config,
+                              UpstreamSSLConfig upstream_ssl_config,
                               std::string additional_filters = "")
       : BaseIntegrationTest(GetParam(), postgresConfig(downstream_ssl_config, upstream_ssl_config,
                                                        additional_filters)) {
@@ -58,8 +68,9 @@ public:
   void SetUp() override { BaseIntegrationTest::initialize(); }
 
   static constexpr absl::string_view empty_config_string_{""};
-  static constexpr SSLConfig NoUpstreamSSL{empty_config_string_, empty_config_string_};
-  static constexpr SSLConfig NoDownstreamSSL{empty_config_string_, empty_config_string_};
+  static constexpr UpstreamSSLConfig NoUpstreamSSL{empty_config_string_, empty_config_string_};
+  static constexpr SSLConfig NoDownstreamSSL{empty_config_string_, empty_config_string_,
+                                             empty_config_string_};
   FakeRawConnectionPtr fake_upstream_connection_;
 };
 
@@ -137,7 +148,8 @@ public:
                   filename: {}
    )EOF",
                     TestEnvironment::runfilesPath("test/config/integration/certs/servercert.pem"),
-                    TestEnvironment::runfilesPath("test/config/integration/certs/serverkey.pem"))),
+                    TestEnvironment::runfilesPath("test/config/integration/certs/serverkey.pem")),
+                "downstream_ssl: REQUIRE"),
             NoUpstreamSSL) {}
 };
 
@@ -171,6 +183,27 @@ TEST_P(DownstreamSSLPostgresIntegrationTest, TerminateSSL) {
   test_server_->waitForCounterEq("postgres.postgres_stats.sessions_terminated_ssl", 1);
 }
 
+// Test verifies that Postgres filter replies with error code upon
+// receiving non-ssl request when require downstream ssl is enabled
+TEST_P(DownstreamSSLPostgresIntegrationTest, RequireSSL) {
+  Buffer::OwnedImpl data;
+
+  IntegrationTcpClientPtr tcp_client = makeTcpConnection(lookupPort("listener_0"));
+  FakeRawConnectionPtr fake_upstream_connection;
+  ASSERT_TRUE(fake_upstreams_[0]->waitForRawConnection(fake_upstream_connection));
+
+  // Send the non SSL message.
+  createInitialPostgresRequest(data);
+  ASSERT_TRUE(tcp_client->write(data.toString()));
+  data.drain(data.length());
+
+  // Message will be processed by Postgres filter which
+  // is configured to send back an error response and close connection
+  tcp_client->waitForData("E", true);
+  tcp_client->waitForDisconnect();
+  ASSERT_TRUE(fake_upstream_connection->waitForDisconnect());
+}
+
 INSTANTIATE_TEST_SUITE_P(IpVersions, DownstreamSSLPostgresIntegrationTest,
                          testing::ValuesIn(TestEnvironment::getIpVersionsForTest()));
 
@@ -178,7 +211,9 @@ class DownstreamSSLWrongConfigPostgresIntegrationTest : public PostgresBaseInteg
 public:
   DownstreamSSLWrongConfigPostgresIntegrationTest()
       // Enable SSL termination but do not configure downstream transport socket.
-      : PostgresBaseIntegrationTest(std::make_tuple("terminate_ssl: true", ""), NoUpstreamSSL) {}
+      : PostgresBaseIntegrationTest(
+            std::make_tuple("terminate_ssl: false", "", "downstream_ssl: REQUIRE"), NoUpstreamSSL) {
+  }
 };
 
 // Test verifies that Postgres filter closes connection when it is configured to
@@ -223,9 +258,10 @@ INSTANTIATE_TEST_SUITE_P(IpVersions, DownstreamSSLWrongConfigPostgresIntegration
 
 class UpstreamSSLBaseIntegrationTest : public PostgresBaseIntegrationTest {
 public:
-  UpstreamSSLBaseIntegrationTest(SSLConfig upstream_ssl_config)
+  UpstreamSSLBaseIntegrationTest(UpstreamSSLConfig upstream_ssl_config,
+                                 SSLConfig downstream_ssl_config = NoDownstreamSSL)
       // Disable downstream SSL and attach synchronization filter.
-      : PostgresBaseIntegrationTest(NoDownstreamSSL, upstream_ssl_config, R"EOF(
+      : PostgresBaseIntegrationTest(downstream_ssl_config, upstream_ssl_config, R"EOF(
       -  name: sync
          typed_config:
            "@type": type.googleapis.com/test.integration.postgres.SyncWriteFilterConfig
@@ -294,7 +330,8 @@ public:
     // The tls transport socket will be inserted into fake_upstream when
     // Envoy's upstream starttls transport socket is converted to secure mode.
     std::unique_ptr<Ssl::ContextManager> tls_context_manager =
-        std::make_unique<Extensions::TransportSockets::Tls::ContextManagerImpl>(timeSystem());
+        std::make_unique<Extensions::TransportSockets::Tls::ContextManagerImpl>(
+            server_factory_context_);
 
     envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext downstream_tls_context;
 
@@ -314,12 +351,12 @@ public:
 
     NiceMock<Server::Configuration::MockTransportSocketFactoryContext> mock_factory_ctx;
     ON_CALL(mock_factory_ctx.server_context_, api()).WillByDefault(testing::ReturnRef(*api_));
-    auto cfg = std::make_unique<Extensions::TransportSockets::Tls::ServerContextConfigImpl>(
-        downstream_tls_context, mock_factory_ctx);
+    auto cfg = *Extensions::TransportSockets::Tls::ServerContextConfigImpl::create(
+        downstream_tls_context, mock_factory_ctx, false);
     static auto* client_stats_store = new Stats::TestIsolatedStoreImpl();
     Network::DownstreamTransportSocketFactoryPtr tls_context =
         Network::DownstreamTransportSocketFactoryPtr{
-            new Extensions::TransportSockets::Tls::ServerSslSocketFactory(
+            *Extensions::TransportSockets::Tls::ServerSslSocketFactory::create(
                 std::move(cfg), *tls_context_manager, *(client_stats_store->rootScope()), {})};
 
     Network::TransportSocketPtr ts = tls_context->createDownstreamTransportSocket();
@@ -465,8 +502,8 @@ TEST_P(UpstreamSSLRequirePostgresIntegrationTest, ServerDeniesSSLTest) {
   ASSERT_EQ(80877103, upstream_data.peekBEInt<uint32_t>(4));
   upstream_data.drain(upstream_data.length());
 
-  // Reply to Envoy with 'E' (SSL not allowed).
-  upstream_data.add("E");
+  // Reply to Envoy with 'N' (SSL not allowed).
+  upstream_data.add("N");
   ASSERT_TRUE(fake_upstream_connection_->write(upstream_data.toString()));
   config_factory_.proceed_sync_.Notify();
 
@@ -481,6 +518,227 @@ TEST_P(UpstreamSSLRequirePostgresIntegrationTest, ServerDeniesSSLTest) {
 }
 
 INSTANTIATE_TEST_SUITE_P(IpVersions, UpstreamSSLRequirePostgresIntegrationTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()));
+
+// Base class for parameterized tests when upstream and downstream SSL is enabled.
+class UpstreamAndDownstreamSSLIntegrationTest : public UpstreamSSLBaseIntegrationTest {
+public:
+  UpstreamAndDownstreamSSLIntegrationTest()
+      : UpstreamSSLBaseIntegrationTest(
+            // Configure upstream SSL
+            std::make_tuple("upstream_ssl: REQUIRE",
+                            R"EOF(transport_socket:
+      name: "starttls"
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.starttls.v3.UpstreamStartTlsConfig
+        tls_socket_config:
+          common_tls_context: {}
+    )EOF"),
+            // configure downstream SSL
+            std::make_tuple(
+                "terminate_ssl: true",
+                fmt::format(
+                    R"EOF(transport_socket:
+        name: "starttls"
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.starttls.v3.StartTlsConfig
+          cleartext_socket_config:
+          tls_socket_config:
+            common_tls_context:
+              tls_certificates:
+                certificate_chain:
+                  filename: {}
+                private_key:
+                  filename: {}
+   )EOF",
+                    TestEnvironment::runfilesPath("test/config/integration/certs/servercert.pem"),
+                    TestEnvironment::runfilesPath("test/config/integration/certs/serverkey.pem")),
+                "downstream_ssl: REQUIRE")) {}
+
+  // Method changes IntegrationTcpClient's transport socket to TLS.
+  // Sending any traffic to newly attached TLS transport socket will trigger
+  // TLS handshake negotiation.
+  void enableTLSonTCPClient(const IntegrationTcpClientPtr& tcp_client) {
+    // Setup factory and context for tls transport socket.
+    // The tls transport socket will be inserted into fake_upstream when
+    // Envoy's upstream starttls transport socket is converted to secure mode.
+    std::unique_ptr<Ssl::ContextManager> tls_context_manager =
+        std::make_unique<Extensions::TransportSockets::Tls::ContextManagerImpl>(
+            server_factory_context_);
+
+    envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext upstream_tls_context;
+
+    NiceMock<Server::Configuration::MockTransportSocketFactoryContext> mock_factory_ctx;
+    ON_CALL(mock_factory_ctx.server_context_, api()).WillByDefault(testing::ReturnRef(*api_));
+    auto cfg = *Extensions::TransportSockets::Tls::ClientContextConfigImpl::create(
+        upstream_tls_context, mock_factory_ctx);
+    static auto* client_stats_store = new Stats::TestIsolatedStoreImpl();
+    Network::UpstreamTransportSocketFactoryPtr tls_context =
+        Network::UpstreamTransportSocketFactoryPtr{
+            *Extensions::TransportSockets::Tls::ClientSslSocketFactory::create(
+                std::move(cfg), *tls_context_manager, *(client_stats_store->rootScope()))};
+
+    Network::TransportSocketOptionsConstSharedPtr options;
+
+    auto connection = dynamic_cast<Envoy::Network::ConnectionImpl*>(tcp_client->connection());
+    Network::TransportSocketPtr ts = tls_context->createTransportSocket(
+        options, connection->streamInfo().upstreamInfo()->upstreamHost());
+    connection->transportSocket() = std::move(ts);
+    connection->transportSocket()->setTransportSocketCallbacks(*connection);
+  }
+};
+
+// Integration test when both downstream and upstream SSL is enabled.
+// In this scenario test client establishes SSL connection to Envoy. Envoy de-crypts the traffic.
+// The traffic is encrypted again when sent to upstream server.
+// The test follows the following scenario:
+//
+// Test client                     Envoy                  Upstream
+// ----- Can I use SSL? ------------>
+// <------- Yes---------------------
+// <------- TLS handshake ---------->
+// ------ Initial postgres msg ----->
+//                                    ------ Can I use SSL? --->
+//                                    <------- Yes--------------
+//                                    <------- TLS handshake--->
+//                                    --Initial postgres msg--->
+// ------ close connection --------->
+//                                    ------ close connection--->
+//
+TEST_P(UpstreamAndDownstreamSSLIntegrationTest, ServerAgreesForSSL) {
+  Buffer::OwnedImpl data;
+
+  IntegrationTcpClientPtr tcp_client = makeTcpConnection(lookupPort("listener_0"));
+  ASSERT_TRUE(fake_upstreams_[0]->waitForRawConnection(fake_upstream_connection_));
+
+  // Send the startup message requesting SSL.
+  // Message is 8 bytes long. The first 4 bytes contain length (8)
+  // The next 8 bytes contain message code (RequestSSL=80877103)
+  data.writeBEInt<uint32_t>(8);
+  data.writeBEInt<uint32_t>(80877103);
+
+  // Message will be processed by Postgres filter which
+  // is configured to accept SSL termination and confirm it
+  // by returning single byte 'S'.
+  ASSERT_TRUE(tcp_client->write(data.toString()));
+  data.drain(data.length());
+
+  tcp_client->waitForData("S", true);
+
+  // Attach TLS to tcp_client.
+  enableTLSonTCPClient(tcp_client);
+
+  // Write initial postgres message. This should trigger SSL negotiation between test TCP client and
+  // Envoy downstream transport socket. Postgres filter should ask the fake upstream server if it
+  // will accept encrypted connection.
+  Buffer::OwnedImpl upstream_data;
+  std::string rcvd;
+  createInitialPostgresRequest(data);
+  ASSERT_TRUE(tcp_client->write(data.toString()));
+  // Postgres filter should buffer the original message and negotiate SSL upstream.
+  // The first 4 bytes should be length on the message (8 bytes).
+  // The next 4 bytes should be SSL code.
+  ASSERT_TRUE(fake_upstream_connection_->waitForData(8, &rcvd));
+  upstream_data.add(rcvd);
+  ASSERT_EQ(8, upstream_data.peekBEInt<uint32_t>(0));
+  ASSERT_EQ(80877103, upstream_data.peekBEInt<uint32_t>(4));
+  upstream_data.drain(upstream_data.length());
+
+  // Reply to Envoy with 'S' and attach TLS socket to upstream.
+  upstream_data.add("S");
+  ASSERT_TRUE(fake_upstream_connection_->write(upstream_data.toString()));
+  fake_upstream_connection_->clearData();
+
+  config_factory_.recv_sync_.WaitForNotification();
+  enableTLSOnFakeUpstream();
+  config_factory_.proceed_sync_.Notify();
+
+  ASSERT_TRUE(fake_upstream_connection_->waitForData(data.length(), &rcvd));
+  // Make sure that upstream received initial postgres request, which
+  // triggered upstream SSL negotiation and TLS handshake.
+  ASSERT_EQ(data.toString(), rcvd);
+
+  data.drain(data.length());
+
+  tcp_client->close();
+  ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
+
+  test_server_->waitForCounterEq("postgres.postgres_stats.sessions_terminated_ssl", 1);
+  test_server_->waitForCounterEq("postgres.postgres_stats.sessions_upstream_ssl_success", 1);
+  test_server_->waitForCounterEq("postgres.postgres_stats.sessions_upstream_ssl_failed", 0);
+}
+
+// Integration test when both downstream and upstream SSL is enabled.
+// In this scenario test client establishes SSL connection to Envoy. Envoy de-crypts the traffic.
+// The traffic is encrypted again when sent to upstream server, but the server
+// rejects request for SSL.
+// The test follows the following scenario:
+//
+// Test client                     Envoy                  Upstream
+// ----- Can I use SSL? ------------>
+// <------- Yes---------------------
+// <------- TLS handshake ---------->
+// ------ Initial postgres msg ----->
+//                                    ------ Can I use SSL? --->
+//                                    <------- No---------------
+// <----- close connection ----------
+//                                    ------ close connection--->
+TEST_P(UpstreamAndDownstreamSSLIntegrationTest, ServerRejectsSSL) {
+  Buffer::OwnedImpl data;
+
+  IntegrationTcpClientPtr tcp_client = makeTcpConnection(lookupPort("listener_0"));
+  ASSERT_TRUE(fake_upstreams_[0]->waitForRawConnection(fake_upstream_connection_));
+
+  // Send the startup message requesting SSL.
+  // Message is 8 bytes long. The first 4 bytes contain length (8)
+  // The next 8 bytes contain message code (RequestSSL=80877103)
+  data.writeBEInt<uint32_t>(8);
+  data.writeBEInt<uint32_t>(80877103);
+
+  // Message will be processed by Postgres filter which
+  // is configured to accept SSL termination and confirm it
+  // by returning single byte 'S'.
+  ASSERT_TRUE(tcp_client->write(data.toString()));
+  data.drain(data.length());
+
+  tcp_client->waitForData("S", true);
+
+  // Attach TLS to tcp_client.
+  enableTLSonTCPClient(tcp_client);
+
+  // Write initial postgres message. This should trigger SSL negotiation between test TCP client and
+  // Envoy downstream transport socket. Postgres filter should ask the fake upstream server if it
+  // will accept encrypted connection.
+  Buffer::OwnedImpl upstream_data;
+  std::string rcvd;
+  createInitialPostgresRequest(data);
+  ASSERT_TRUE(tcp_client->write(data.toString()));
+  // Postgres filter should buffer the original message and negotiate SSL upstream.
+  // The first 4 bytes should be length on the message (8 bytes).
+  // The next 4 bytes should be SSL code.
+  ASSERT_TRUE(fake_upstream_connection_->waitForData(8, &rcvd));
+  upstream_data.add(rcvd);
+  ASSERT_EQ(8, upstream_data.peekBEInt<uint32_t>(0));
+  ASSERT_EQ(80877103, upstream_data.peekBEInt<uint32_t>(4));
+  upstream_data.drain(upstream_data.length());
+
+  // Reply to Envoy with 'E' (SSL not allowed).
+  upstream_data.add("E");
+  ASSERT_TRUE(fake_upstream_connection_->write(upstream_data.toString()));
+  config_factory_.proceed_sync_.Notify();
+
+  data.drain(data.length());
+
+  // Envoy should close the connection to test client.
+  tcp_client->waitForDisconnect();
+  ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
+
+  test_server_->waitForCounterEq("postgres.postgres_stats.sessions_terminated_ssl", 1);
+  test_server_->waitForCounterEq("postgres.postgres_stats.sessions_upstream_ssl_success", 0);
+  test_server_->waitForCounterEq("postgres.postgres_stats.sessions_upstream_ssl_failed", 1);
+}
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, UpstreamAndDownstreamSSLIntegrationTest,
                          testing::ValuesIn(TestEnvironment::getIpVersionsForTest()));
 
 } // namespace PostgresProxy

@@ -9,28 +9,18 @@
 #include "envoy/network/connection.h"
 #include "envoy/network/listener.h"
 
+#include "source/common/api/os_sys_calls_impl.h"
+#include "source/common/common/cleanup.h"
 #include "source/common/common/statusor.h"
+
+#if defined(__linux__)
+#include "source/common/api/os_sys_calls_impl_linux.h"
+#endif
 
 #include "absl/strings/string_view.h"
 
 namespace Envoy {
 namespace Network {
-
-/**
- * Utility class to represent TCP/UDP port range
- */
-class PortRange {
-public:
-  PortRange(uint32_t min, uint32_t max) : min_(min), max_(max) {}
-
-  bool contains(uint32_t port) const { return (port >= min_ && port <= max_); }
-
-private:
-  const uint32_t min_;
-  const uint32_t max_;
-};
-
-using PortRangeList = std::list<PortRange>;
 
 /**
  * A callback interface used by readFromSocket() to pass packets read from
@@ -50,7 +40,8 @@ public:
    */
   virtual void processPacket(Address::InstanceConstSharedPtr local_address,
                              Address::InstanceConstSharedPtr peer_address,
-                             Buffer::InstancePtr buffer, MonotonicTime receive_time) PURE;
+                             Buffer::InstancePtr buffer, MonotonicTime receive_time, uint8_t tos,
+                             Buffer::OwnedImpl saved_cmsg) PURE;
 
   /**
    * Called whenever datagrams are dropped due to overflow or truncation.
@@ -68,6 +59,8 @@ public:
    * An estimated number of packets to read in each read event.
    */
   virtual size_t numPacketsExpectedPerEventLoop() const PURE;
+
+  virtual const IoHandle::UdpSaveCmsgConfig& saveCmsgConfig() const PURE;
 };
 
 static const uint64_t DEFAULT_UDP_MAX_DATAGRAM_SIZE = 1500;
@@ -85,6 +78,17 @@ struct ResolvedUdpSocketConfig {
   bool prefer_gro_;
 };
 
+// The different options for receiving UDP packet(s) from system calls.
+enum class UdpRecvMsgMethod {
+  // The `recvmsg` system call.
+  RecvMsg,
+  // The `recvmsg` system call using GRO (generic receive offload). This is the preferred method,
+  // if the platform supports it.
+  RecvMsgWithGro,
+  // The `recvmmsg` system call.
+  RecvMmsg,
+};
+
 /**
  * Common network utility routines.
  */
@@ -95,12 +99,21 @@ public:
   static constexpr absl::string_view UNIX_SCHEME{"unix://"};
 
   /**
+   * Make a URL from a datagram Address::Instance; will be udp:// prefix for
+   * an IP address, and unix:// prefix otherwise. Giving a tcp address to this
+   * function will result in incorrect behavior (addresses don't know if they
+   * are datagram or stream).
+   * @param addr supplies the address to convert to string.
+   * @return The appropriate url string compatible with resolveUrl.
+   */
+  static std::string urlFromDatagramAddress(const Address::Instance& addr);
+
+  /**
    * Resolve a URL.
    * @param url supplies the url to resolve.
-   * @return Address::InstanceConstSharedPtr the resolved address.
-   * @throw EnvoyException if url is invalid.
+   * @return Address::InstanceConstSharedPtr the resolved address or an error status
    */
-  static Address::InstanceConstSharedPtr resolveUrl(const std::string& url);
+  static absl::StatusOr<Address::InstanceConstSharedPtr> resolveUrl(const std::string& url);
 
   /**
    * Determine the socket type for a URL.
@@ -133,26 +146,16 @@ public:
 
   /**
    * Parse an internet host address (IPv4 or IPv6) and create an Instance from it. The address must
-   * not include a port number. Throws EnvoyException if unable to parse the address.
-   * @param ip_address string to be parsed as an internet address.
-   * @param port optional port to include in Instance created from ip_address, 0 by default.
-   * @param v6only disable IPv4-IPv6 mapping for IPv6 addresses?
-   * @return pointer to the Instance.
-   * @throw EnvoyException in case of a malformed IP address.
-   */
-  static Address::InstanceConstSharedPtr
-  parseInternetAddress(const std::string& ip_address, uint16_t port = 0, bool v6only = true);
-
-  /**
-   * Parse an internet host address (IPv4 or IPv6) and create an Instance from it. The address must
    * not include a port number.
    * @param ip_address string to be parsed as an internet address.
    * @param port optional port to include in Instance created from ip_address, 0 by default.
    * @param v6only disable IPv4-IPv6 mapping for IPv6 addresses?
+   * @param network_namespace network namespace containing the address.
    * @return pointer to the Instance, or nullptr if unable to parse the address.
    */
   static Address::InstanceConstSharedPtr
-  parseInternetAddressNoThrow(const std::string& ip_address, uint16_t port = 0, bool v6only = true);
+  parseInternetAddressNoThrow(const std::string& ip_address, uint16_t port = 0, bool v6only = true,
+                              absl::optional<std::string> network_namespace = absl::nullopt);
 
   /**
    * Parse an internet host address (IPv4 or IPv6) AND port, and create an Instance from it. Throws
@@ -169,22 +172,12 @@ public:
    *        - "1.2.3.4:80"
    *        - "[1234:5678::9]:443"
    * @param v6only disable IPv4-IPv6 mapping for IPv6 addresses?
-   * @return pointer to the Instance.
-   * @throw EnvoyException in case of a malformed IP address.
-   */
-  static Address::InstanceConstSharedPtr parseInternetAddressAndPort(const std::string& ip_address,
-                                                                     bool v6only = true);
-
-  /**
-   * Create a new Instance from an internet host address (IPv4 or IPv6) and port.
-   * @param ip_addr string to be parsed as an internet address and port. Examples:
-   *        - "1.2.3.4:80"
-   *        - "[1234:5678::9]:443"
-   * @param v6only disable IPv4-IPv6 mapping for IPv6 addresses?
+   * @param network_namespace network namespace containing the address.
    * @return pointer to the Instance, or a nullptr in case of a malformed IP address.
    */
   static Address::InstanceConstSharedPtr
-  parseInternetAddressAndPortNoThrow(const std::string& ip_address, bool v6only = true);
+  parseInternetAddressAndPortNoThrow(const std::string& ip_address, bool v6only = true,
+                                     absl::optional<std::string> network_namespace = absl::nullopt);
 
   /**
    * Get the local address of the first interface address that is of type
@@ -269,24 +262,6 @@ public:
   static Address::InstanceConstSharedPtr getOriginalDst(Socket& sock);
 
   /**
-   * Parses a string containing a comma-separated list of port numbers and/or
-   * port ranges and appends the values to a caller-provided list of PortRange structures.
-   * For example, the string "1-1024,2048-4096,12345" causes 3 PortRange structures
-   * to be appended to the supplied list.
-   * @param str is the string containing the port numbers and ranges
-   * @param list is the list to append the new data structures to
-   */
-  static void parsePortRangeList(absl::string_view string, std::list<PortRange>& list);
-
-  /**
-   * Checks whether a given port number appears in at least one of the port ranges in a list
-   * @param address supplies the IP address to compare.
-   * @param list the list of port ranges in which the port may appear
-   * @return whether the port appears in at least one of the ranges in the list
-   */
-  static bool portInRangeList(const Address::Instance& address, const std::list<PortRange>& list);
-
-  /**
    * Converts IPv6 absl::uint128 in network byte order to host byte order.
    * @param address supplies the IPv6 address in network byte order.
    * @return the absl::uint128 IPv6 address in host byte order.
@@ -300,8 +275,12 @@ public:
    */
   static absl::uint128 Ip6htonl(const absl::uint128& address);
 
+  /**
+   * @param proto_address supplies the proto address to convert
+   * @return the InstanceConstSharedPtr for the address, or null if proto_address is invalid.
+   */
   static Address::InstanceConstSharedPtr
-  protobufAddressToAddress(const envoy::config::core::v3::Address& proto_address);
+  protobufAddressToAddressNoThrow(const envoy::config::core::v3::Address& proto_address);
 
   /**
    * Copies the address instance into the protobuf representation of an address.
@@ -342,15 +321,19 @@ public:
    * @param udp_packet_processor is the callback to receive the packet.
    * @param receive_time is the timestamp passed to udp_packet_processor for the
    * receive time of the packet.
-   * @param prefer_gro supplies whether to use GRO if the OS supports it.
+   * @param recv_msg_method the type of system call and socket options combination to use when
+   * receiving packets from the kernel.
    * @param packets_dropped is the output parameter for number of packets dropped in kernel. If the
    * caller is not interested in it, nullptr can be passed in.
+   * @param num_packets_read is the output parameter for the number of packets passed to the
+   * udp_packet_processor in this call. If the caller is not interested in it, nullptr can be passed
+   * in.
    */
-  static Api::IoCallUint64Result readFromSocket(IoHandle& handle,
-                                                const Address::Instance& local_address,
-                                                UdpPacketProcessor& udp_packet_processor,
-                                                MonotonicTime receive_time, bool use_gro,
-                                                uint32_t* packets_dropped);
+  static Api::IoCallUint64Result
+  readFromSocket(IoHandle& handle, const Address::Instance& local_address,
+                 UdpPacketProcessor& udp_packet_processor, MonotonicTime receive_time,
+                 UdpRecvMsgMethod recv_msg_method, uint32_t* packets_dropped,
+                 uint32_t* num_packets_read);
 
   /**
    * Read some packets from a given UDP socket and pass the packet to a given
@@ -359,7 +342,11 @@ public:
    * @param local_address is the socket's local address used to populate port.
    * @param udp_packet_processor is the callback to receive the packets.
    * @param time_source is the time source used to generate the time stamp of the received packets.
-   * @param prefer_gro supplies whether to use GRO if the OS supports it.
+   * @param allow_gro whether to use GRO, iff the platform supports it. This function will check
+   * the IoHandle to ensure the platform supports GRO before using it.
+   * @param allow_mmsg whether to use recvmmsg, iff the platform supports it. This function will
+   * check the IoHandle to ensure the platform supports recvmmsg before using it. If `allow_gro` is
+   * true and the platform supports GRO, then it will take precedence over using recvmmsg.
    * @param packets_dropped is the output parameter for number of packets dropped in kernel.
    * Return the io error encountered or nullptr if no io error but read stopped
    * because of MAX_NUM_PACKETS_PER_EVENT_LOOP.
@@ -374,12 +361,68 @@ public:
   static Api::IoErrorPtr readPacketsFromSocket(IoHandle& handle,
                                                const Address::Instance& local_address,
                                                UdpPacketProcessor& udp_packet_processor,
-                                               TimeSource& time_source, bool prefer_gro,
-                                               uint32_t& packets_dropped);
+                                               TimeSource& time_source, bool allow_gro,
+                                               bool allow_mmsg, uint32_t& packets_dropped);
+
+#if defined(__linux__)
+  /**
+   * Changes the calling thread's network namespace to the one referenced by the file at `netns`,
+   * calls the function `f`, and returns its result after switching back to the original network
+   * namespace.
+   *
+   * @param f the function to execute in the specified network namespace.
+   * @param netns filepath referencing the network namespace in which `f` is executed.
+   * @return the result of 'f' wrapped in absl::StatusOr to any indicate syscall failures.
+   */
+  template <typename Func>
+  static auto execInNetworkNamespace(Func&& f, const char* netns)
+      -> absl::StatusOr<typename std::invoke_result_t<Func>> {
+    Api::OsSysCalls& posix = Api::OsSysCallsSingleton().get();
+
+    // Open the original netns fd, so that we can return to it.
+    constexpr auto curr_netns_file = "/proc/self/ns/net";
+    auto og_netns_fd_result = posix.open(curr_netns_file, O_RDONLY);
+    int og_netns_fd = og_netns_fd_result.return_value_;
+    if (og_netns_fd_result.errno_ != 0) {
+      return absl::InternalError(fmt::format("failed to open netns file {}: {}", curr_netns_file,
+                                             errorDetails(og_netns_fd_result.errno_)));
+    }
+    Cleanup cleanup_og_fd([&og_netns_fd, &posix]() { posix.close(og_netns_fd); });
+
+    // Open the fd for the network namespace we want the socket in.
+    auto netns_fd_result = posix.open(netns, O_RDONLY);
+    const int netns_fd = netns_fd_result.return_value_;
+    if (netns_fd <= 0) {
+      return absl::InternalError(fmt::format("failed to open netns file {}: {}", netns,
+                                             errorDetails(netns_fd_result.errno_)));
+    }
+    Cleanup cleanup_netns_fd([&posix, &netns_fd]() { posix.close(netns_fd); });
+
+    // Change the network namespace of this thread.
+    auto setns_result = Api::LinuxOsSysCallsSingleton().get().setns(netns_fd, CLONE_NEWNET);
+    if (setns_result.return_value_ != 0) {
+      return absl::InternalError(fmt::format("failed to set netns to {} (fd={}): {}", netns,
+                                             netns_fd, errorDetails(errno)));
+    }
+
+    // Calling function from the specified network namespace.
+    auto result = std::forward<Func>(f)();
+
+    // Restore the original network namespace before returning the function result.
+    setns_result = Api::LinuxOsSysCallsSingleton().get().setns(og_netns_fd, CLONE_NEWNET);
+
+    // If we cannot jump back into the original network namespace, this is an unrecoverable error.
+    // It would leave the current thread in another network namespace indefinitely, so we cannot
+    // continue running in that state.
+    RELEASE_ASSERT(
+        setns_result.return_value_ == 0,
+        fmt::format("failed to restore original netns (fd={}): {}", netns_fd, errorDetails(errno)));
+
+    return result;
+  }
+#endif
 
 private:
-  static void throwWithMalformedIp(absl::string_view ip_address);
-
   /**
    * Takes a number and flips the order in byte chunks. The last byte of the input will be the
    * first byte in the output. The second to last byte will be the second to first byte in the

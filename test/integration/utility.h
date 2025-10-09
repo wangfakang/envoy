@@ -6,15 +6,18 @@
 #include <string>
 
 #include "envoy/api/api.h"
+#include "envoy/extensions/http/header_validators/envoy_default/v3/header_validator.pb.h"
 #include "envoy/http/codec.h"
 #include "envoy/http/header_map.h"
 #include "envoy/network/filter.h"
 #include "envoy/server/factory_context.h"
+#include "envoy/thread_local/thread_local.h"
 
 #include "source/common/common/assert.h"
 #include "source/common/common/dump_state_utils.h"
 #include "source/common/common/utility.h"
 #include "source/common/http/codec_client.h"
+#include "source/common/http/response_decoder_impl_base.h"
 #include "source/common/stats/isolated_store_impl.h"
 
 #include "test/test_common/printers.h"
@@ -27,7 +30,7 @@ namespace Envoy {
 /**
  * A buffering response decoder used for testing.
  */
-class BufferingStreamDecoder : public Http::ResponseDecoder, public Http::StreamCallbacks {
+class BufferingStreamDecoder : public Http::ResponseDecoderImplBase, public Http::StreamCallbacks {
 public:
   BufferingStreamDecoder(std::function<void()> on_complete_cb) : on_complete_cb_(on_complete_cb) {}
 
@@ -204,12 +207,15 @@ public:
    * Create transport socket factory for Quic upstream transport socket.
    * @return TransportSocketFactoryPtr the client transport socket factory.
    */
-  static Network::UpstreamTransportSocketFactoryPtr
-  createQuicUpstreamTransportSocketFactory(Api::Api& api, Stats::Store& store,
-                                           Ssl::ContextManager& context_manager,
-                                           const std::string& san_to_match);
+  static Network::UpstreamTransportSocketFactoryPtr createQuicUpstreamTransportSocketFactory(
+      Api::Api& api, Stats::Store& store, Ssl::ContextManager& context_manager,
+      ThreadLocal::Instance& threadlocal, const std::string& san_to_match,
+      // Allow configuring TLS to talk to upstreams instead of Envoy
+      bool connect_to_fake_upstreams = false);
 
-  static Http::HeaderValidatorFactoryPtr makeHeaderValidationFactory(absl::string_view config);
+  static Http::HeaderValidatorFactoryPtr makeHeaderValidationFactory(
+      const ::envoy::extensions::http::header_validators::envoy_default::v3::HeaderValidatorConfig&
+          config);
 };
 
 // A set of connection callbacks which tracks connection state.
@@ -261,13 +267,14 @@ public:
 
     dispatcher_.run(Event::Dispatcher::RunType::Block);
 
+    length_to_wait_for_ = 0;
+    wait_for_length_ = false;
+
     if (timeout_timer->enabled()) {
       timeout_timer->disableTimer();
       return testing::AssertionSuccess();
     }
 
-    length_to_wait_for_ = 0;
-    wait_for_length_ = false;
     return testing::AssertionFailure() << "Timed out waiting for " << length << " bytes of data\n";
   }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "envoy/http/codec.h"
+#include "envoy/server/overload/load_shed_point.h"
 
 #include "source/common/http/http2/codec_impl.h"
 #include "source/common/http/utility.h"
@@ -40,20 +41,17 @@ public:
 protected:
   // Stores SETTINGS parameters contained in |settings_frame| to make them available via
   // getRemoteSettingsParameterValue().
-  void onSettingsFrame(const nghttp2_settings& settings_frame) {
-    for (uint32_t i = 0; i < settings_frame.niv; ++i) {
-      auto result = settings_.insert(
-          std::make_pair(settings_frame.iv[i].settings_id, settings_frame.iv[i].value));
+  void onSettingsFrame(absl::Span<const http2::adapter::Http2Setting> settings) {
+    for (const auto& [id, value] : settings) {
+      auto result = settings_.insert(std::make_pair(id, value));
       // It is possible to have duplicate settings parameters, each new parameter replaces any
       // existing value.
       // https://tools.ietf.org/html/rfc7540#section-6.5
       if (!result.second) {
-        ENVOY_LOG_MISC(debug, "Duplicated settings parameter {} with value {}",
-                       settings_frame.iv[i].settings_id, settings_frame.iv[i].value);
+        ENVOY_LOG_MISC(debug, "Duplicated settings parameter {} with value {}", id, value);
         settings_.erase(result.first);
         // Guaranteed success here.
-        settings_.insert(
-            std::make_pair(settings_frame.iv[i].settings_id, settings_frame.iv[i].value));
+        settings_.insert(std::make_pair(id, value));
       }
     }
   }
@@ -66,11 +64,20 @@ class TestCodecOverloadManagerProvider {
 public:
   TestCodecOverloadManagerProvider() {
     ON_CALL(overload_manager_, getLoadShedPoint(testing::_))
-        .WillByDefault(testing::Return(&server_go_away_on_dispatch));
+        .WillByDefault(testing::Invoke([this](absl::string_view name) -> Server::LoadShedPoint* {
+          if (name == Server::LoadShedPointName::get().H2ServerGoAwayOnDispatch) {
+            return &server_go_away_on_dispatch;
+          }
+          if (name == Server::LoadShedPointName::get().H2ServerGoAwayAndCloseOnDispatch) {
+            return &server_go_away_and_close_on_dispatch;
+          }
+          return nullptr;
+        }));
   }
 
   testing::NiceMock<Server::MockOverloadManager> overload_manager_;
   testing::NiceMock<Server::MockLoadShedPoint> server_go_away_on_dispatch;
+  testing::NiceMock<Server::MockLoadShedPoint> server_go_away_and_close_on_dispatch;
 };
 
 class TestServerConnectionImpl : public TestCodecStatsProvider,
@@ -96,7 +103,9 @@ public:
 
 protected:
   // Overrides ServerConnectionImpl::onSettings().
-  void onSettings(const nghttp2_settings& settings) override { onSettingsFrame(settings); }
+  void onSettings(absl::Span<const http2::adapter::Http2Setting> settings) override {
+    onSettingsFrame(settings);
+  }
 
   testing::NiceMock<Random::MockRandomGenerator> random_;
 };
@@ -132,7 +141,9 @@ public:
 
 protected:
   // Overrides ClientConnectionImpl::onSettings().
-  void onSettings(const nghttp2_settings& settings) override { onSettingsFrame(settings); }
+  void onSettings(absl::Span<const http2::adapter::Http2Setting> settings) override {
+    onSettingsFrame(settings);
+  }
 };
 
 } // namespace Http2

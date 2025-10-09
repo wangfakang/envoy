@@ -9,7 +9,7 @@ namespace Envoy {
 namespace Init {
 
 ManagerImpl::ManagerImpl(absl::string_view name)
-    : name_(fmt::format("init manager {}", name)), state_(State::Uninitialized), count_(0),
+    : name_(fmt::format("init manager {}", name)),
       watcher_(name_, [this](absl::string_view target_name) { onTargetReady(target_name); }) {}
 
 Manager::State ManagerImpl::state() const { return state_; }
@@ -62,6 +62,11 @@ void ManagerImpl::initialize(const Watcher& watcher) {
     }
   }
 }
+
+void ManagerImpl::updateWatcher(const Watcher& watcher) {
+  ASSERT(state_ != State::Initialized, "attempted to update watcher on initialized manager");
+  watcher_handle_ = watcher.createHandle(name_);
+};
 
 void ManagerImpl::dumpUnreadyTargets(envoy::admin::v3::UnreadyTargetsDumps& unready_targets_dumps) {
   auto& message = *unready_targets_dumps.mutable_unready_targets_dumps()->Add();

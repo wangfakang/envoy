@@ -41,7 +41,12 @@ public:
       const envoy::extensions::health_checkers::redis::v3::Redis& redis_config,
       Event::Dispatcher& dispatcher, Runtime::Loader& runtime,
       Upstream::HealthCheckEventLoggerPtr&& event_logger, Api::Api& api,
-      Extensions::NetworkFilters::Common::Redis::Client::ClientFactory& client_factory);
+      Extensions::NetworkFilters::Common::Redis::Client::ClientFactory& client_factory,
+      const absl::optional<envoy::extensions::filters::network::redis_proxy::v3::AwsIam>
+          aws_iam_config,
+      const absl::optional<Extensions::NetworkFilters::Common::Redis::AwsIamAuthenticator::
+                               AwsIamAuthenticatorSharedPtr>
+          aws_iam_authenticator);
 
   static const NetworkFilters::Common::Redis::RespValue& pingHealthCheckRequest() {
     static HealthCheckRequest* request = new HealthCheckRequest();
@@ -63,24 +68,14 @@ private:
   friend class RedisHealthCheckerTest;
   RedisHealthCheckerStats generateRedisStats(Stats::Scope& scope);
 
-  struct RedisActiveHealthCheckSession
-      : public ActiveHealthCheckSession,
-        public Extensions::NetworkFilters::Common::Redis::Client::Config,
-        public Extensions::NetworkFilters::Common::Redis::Client::ClientCallbacks,
-        public Network::ConnectionCallbacks {
-    RedisActiveHealthCheckSession(RedisHealthChecker& parent, const Upstream::HostSharedPtr& host);
-    ~RedisActiveHealthCheckSession() override;
-
-    // ActiveHealthCheckSession
-    void onInterval() override;
-    void onTimeout() override;
-    void onDeferredDelete() final;
+  struct RedisConfig : public Extensions::NetworkFilters::Common::Redis::Client::Config {
+    RedisConfig(std::chrono::milliseconds timeout) : parent_timeout_(timeout) {}
 
     // Extensions::NetworkFilters::Common::Redis::Client::Config
     bool disableOutlierEvents() const override { return true; }
     std::chrono::milliseconds opTimeout() const override {
       // Allow the main Health Check infra to control timeout.
-      return parent_.timeout_ * 2;
+      return parent_timeout_ * 2;
     }
     bool enableHashtagging() const override { return false; }
     bool enableRedirection() const override {
@@ -103,6 +98,22 @@ private:
     bool connectionRateLimitEnabled() const override { return false; }
     uint32_t connectionRateLimitPerSec() const override { return 0; }
 
+    const std::chrono::milliseconds parent_timeout_;
+    absl::optional<envoy::extensions::filters::network::redis_proxy::v3::AwsIam> aws_iam_config_;
+  };
+
+  struct RedisActiveHealthCheckSession
+      : public ActiveHealthCheckSession,
+        public Extensions::NetworkFilters::Common::Redis::Client::ClientCallbacks,
+        public Network::ConnectionCallbacks {
+    RedisActiveHealthCheckSession(RedisHealthChecker& parent, const Upstream::HostSharedPtr& host);
+    ~RedisActiveHealthCheckSession() override;
+
+    // ActiveHealthCheckSession
+    void onInterval() override;
+    void onTimeout() override;
+    void onDeferredDelete() final;
+
     // Extensions::NetworkFilters::Common::Redis::Client::ClientCallbacks
     void onResponse(NetworkFilters::Common::Redis::RespValuePtr&& value) override;
     void onFailure() override;
@@ -115,6 +126,7 @@ private:
     void onBelowWriteBufferLowWatermark() override {}
 
     RedisHealthChecker& parent_;
+    std::shared_ptr<RedisConfig> redis_config_{std::make_shared<RedisConfig>(parent_.timeout_)};
     Extensions::NetworkFilters::Common::Redis::Client::ClientPtr client_;
     Extensions::NetworkFilters::Common::Redis::Client::PoolRequest* current_request_{};
     Extensions::NetworkFilters::Common::Redis::RedisCommandStatsSharedPtr redis_command_stats_;
@@ -142,6 +154,13 @@ private:
   RedisHealthCheckerStats redis_stats_;
   const std::string auth_username_;
   const std::string auth_password_;
+  const absl::optional<
+      Extensions::NetworkFilters::Common::Redis::AwsIamAuthenticator::AwsIamAuthenticatorSharedPtr>
+      aws_iam_authenticator_;
+  const absl::optional<envoy::extensions::filters::network::redis_proxy::v3::AwsIam>
+      aws_iam_config_;
+
+  const envoy::extensions::health_checkers::redis::v3::Redis& redis_config_;
 };
 
 } // namespace RedisHealthChecker

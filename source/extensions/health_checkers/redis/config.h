@@ -27,7 +27,13 @@ public:
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
     return ProtobufTypes::MessagePtr{new envoy::extensions::health_checkers::redis::v3::Redis()};
   }
+
+  absl::optional<
+      Extensions::NetworkFilters::Common::Redis::AwsIamAuthenticator::AwsIamAuthenticatorSharedPtr>
+      aws_iam_authenticator_;
 };
+
+DECLARE_FACTORY(RedisHealthCheckerFactory);
 
 } // namespace RedisHealthChecker
 } // namespace HealthCheckers

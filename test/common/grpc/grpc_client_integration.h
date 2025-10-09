@@ -46,6 +46,18 @@ public:
   }
 };
 
+class EnvoyGrpcClientIntegrationParamTest
+    : public BaseGrpcClientIntegrationParamTest,
+      public testing::TestWithParam<Network::Address::IpVersion> {
+public:
+  static std::string
+  protocolTestParamsToString(const ::testing::TestParamInfo<Network::Address::IpVersion>& p) {
+    return fmt::format("{}_{}", TestUtility::ipVersionToString(p.param), "EnvoyGrpc");
+  }
+  Network::Address::IpVersion ipVersion() const override { return GetParam(); }
+  ClientType clientType() const override { return ClientType::EnvoyGrpc; }
+};
+
 class GrpcClientIntegrationParamTest
     : public BaseGrpcClientIntegrationParamTest,
       public testing::TestWithParam<std::tuple<Network::Address::IpVersion, ClientType>> {
@@ -57,31 +69,6 @@ public:
   }
   Network::Address::IpVersion ipVersion() const override { return std::get<0>(GetParam()); }
   ClientType clientType() const override { return std::get<1>(GetParam()); }
-};
-
-// TODO(kbaichoo): Revert to using GrpcClientIntegrationParamTest for all
-// derived classes when deferred processing is enabled by default. It's
-// parameterized by deferred processing now to avoid bit rot since the feature
-// is off by default.
-class GrpcClientIntegrationParamTestWithDeferredProcessing
-    : public Grpc::BaseGrpcClientIntegrationParamTest,
-      public testing::TestWithParam<
-          std::tuple<std::tuple<Network::Address::IpVersion, Grpc::ClientType>, bool>> {
-public:
-  static std::string protocolTestParamsToString(
-      const ::testing::TestParamInfo<
-          std::tuple<std::tuple<Network::Address::IpVersion, Grpc::ClientType>, bool>>& p) {
-    return fmt::format(
-        "{}_{}_{}", TestUtility::ipVersionToString(std::get<0>(std::get<0>(p.param))),
-        std::get<1>(std::get<0>(p.param)) == Grpc::ClientType::GoogleGrpc ? "GoogleGrpc"
-                                                                          : "EnvoyGrpc",
-        std::get<1>(p.param) ? "WithDeferredProcessing" : "NoDeferredProcessing");
-  }
-  Network::Address::IpVersion ipVersion() const override {
-    return std::get<0>(std::get<0>(GetParam()));
-  }
-  Grpc::ClientType clientType() const override { return std::get<1>(std::get<0>(GetParam())); }
-  bool deferredProcessing() const { return std::get<1>(GetParam()); }
 };
 
 class UnifiedOrLegacyMuxIntegrationParamTest
@@ -121,6 +108,26 @@ public:
   SotwOrDelta sotwOrDelta() const { return std::get<2>(GetParam()); }
 };
 
+class DeltaSotwDeferredClustersIntegrationParamTest
+    : public BaseGrpcClientIntegrationParamTest,
+      public testing::TestWithParam<
+          std::tuple<Network::Address::IpVersion, ClientType, SotwOrDelta, bool>> {
+public:
+  ~DeltaSotwDeferredClustersIntegrationParamTest() override = default;
+  static std::string protocolTestParamsToString(
+      const ::testing::TestParamInfo<
+          std::tuple<Network::Address::IpVersion, ClientType, SotwOrDelta, bool>>& p) {
+    return fmt::format("{}_{}_{}_{}", TestUtility::ipVersionToString(std::get<0>(p.param)),
+                       std::get<1>(p.param) == ClientType::GoogleGrpc ? "GoogleGrpc" : "EnvoyGrpc",
+                       std::get<2>(p.param) == SotwOrDelta::Delta ? "Delta" : "StateOfTheWorld",
+                       std::get<3>(p.param) == true ? "DeferredClusters" : "");
+  }
+  Network::Address::IpVersion ipVersion() const override { return std::get<0>(GetParam()); }
+  ClientType clientType() const override { return std::get<1>(GetParam()); }
+  SotwOrDelta sotwOrDelta() const { return std::get<2>(GetParam()); }
+  bool useDeferredCluster() const { return std::get<3>(GetParam()); }
+};
+
 // Skip tests based on gRPC client type.
 #define SKIP_IF_GRPC_CLIENT(client_type)                                                           \
   if (clientType() == (client_type)) {                                                             \
@@ -136,12 +143,15 @@ public:
 #define GRPC_CLIENT_INTEGRATION_PARAMS                                                             \
   testing::Combine(testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),                     \
                    testing::ValuesIn(TestEnvironment::getsGrpcVersionsForTest()))
-#define GRPC_CLIENT_INTEGRATION_DEFERRED_PROCESSING_PARAMS                                         \
-  testing::Combine(GRPC_CLIENT_INTEGRATION_PARAMS, testing::Bool())
 #define DELTA_SOTW_GRPC_CLIENT_INTEGRATION_PARAMS                                                  \
   testing::Combine(testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),                     \
                    testing::ValuesIn(TestEnvironment::getsGrpcVersionsForTest()),                  \
                    testing::Values(Grpc::SotwOrDelta::Sotw, Grpc::SotwOrDelta::Delta))
+#define DELTA_SOTW_GRPC_CLIENT_DEFERRED_CLUSTERS_INTEGRATION_PARAMS                                \
+  testing::Combine(testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),                     \
+                   testing::ValuesIn(TestEnvironment::getsGrpcVersionsForTest()),                  \
+                   testing::Values(Grpc::SotwOrDelta::Sotw, Grpc::SotwOrDelta::Delta),             \
+                   testing::Values(true, false))
 #define UNIFIED_LEGACY_GRPC_CLIENT_INTEGRATION_PARAMS                                              \
   testing::Combine(testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),                     \
                    testing::ValuesIn(TestEnvironment::getsGrpcVersionsForTest()),                  \

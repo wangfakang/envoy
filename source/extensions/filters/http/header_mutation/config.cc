@@ -9,20 +9,28 @@ namespace Extensions {
 namespace HttpFilters {
 namespace HeaderMutation {
 
-Http::FilterFactoryCb HeaderMutationFactoryConfig::createFilterFactoryFromProtoTyped(
+absl::StatusOr<Http::FilterFactoryCb>
+HeaderMutationFactoryConfig::createFilterFactoryFromProtoTyped(
     const ProtoConfig& config, const std::string&, DualInfo,
-    Server::Configuration::ServerFactoryContext&) {
-  auto filter_config = std::make_shared<HeaderMutationConfig>(config);
+    Server::Configuration::ServerFactoryContext& context) {
+  absl::Status creation_status = absl::OkStatus();
+  auto filter_config = std::make_shared<HeaderMutationConfig>(config, context, creation_status);
+  RETURN_IF_NOT_OK_REF(creation_status);
+
   return [filter_config](Http::FilterChainFactoryCallbacks& callbacks) -> void {
     callbacks.addStreamFilter(std::make_shared<HeaderMutation>(filter_config));
   };
 }
 
-Router::RouteSpecificFilterConfigConstSharedPtr
+absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
 HeaderMutationFactoryConfig::createRouteSpecificFilterConfigTyped(
-    const PerRouteProtoConfig& proto_config, Server::Configuration::ServerFactoryContext&,
+    const PerRouteProtoConfig& proto_config, Server::Configuration::ServerFactoryContext& context,
     ProtobufMessage::ValidationVisitor&) {
-  return std::make_shared<PerRouteHeaderMutation>(proto_config);
+  absl::Status creation_status = absl::OkStatus();
+  auto route_config =
+      std::make_shared<PerRouteHeaderMutation>(proto_config, context, creation_status);
+  RETURN_IF_NOT_OK_REF(creation_status);
+  return route_config;
 }
 
 using UpstreamHeaderMutationFactoryConfig = HeaderMutationFactoryConfig;

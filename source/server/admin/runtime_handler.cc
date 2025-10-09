@@ -17,13 +17,13 @@ RuntimeHandler::RuntimeHandler(Server::Instance& server) : HandlerContextBase(se
 
 Http::Code RuntimeHandler::handlerRuntime(Http::ResponseHeaderMap& response_headers,
                                           Buffer::Instance& response, AdminStream& admin_stream) {
-  const Http::Utility::QueryParams params = admin_stream.queryParams();
+  const Http::Utility::QueryParamsMulti params = admin_stream.queryParams();
   response_headers.setReferenceContentType(Http::Headers::get().ContentTypeValues.Json);
 
   // TODO(jsedgwick): Use proto to structure this output instead of arbitrary JSON.
   const auto& layers = server_.runtime().snapshot().getLayers();
 
-  std::vector<ProtobufWkt::Value> layer_names;
+  std::vector<Protobuf::Value> layer_names;
   layer_names.reserve(layers.size());
   std::map<std::string, std::vector<std::string>> entries;
   for (const auto& layer : layers) {
@@ -45,10 +45,10 @@ Http::Code RuntimeHandler::handlerRuntime(Http::ResponseHeaderMap& response_head
     }
   }
 
-  ProtobufWkt::Struct layer_entries;
+  Protobuf::Struct layer_entries;
   auto* layer_entry_fields = layer_entries.mutable_fields();
   for (const auto& entry : entries) {
-    std::vector<ProtobufWkt::Value> layer_entry_values;
+    std::vector<Protobuf::Value> layer_entry_values;
     layer_entry_values.reserve(entry.second.size());
     std::string final_value;
     for (const auto& value : entry.second) {
@@ -58,7 +58,7 @@ Http::Code RuntimeHandler::handlerRuntime(Http::ResponseHeaderMap& response_head
       layer_entry_values.push_back(ValueUtil::stringValue(value));
     }
 
-    ProtobufWkt::Struct layer_entry_value;
+    Protobuf::Struct layer_entry_value;
     auto* layer_entry_value_fields = layer_entry_value.mutable_fields();
 
     (*layer_entry_value_fields)["final_value"] = ValueUtil::stringValue(final_value);
@@ -66,7 +66,7 @@ Http::Code RuntimeHandler::handlerRuntime(Http::ResponseHeaderMap& response_head
     (*layer_entry_fields)[entry.first] = ValueUtil::structValue(layer_entry_value);
   }
 
-  ProtobufWkt::Struct runtime;
+  Protobuf::Struct runtime;
   auto* fields = runtime.mutable_fields();
 
   (*fields)["layers"] = ValueUtil::listValue(layer_names);
@@ -79,16 +79,18 @@ Http::Code RuntimeHandler::handlerRuntime(Http::ResponseHeaderMap& response_head
 Http::Code RuntimeHandler::handlerRuntimeModify(Http::ResponseHeaderMap&,
                                                 Buffer::Instance& response,
                                                 AdminStream& admin_stream) {
-  Http::Utility::QueryParams params = admin_stream.queryParams();
-  if (params.empty()) {
+  Http::Utility::QueryParamsMulti params = admin_stream.queryParams();
+  if (params.data().empty()) {
     response.add("usage: /runtime_modify?key1=value1&key2=value2&keyN=valueN\n");
     response.add("       or send the parameters as form values\n");
     response.add("use an empty value to remove a previously added override");
     return Http::Code::BadRequest;
   }
   absl::node_hash_map<std::string, std::string> overrides;
-  overrides.insert(params.begin(), params.end());
-  TRY_ASSERT_MAIN_THREAD { server_.runtime().mergeValues(overrides); }
+  for (const auto& it : params.data()) {
+    overrides.insert({it.first, it.second[0]});
+  }
+  TRY_ASSERT_MAIN_THREAD { THROW_IF_NOT_OK(server_.runtime().mergeValues(overrides)); }
   END_TRY
   catch (const EnvoyException& e) {
     ENVOY_LOG_MISC(error, "{}", e.what());

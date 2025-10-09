@@ -15,12 +15,33 @@
   } while (0)
 
 using testing::AnyNumber;
+using testing::Invoke;
 using testing::InvokeWithoutArgs;
+using testing::NiceMock;
+using testing::Return;
 
 namespace Envoy {
 namespace Http {
 namespace Http2 {
 namespace {
+
+bool skipForUhv() {
+#ifdef ENVOY_ENABLE_UHV
+  return Runtime::runtimeFeatureEnabled("envoy.reloadable_features.http2_use_oghttp2");
+#else
+  return false;
+#endif
+}
+
+void setupRequestDecoderMock(Http::MockRequestDecoder& request_decoder) {
+  EXPECT_CALL(request_decoder, getRequestDecoderHandle())
+      .WillRepeatedly(Invoke([&request_decoder]() {
+        auto handle = std::make_unique<NiceMock<Http::MockRequestDecoderHandle>>();
+        ON_CALL(*handle, get())
+            .WillByDefault(Return(OptRef<Http::RequestDecoder>(request_decoder)));
+        return handle;
+      }));
+}
 
 // For organizational purposes only.
 class RequestFrameCommentTest : public ::testing::Test {};
@@ -57,6 +78,7 @@ TEST_F(RequestFrameCommentTest, SimpleExampleHuffman) {
 
   // Validate HEADERS decode.
   ServerCodecFrameInjector codec;
+  setupRequestDecoderMock(codec.request_decoder_);
   TestServerConnectionImpl connection(
       codec.server_connection_, codec.server_callbacks_, *codec.stats_store_.rootScope(),
       codec.options_, codec.random_, Http::DEFAULT_MAX_REQUEST_HEADERS_KB,
@@ -135,6 +157,7 @@ TEST_F(RequestFrameCommentTest, SimpleExamplePlain) {
 
   // Validate HEADERS decode.
   ServerCodecFrameInjector codec;
+  setupRequestDecoderMock(codec.request_decoder_);
   TestServerConnectionImpl connection(
       codec.server_connection_, codec.server_callbacks_, *codec.stats_store_.rootScope(),
       codec.options_, codec.random_, Http::DEFAULT_MAX_REQUEST_HEADERS_KB,
@@ -191,6 +214,9 @@ TEST_F(ResponseFrameCommentTest, SimpleExamplePlain) {
 // https://httpwg.org/specs/rfc7540.html#rfc.section.10.3. We use a non-compressed frame with no
 // Huffman encoding to simplify.
 TEST_F(RequestFrameCommentTest, SingleByteNulCrLfInHeaderFrame) {
+  if (skipForUhv()) {
+    return;
+  }
   FileFrame header{"request_header_corpus/simple_example_plain"};
 
   for (size_t offset = 0; offset < header.frame().size(); ++offset) {
@@ -200,6 +226,7 @@ TEST_F(RequestFrameCommentTest, SingleByteNulCrLfInHeaderFrame) {
       header.frame()[offset] = c;
       // Play the frames back.
       ServerCodecFrameInjector codec;
+      setupRequestDecoderMock(codec.request_decoder_);
       TestServerConnectionImpl connection(
           codec.server_connection_, codec.server_callbacks_, *codec.stats_store_.rootScope(),
           codec.options_, codec.random_, Http::DEFAULT_MAX_REQUEST_HEADERS_KB,
@@ -224,6 +251,9 @@ TEST_F(RequestFrameCommentTest, SingleByteNulCrLfInHeaderFrame) {
 // https://httpwg.org/specs/rfc7540.html#rfc.section.10.3. We use a non-compressed frame with no
 // Huffman encoding to simplify.
 TEST_F(ResponseFrameCommentTest, SingleByteNulCrLfInHeaderFrame) {
+  if (skipForUhv()) {
+    return;
+  }
   FileFrame header{"response_header_corpus/simple_example_plain"};
 
   for (size_t offset = 0; offset < header.frame().size(); ++offset) {
@@ -258,6 +288,9 @@ TEST_F(ResponseFrameCommentTest, SingleByteNulCrLfInHeaderFrame) {
 // CVE-2019-9900. See also https://httpwg.org/specs/rfc7540.html#rfc.section.10.3. We use a
 // non-compressed frame with no Huffman encoding to simplify.
 TEST_F(RequestFrameCommentTest, SingleByteNulCrLfInHeaderField) {
+  if (skipForUhv()) {
+    return;
+  }
   FileFrame header{"request_header_corpus/simple_example_plain"};
 
   for (size_t offset = header.frame().size() - 11 /* foo: offset */; offset < header.frame().size();
@@ -268,6 +301,7 @@ TEST_F(RequestFrameCommentTest, SingleByteNulCrLfInHeaderField) {
       header.frame()[offset] = c;
       // Play the frames back.
       ServerCodecFrameInjector codec;
+      setupRequestDecoderMock(codec.request_decoder_);
       TestServerConnectionImpl connection(
           codec.server_connection_, codec.server_callbacks_, *codec.stats_store_.rootScope(),
           codec.options_, codec.random_, Http::DEFAULT_MAX_REQUEST_HEADERS_KB,
@@ -296,6 +330,9 @@ TEST_F(RequestFrameCommentTest, SingleByteNulCrLfInHeaderField) {
 // CVE-2019-9900. See also https://httpwg.org/specs/rfc7540.html#rfc.section.10.3. We use a
 // non-compressed frame with no Huffman encoding to simplify.
 TEST_F(ResponseFrameCommentTest, SingleByteNulCrLfInHeaderField) {
+  if (skipForUhv()) {
+    return;
+  }
   FileFrame header{"response_header_corpus/simple_example_plain"};
 
   for (size_t offset = header.frame().size() - 17 /* test: offset */;

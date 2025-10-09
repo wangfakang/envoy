@@ -30,7 +30,7 @@ TEST(RoleBasedAccessControlFilterConfigFactoryTest, ValidProto) {
 
   NiceMock<Server::Configuration::MockFactoryContext> context;
   RoleBasedAccessControlFilterConfigFactory factory;
-  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(config, "stats", context);
+  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(config, "stats", context).value();
   Http::MockFilterChainFactoryCallbacks filter_callbacks;
   EXPECT_CALL(filter_callbacks, addStreamDecoderFilter(_));
   cb(filter_callbacks);
@@ -50,7 +50,7 @@ TEST(RoleBasedAccessControlFilterConfigFactoryTest, ValidMatcherProto) {
 
   NiceMock<Server::Configuration::MockFactoryContext> context;
   RoleBasedAccessControlFilterConfigFactory factory;
-  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(config, "stats", context);
+  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(config, "stats", context).value();
   Http::MockFilterChainFactoryCallbacks filter_callbacks;
   EXPECT_CALL(filter_callbacks, addStreamDecoderFilter(_));
   cb(filter_callbacks);
@@ -114,8 +114,10 @@ TEST(RoleBasedAccessControlFilterConfigFactoryTest, RouteSpecificConfig) {
   EXPECT_TRUE(proto_config.get());
 
   Router::RouteSpecificFilterConfigConstSharedPtr route_config =
-      factory.createRouteSpecificFilterConfig(*proto_config, context,
-                                              ProtobufMessage::getNullValidationVisitor());
+      factory
+          .createRouteSpecificFilterConfig(*proto_config, context,
+                                           ProtobufMessage::getNullValidationVisitor())
+          .value();
   EXPECT_TRUE(route_config.get());
 }
 

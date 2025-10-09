@@ -86,18 +86,19 @@ private:
 class TestFilterConfigFactory : public Server::Configuration::NamedNetworkFilterConfigFactory {
 public:
   // NamedNetworkFilterConfigFactory
-  Network::FilterFactoryCb
+  absl::StatusOr<Network::FilterFactoryCb>
   createFilterFactoryFromProto(const Protobuf::Message&,
                                Server::Configuration::FactoryContext& context) override {
     return [&context](Network::FilterManager& filter_manager) -> void {
-      filter_manager.addReadFilter(std::make_shared<TestFilter>(context.clusterManager()));
+      filter_manager.addReadFilter(
+          std::make_shared<TestFilter>(context.serverFactoryContext().clusterManager()));
     };
   }
 
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
     // Using Struct instead of a custom per-filter empty config proto
     // This is only allowed in tests.
-    return ProtobufTypes::MessagePtr{new Envoy::ProtobufWkt::Struct()};
+    return ProtobufTypes::MessagePtr{new Envoy::Protobuf::Struct()};
   }
 
   std::string name() const override { CONSTRUCT_ON_FIRST_USE(std::string, "envoy.test.router"); }

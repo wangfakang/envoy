@@ -71,11 +71,12 @@ TEST_P(FileSystemBufferIntegrationTest, NotFoundBodyBuffer) {
 }
 
 TEST_P(FileSystemBufferIntegrationTest, RequestAndResponseWithGiantBodyBuffer) {
+  async_lb_ = false;
   config_helper_.prependFilter(contentLengthConfig());
   // Not quite as giant as the memory buffer's integration test uses - with
   // disk operations involved that size risks timing out the test.
   testRouterRequestAndResponseWithBody(1024 * 1024, 1024 * 1024, false, false, nullptr,
-                                       std::chrono::milliseconds(25000) * TSAN_TIMEOUT_FACTOR);
+                                       std::chrono::milliseconds(25000) * TIMEOUT_FACTOR);
 }
 
 TEST_P(FileSystemBufferIntegrationTest, HeaderOnlyRequestAndResponseBuffer) {

@@ -4,176 +4,153 @@ External Authorization
 ======================
 * External authorization :ref:`architecture overview <arch_overview_ext_authz>`
 * This filter should be configured with the type URL ``type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz``.
-* :ref:`HTTP filter v3 API reference <envoy_v3_api_msg_extensions.filters.http.ext_authz.v3.ExtAuthz>`
+* :ref:`v3 API reference <envoy_v3_api_msg_extensions.filters.http.ext_authz.v3.ExtAuthz>`
 
-The external authorization filter calls an external gRPC or HTTP service to check whether an incoming
-HTTP request is authorized or not.
-If the request is deemed unauthorized, then the request will be denied normally with 403 (Forbidden) response.
-Note that sending additional custom metadata from the authorization service to the upstream, to the downstream or to the authorization service is
-also possible. This is explained in more details at :ref:`HTTP filter <envoy_v3_api_msg_extensions.filters.http.ext_authz.v3.ExtAuthz>`.
+The external authorization filter calls an external gRPC or HTTP service to determine whether an incoming
+HTTP request is authorized. If the request is unauthorized, Envoy returns a ``403 (Forbidden)`` response.
+It is also possible to send additional custom metadata to the authorization service, and to propagate metadata
+returned by the authorization service to the upstream or downstream. See the :ref:`HTTP filter API
+<envoy_v3_api_msg_extensions.filters.http.ext_authz.v3.ExtAuthz>` for details.
 
-The content of the requests that are passed to an authorization service is specified by
+The content of the request passed to the authorization service is specified by
 :ref:`CheckRequest <envoy_v3_api_msg_service.auth.v3.CheckRequest>`.
 
 .. _config_http_filters_ext_authz_http_configuration:
 
-The HTTP filter, using a gRPC/HTTP service, can be configured as follows. You can see all the
-configuration options at
-:ref:`HTTP filter <envoy_v3_api_msg_extensions.filters.http.ext_authz.v3.ExtAuthz>`.
+This HTTP filter can be configured to use a gRPC or HTTP service as follows. See the
+:ref:`HTTP filter API <envoy_v3_api_msg_extensions.filters.http.ext_authz.v3.ExtAuthz>` for all configuration options.
+
+.. _config_http_filters_ext_authz_security_considerations:
+
+Security Considerations
+-----------------------
+
+.. attention::
+
+   **Route cache clearing risk**: When using per-route ext_authz configuration, subsequent filters
+   in the filter chain may clear the route cache, potentially leading to privilege escalation
+   vulnerabilities where requests bypass authorization checks.
+
+   For more information about this security risk, including affected filters and general
+   mitigation strategies, see :ref:`Filter route mutation security considerations
+   <arch_overview_http_filters_route_mutation>`.
+
+   The risk is particularly important for External Authorization because it often handles authentication and
+   authorization decisions that directly impact access control. When the route cache is cleared after the
+   ext_authz filter has run, a request may be rerouted to endpoints with different authorization requirements,
+   bypassing those checks entirely.
+
+   **Example vulnerable configuration**:
+
+   .. code-block:: yaml
+
+      http_filters:
+      - name: envoy.filters.http.ext_authz
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+          # ... ext_authz config ...
+      - name: envoy.filters.http.lua
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+          inline_code: |
+            function envoy_on_request(request_handle)
+              -- This clears the route cache after ext_authz has run.
+              request_handle:clearRouteCache()
+              -- The request may now match a different route with different authorization requirements.
+            end
+
+   In this example, if the initial route had the ext_authz filter disabled but the recomputed route match
+   (after cache clearing) requires authorization, the request bypasses the authorization check entirely.
 
 Configuration Examples
 ----------------------
 
 A sample filter configuration for a gRPC authorization server:
 
-.. code-block:: yaml
+.. literalinclude:: _include/ext-authz-grpc-filter.yaml
+    :language: yaml
+    :lines: 26-35
+    :lineno-start: 26
+    :linenos:
+    :caption: :download:`ext-authz-grpc-filter.yaml <_include/ext-authz-grpc-filter.yaml>`
 
-  http_filters:
-    - name: envoy.filters.http.ext_authz
-      typed_config:
-        "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
-        grpc_service:
-          envoy_grpc:
-            cluster_name: ext-authz
-
-          # Default is 200ms; override if your server needs e.g. warmup time.
-          timeout: 0.5s
-        include_peer_certificate: true
-
-.. code-block:: yaml
-
-  clusters:
-    - name: ext-authz
-      type: static
-      typed_extension_protocol_options:
-        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
-          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
-          explicit_http_config:
-            http2_protocol_options: {}
-      load_assignment:
-        cluster_name: ext-authz
-        endpoints:
-        - lb_endpoints:
-          - endpoint:
-              address:
-                socket_address:
-                  address: 127.0.0.1
-                  port_value: 10003
-
-      # This timeout controls the initial TCP handshake timeout - not the timeout for the
-      # entire request.
-      connect_timeout: 0.25s
+.. literalinclude:: _include/ext-authz-grpc-filter.yaml
+    :language: yaml
+    :lines: 41-56
+    :lineno-start: 41
+    :linenos:
+    :caption: :download:`ext-authz-grpc-filter.yaml <_include/ext-authz-grpc-filter.yaml>`
 
 .. note::
 
-  One of the features of this filter is to send HTTP request body to the configured gRPC
+  One feature of this filter is sending the HTTP request body to the configured gRPC
   authorization server as part of the :ref:`check request
   <envoy_v3_api_msg_service.auth.v3.CheckRequest>`.
 
   A sample configuration is as follows:
 
-  .. code:: yaml
+  .. literalinclude:: _include/ext-authz-grpc-body-filter.yaml
+      :language: yaml
+      :lines: 26-36
+      :lineno-start: 26
+      :linenos:
+      :caption: :download:`ext-authz-grpc-body-filter.yaml <_include/ext-authz-grpc-body-filter.yaml>`
 
-    http_filters:
-      - name: envoy.filters.http.ext_authz
-        typed_config:
-          "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
-          grpc_service:
-            envoy_grpc:
-              cluster_name: ext-authz
-          with_request_body:
-            max_request_bytes: 1024
-            allow_partial_message: true
-            pack_as_bytes: true
-
-  Please note that by default :ref:`check request<envoy_v3_api_msg_service.auth.v3.CheckRequest>`
-  carries the HTTP request body as UTF-8 string and it fills the :ref:`body
-  <envoy_v3_api_field_service.auth.v3.AttributeContext.HttpRequest.body>` field. To pack the request
-  body as raw bytes, it is needed to set :ref:`pack_as_bytes
-  <envoy_v3_api_field_extensions.filters.http.ext_authz.v3.BufferSettings.pack_as_bytes>` field to
-  true. In effect to that, the :ref:`raw_body
-  <envoy_v3_api_field_service.auth.v3.AttributeContext.HttpRequest.raw_body>`
-  field will be set and :ref:`body
-  <envoy_v3_api_field_service.auth.v3.AttributeContext.HttpRequest.body>` field will be empty.
+  By default, the :ref:`check request <envoy_v3_api_msg_service.auth.v3.CheckRequest>` carries the HTTP
+  request body as a UTF-8 string in :ref:`body
+  <envoy_v3_api_field_service.auth.v3.AttributeContext.HttpRequest.body>`. To send the request body as
+  raw bytes, set :ref:`pack_as_bytes
+  <envoy_v3_api_field_extensions.filters.http.ext_authz.v3.BufferSettings.pack_as_bytes>` to ``true``.
+  In that case, :ref:`raw_body
+  <envoy_v3_api_field_service.auth.v3.AttributeContext.HttpRequest.raw_body>` is set and :ref:`body
+  <envoy_v3_api_field_service.auth.v3.AttributeContext.HttpRequest.body>` is empty.
 
 A sample filter configuration for a raw HTTP authorization server:
 
-.. code-block:: yaml
+.. literalinclude:: _include/ext-authz-http-filter.yaml
+    :language: yaml
+    :lines: 26-36
+    :lineno-start: 26
+    :linenos:
+    :caption: :download:`ext-authz-http-filter.yaml <_include/ext-authz-http-filter.yaml>`
 
-  http_filters:
-    - name: envoy.filters.http.ext_authz
-      typed_config:
-        "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
-        http_service:
-            server_uri:
-              uri: 127.0.0.1:10003
-              cluster: ext-authz
-              timeout: 0.25s
-              failure_mode_allow: false
-        include_peer_certificate: true
-
-.. code-block:: yaml
-
-  clusters:
-    - name: ext-authz
-      connect_timeout: 0.25s
-      type: logical_dns
-      lb_policy: round_robin
-      load_assignment:
-        cluster_name: ext-authz
-        endpoints:
-        - lb_endpoints:
-          - endpoint:
-              address:
-                socket_address:
-                  address: 127.0.0.1
-                  port_value: 10003
+.. literalinclude:: _include/ext-authz-http-filter.yaml
+    :language: yaml
+    :lines: 41-53
+    :lineno-start: 41
+    :linenos:
+    :caption: :download:`ext-authz-http-filter.yaml <_include/ext-authz-http-filter.yaml>`
 
 Per-Route Configuration
 -----------------------
 
+.. literalinclude:: _include/ext-authz-routes-filter.yaml
+    :language: yaml
+    :lines: 15-38
+    :lineno-start: 15
+    :linenos:
+    :caption: :download:`ext-authz-routes-filter.yaml <_include/ext-authz-routes-filter.yaml>`
+
 A sample virtual host and route filter configuration.
-In this example we add additional context on the virtual host, and disabled the filter for ``/static`` prefixed routes.
-
-.. code-block:: yaml
-
-  route_config:
-    name: local_route
-    virtual_hosts:
-    - name: local_service
-      domains: ["*"]
-      typed_per_filter_config:
-        envoy.filters.http.ext_authz:
-          "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
-          check_settings:
-            context_extensions:
-              virtual_host: local_service
-      routes:
-      - match: { prefix: "/static" }
-        route: { cluster: some_service }
-        typed_per_filter_config:
-          envoy.filters.http.ext_authz:
-            "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
-            disabled: true
-      - match: { prefix: "/" }
-        route: { cluster: some_service }
+In this example, we add additional context on the virtual host and disable the filter for ``/static``-prefixed routes.
 
 Statistics
 ----------
 .. _config_http_filters_ext_authz_stats:
 
-The HTTP filter outputs statistics in the *cluster.<route target cluster>.ext_authz.* namespace.
+The HTTP filter outputs statistics in the ``cluster.<route target cluster>.ext_authz.`` namespace.
 
 .. csv-table::
   :header: Name, Type, Description
   :widths: 1, 1, 2
 
-  ok, Counter, Total responses from the filter.
+  ok, Counter, Total responses from the authorization service that allowed the request.
   error, Counter, Total errors contacting the external service.
-  denied, Counter, Total responses from the authorizations service that were to deny the traffic.
-  disabled, Counter, Total requests that are allowed without calling external services due to the filter is disabled.
-  failure_mode_allowed, Counter, "Total requests that were error(s) but were allowed through because
-  of failure_mode_allow set to true."
+  denied, Counter, Total responses from the authorization service that denied the request.
+  disabled, Counter, Total requests that were allowed without calling the external service because the filter is disabled.
+  failure_mode_allowed, Counter, "Total error responses that were allowed through because :ref:`failure_mode_allow
+  <envoy_v3_api_field_extensions.filters.http.ext_authz.v3.ExtAuthz.failure_mode_allow>` is set to ``true``."
+  invalid, Counter, Total responses rejected due to invalid header or query parameter mutations.
 
 Dynamic Metadata
 ----------------
@@ -182,7 +159,7 @@ Dynamic Metadata
 The External Authorization filter supports emitting dynamic metadata as an opaque ``google.protobuf.Struct``.
 
 When using a gRPC authorization server, dynamic metadata will be emitted only when the :ref:`CheckResponse
-<envoy_v3_api_msg_service.auth.v3.CheckResponse>` contains a filled :ref:`dynamic_metadata
+<envoy_v3_api_msg_service.auth.v3.CheckResponse>` contains a non-empty :ref:`dynamic_metadata
 <envoy_v3_api_field_service.auth.v3.CheckResponse.dynamic_metadata>` field.
 
 When using an HTTP authorization server, dynamic metadata will be emitted only when there are response headers
@@ -202,3 +179,17 @@ The fraction of requests for which the filter is enabled can be configured via t
 Tracing
 -------
 The ext_authz span keeps the sampling status of the parent span, i.e. in the tracing backend we will either see both the parent span and the child ext_authz span, or none of them.
+
+Logging
+-------
+When :ref:`emit_filter_state_stats <envoy_v3_api_field_extensions.filters.http.ext_authz.v3.ExtAuthz.emit_filter_state_stats>` is set to ``true``,
+the ext_authz filter exposes fields ``latency_us``, ``bytesSent`` and ``bytesReceived`` for use in CEL and logging.
+
+.. note::
+
+  The ``bytesSent`` and ``bytesReceived`` fields are populated only when using the Envoy gRPC client type.
+
+* ``filter_state["envoy.filters.http.ext_authz"].latency_us``
+* ``%FILTER_STATE(envoy.filters.http.ext_authz:FIELD:latency_us)%``
+* ``%FILTER_STATE(envoy.filters.http.ext_authz:FIELD:bytesSent)%``
+* ``%FILTER_STATE(envoy.filters.http.ext_authz:FIELD:bytesReceived)%``

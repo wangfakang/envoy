@@ -15,6 +15,47 @@ class Span;
 using SpanPtr = std::unique_ptr<Span>;
 
 /**
+ * The upstream service type.
+ */
+enum class ServiceType {
+  // Service type is unknown.
+  Unknown,
+  // Service is treated as HTTP.
+  Http,
+  // Service is treated as GoogleGrpc.
+  GoogleGrpc,
+  // Service is treated as EnvoyGrpc.
+  EnvoyGrpc
+};
+
+/**
+ * Contains upstream context information essential for the injectContext process.
+ *
+ * @param host Optional reference to the upstream host description.
+ * @param cluster Optional reference to the upstream cluster information.
+ * @param service_type The type of service the upstream context relates to.
+ * @param async_client_span Indicates if the injectContext originates from an asynchronous
+ * client.
+ */
+struct UpstreamContext {
+  UpstreamContext(const Upstream::HostDescription* host = nullptr,
+                  const Upstream::ClusterInfo* cluster = nullptr,
+                  const ServiceType service_type = ServiceType::Unknown,
+                  const bool async_client_span = false)
+      : host_(makeOptRefFromPtr(host)), cluster_(makeOptRefFromPtr(cluster)),
+        service_type_(service_type), async_client_span_(async_client_span) {}
+
+  OptRef<const Upstream::HostDescription> host_;
+  OptRef<const Upstream::ClusterInfo> cluster_;
+  const ServiceType service_type_;
+
+  // TODO(botengyao): further distinction for the shared upstream code path can be
+  // added if needed. Setting this flag to true only means it is called from async
+  // client at current stage.
+  const bool async_client_span_;
+};
+
+/**
  * Basic abstraction for span.
  */
 class Span {
@@ -51,10 +92,9 @@ public:
    * Mutate the provided headers with the context necessary to propagate this
    * (implementation-specific) trace.
    * @param request_headers the headers to which propagation context will be added
-   * @param upstream connecting host description
+   * @param upstream upstream context info
    */
-  virtual void injectContext(TraceContext& trace_conext,
-                             const Upstream::HostDescriptionConstSharedPtr& upstream) PURE;
+  virtual void injectContext(TraceContext& trace_conext, const UpstreamContext& upstream) PURE;
 
   /**
    * Create and start a child Span, with this Span as its parent in the trace.
@@ -72,6 +112,23 @@ public:
    * @param sampled whether the span and any subsequent child spans should be sampled
    */
   virtual void setSampled(bool sampled) PURE;
+
+  /**
+   * When the startSpan() of tracer is called, the Envoy tracing decision is passed to the
+   * tracer to help determine whether the span should be sampled.
+   *
+   * But note that the tracer may have its own sampling decision logic (e.g. custom sampler,
+   * external tracing context, etc.), and it may not use the Envoy tracing decision at all,
+   * then the desicion may be ignored by the tracer.
+   *
+   * The method is used to return whether the Envoy tracing decision is used by the tracer
+   * or not.
+   *
+   * When the Envoy tracing decision is refreshed becase route refresh or other reasons, if
+   * the Envoy tracing decision is used by the tracer, the sampled value will be updated
+   * by the HTTP connection manager based on the new Envoy tracing decision.
+   */
+  virtual bool useLocalDecision() const PURE;
 
   /**
    * Retrieve a key's value from the span's baggage.
@@ -93,9 +150,15 @@ public:
    * Retrieve the trace ID associated with this span.
    * The trace id may be generated for this span, propagated by parent spans, or
    * not created yet.
-   * @return trace ID as a hex string
+   * @return trace ID
    */
-  virtual std::string getTraceIdAsHex() const PURE;
+  virtual std::string getTraceId() const PURE;
+
+  /**
+   * Retrieve the span's identifier.
+   * @return span ID as a hex string
+   */
+  virtual std::string getSpanId() const PURE;
 };
 
 /**
@@ -111,7 +174,7 @@ public:
   virtual SpanPtr startSpan(const Config& config, TraceContext& trace_context,
                             const StreamInfo::StreamInfo& stream_info,
                             const std::string& operation_name,
-                            const Tracing::Decision tracing_decision) PURE;
+                            Tracing::Decision tracing_decision) PURE;
 };
 
 using DriverPtr = std::unique_ptr<Driver>;

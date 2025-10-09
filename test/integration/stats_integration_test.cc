@@ -9,7 +9,7 @@
 #include "source/common/config/well_known_names.h"
 #include "source/common/memory/stats.h"
 
-#include "test/common/stats/stat_test_utility.h"
+#include "test/common/memory/memory_test_utility.h"
 #include "test/config/integration/certs/clientcert_hash.h"
 #include "test/config/integration/certs/servercert_info.h"
 #include "test/config/utility.h"
@@ -164,6 +164,11 @@ TEST_P(StatsIntegrationTest, WithoutCert) {
 
 TEST_P(StatsIntegrationTest, WithExpiringCert) {
   config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+    auto* listen_address = bootstrap.mutable_static_resources()
+                               ->mutable_listeners(0)
+                               ->mutable_address()
+                               ->mutable_socket_address();
+    listen_address->set_address("0.0.0.0");
     auto* transport_socket = bootstrap.mutable_static_resources()
                                  ->mutable_listeners(0)
                                  ->mutable_filter_chains(0)
@@ -199,10 +204,21 @@ TEST_P(StatsIntegrationTest, WithExpiringCert) {
   int64_t days_until_expiry = absl::ToInt64Hours(cert_expiry - absl::Now()) / 24;
   EXPECT_EQ(test_server_->gauge("server.days_until_first_cert_expiring")->value(),
             days_until_expiry);
+
+  auto actual_cert_expire_time_since_epoch =
+      test_server_
+          ->gauge("listener.0.0.0.0_0.ssl.certificate.server_cert.expiration_unix_time_seconds")
+          ->value();
+  EXPECT_EQ(actual_cert_expire_time_since_epoch, absl::ToUnixSeconds(cert_expiry));
 }
 
 TEST_P(StatsIntegrationTest, WithExpiredCert) {
   config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+    auto* listen_address = bootstrap.mutable_static_resources()
+                               ->mutable_listeners(0)
+                               ->mutable_address()
+                               ->mutable_socket_address();
+    listen_address->set_address("0.0.0.0");
     auto* transport_socket = bootstrap.mutable_static_resources()
                                  ->mutable_listeners(0)
                                  ->mutable_filter_chains(0)
@@ -235,6 +251,11 @@ TEST_P(StatsIntegrationTest, WithExpiredCert) {
 
   initialize();
   EXPECT_EQ(test_server_->gauge("server.days_until_first_cert_expiring")->value(), 0);
+  EXPECT_EQ(
+      test_server_
+          ->gauge("listener.0.0.0.0_0.ssl.certificate.server_cert.expiration_unix_time_seconds")
+          ->value(),
+      1681036973);
 }
 
 // TODO(cmluciano) Refactor once https://github.com/envoyproxy/envoy/issues/5624 is solved
@@ -276,7 +297,7 @@ private:
    * @return size_t the total memory allocated
    */
   size_t clusterMemoryHelper(int num_clusters, int num_hosts, bool allow_stats) {
-    Stats::TestUtil::MemoryTest memory_test;
+    Memory::TestUtil::MemoryTest memory_test;
     config_helper_.addConfigModifier([&](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
       if (!allow_stats) {
         bootstrap.mutable_stats_config()->mutable_stats_matcher()->set_reject_all(true);
@@ -379,6 +400,7 @@ TEST_P(ClusterMemoryTestRunner, MemoryLargeClusterSize) {
   // 2021/08/18  13176    40577       40700   Support slow start mode
   // 2022/03/14                       42000   Fix test flakes
   // 2022/10/27                       44000   Update tcmalloc
+  // 2025/07/28  40266    44299       44500   Add request_count_ field to ActiveClient
 
   // Note: when adjusting this value: EXPECT_MEMORY_EQ is active only in CI
   // 'release' builds, where we control the platform and tool-chain. So you
@@ -399,7 +421,7 @@ TEST_P(ClusterMemoryTestRunner, MemoryLargeClusterSize) {
     // https://github.com/envoyproxy/envoy/issues/12209
     // EXPECT_MEMORY_EQ(m_per_cluster, 37061);
   }
-  EXPECT_MEMORY_LE(m_per_cluster, 44000); // Round up to allow platform variations.
+  EXPECT_MEMORY_LE(m_per_cluster, 44500); // Round up to allow platform variations.
 }
 
 TEST_P(ClusterMemoryTestRunner, MemoryLargeHostSizeWithStats) {
@@ -431,6 +453,8 @@ TEST_P(ClusterMemoryTestRunner, MemoryLargeHostSizeWithStats) {
   // 2020/04/02  10624    1380         1655   Use 100 clusters rather than 1000 to avoid timeouts
   // 2020/09/10                        2000   Reduce flakes
   // 2020/03/23                        3000   Reduce flakes
+  // 2023/07/21                        3005   Additional 4 bytes for new health status
+  // 2023/07/21                        3500   Workaround CI flake pending resolution of #28793
 
   // Note: when adjusting this value: EXPECT_MEMORY_EQ is active only in CI
   // 'release' builds, where we control the platform and tool-chain. So you
@@ -447,7 +471,7 @@ TEST_P(ClusterMemoryTestRunner, MemoryLargeHostSizeWithStats) {
     // https://github.com/envoyproxy/envoy/issues/12209
     // EXPECT_MEMORY_EQ(m_per_host, 1380);
   }
-  EXPECT_MEMORY_LE(m_per_host, 3000); // Round up to allow platform variations.
+  EXPECT_MEMORY_LE(m_per_host, 3500); // Round up to allow platform variations.
 }
 
 } // namespace

@@ -49,7 +49,8 @@ struct FaultFilterStats {
  */
 class FaultSettings : public Router::RouteSpecificFilterConfig {
 public:
-  FaultSettings(const envoy::extensions::filters::http::fault::v3::HTTPFault& fault);
+  FaultSettings(const envoy::extensions::filters::http::fault::v3::HTTPFault& fault,
+                Server::Configuration::CommonFactoryContext& context);
 
   const std::vector<Http::HeaderUtility::HeaderDataPtr>& filterHeaders() const {
     return fault_filter_headers_;
@@ -76,7 +77,7 @@ public:
     return response_rate_limit_percent_runtime_;
   }
   bool disableDownstreamClusterStats() const { return disable_downstream_cluster_stats_; }
-  const Envoy::ProtobufWkt::Struct& filterMetadata() const { return filter_metadata_; }
+  const Envoy::Protobuf::Struct& filterMetadata() const { return filter_metadata_; }
 
 private:
   class RuntimeKeyValues {
@@ -110,7 +111,7 @@ private:
   const std::string response_rate_limit_percent_runtime_;
   const bool disable_downstream_cluster_stats_;
 
-  const Envoy::ProtobufWkt::Struct filter_metadata_;
+  const Envoy::Protobuf::Struct filter_metadata_;
 };
 
 /**
@@ -119,8 +120,8 @@ private:
 class FaultFilterConfig {
 public:
   FaultFilterConfig(const envoy::extensions::filters::http::fault::v3::HTTPFault& fault,
-                    Runtime::Loader& runtime, const std::string& stats_prefix, Stats::Scope& scope,
-                    TimeSource& time_source);
+                    const std::string& stats_prefix, Stats::Scope& scope,
+                    Server::Configuration::CommonFactoryContext& context);
 
   Runtime::Loader& runtime() { return runtime_; }
   FaultFilterStats& stats() { return stats_; }

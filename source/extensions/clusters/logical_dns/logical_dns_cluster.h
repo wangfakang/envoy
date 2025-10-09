@@ -8,6 +8,8 @@
 #include "envoy/config/cluster/v3/cluster.pb.h"
 #include "envoy/config/endpoint/v3/endpoint.pb.h"
 #include "envoy/config/endpoint/v3/endpoint_components.pb.h"
+#include "envoy/extensions/clusters/dns/v3/dns_cluster.pb.h"
+#include "envoy/extensions/clusters/dns/v3/dns_cluster.pb.validate.h"
 #include "envoy/stats/scope.h"
 
 #include "source/common/common/empty_string.h"
@@ -17,6 +19,9 @@
 
 namespace Envoy {
 namespace Upstream {
+
+class LogicalDnsClusterFactory;
+class LogicalDnsClusterTest;
 
 /**
  * The LogicalDnsCluster is a type of cluster that creates a single logical host that wraps
@@ -33,15 +38,26 @@ namespace Upstream {
  */
 class LogicalDnsCluster : public ClusterImplBase {
 public:
-  LogicalDnsCluster(const envoy::config::cluster::v3::Cluster& cluster,
-                    ClusterFactoryContext& context, Network::DnsResolverSharedPtr dns_resolver);
-
   ~LogicalDnsCluster() override;
 
   // Upstream::Cluster
   InitializePhase initializePhase() const override { return InitializePhase::Primary; }
 
+  static absl::StatusOr<std::unique_ptr<LogicalDnsCluster>>
+  create(const envoy::config::cluster::v3::Cluster& cluster,
+         const envoy::extensions::clusters::dns::v3::DnsCluster& dns_cluster,
+         ClusterFactoryContext& context, Network::DnsResolverSharedPtr dns_resolver);
+
+protected:
+  LogicalDnsCluster(const envoy::config::cluster::v3::Cluster& cluster,
+                    const envoy::extensions::clusters::dns::v3::DnsCluster& dns_cluster,
+                    ClusterFactoryContext& context, Network::DnsResolverSharedPtr dns_resolver,
+                    absl::Status& creation_status);
+
 private:
+  friend class LogicalDnsClusterFactory;
+  friend class LogicalDnsClusterTest;
+
   const envoy::config::endpoint::v3::LocalityLbEndpoints& localityLbEndpoint() const {
     // This is checked in the constructor, i.e. at config load time.
     ASSERT(load_assignment_.endpoints().size() == 1);
@@ -61,6 +77,7 @@ private:
 
   Network::DnsResolverSharedPtr dns_resolver_;
   const std::chrono::milliseconds dns_refresh_rate_ms_;
+  const std::chrono::milliseconds dns_jitter_ms_;
   BackOffStrategyPtr failure_backoff_strategy_;
   const bool respect_dns_ttl_;
   Network::DnsLookupFamily dns_lookup_family_;
@@ -75,18 +92,6 @@ private:
   const LocalInfo::LocalInfo& local_info_;
   const envoy::config::endpoint::v3::ClusterLoadAssignment load_assignment_;
 };
-
-class LogicalDnsClusterFactory : public ClusterFactoryImplBase {
-public:
-  LogicalDnsClusterFactory() : ClusterFactoryImplBase("envoy.cluster.logical_dns") {}
-
-private:
-  std::pair<ClusterImplBaseSharedPtr, ThreadAwareLoadBalancerPtr>
-  createClusterImpl(const envoy::config::cluster::v3::Cluster& cluster,
-                    ClusterFactoryContext& context) override;
-};
-
-DECLARE_FACTORY(LogicalDnsClusterFactory);
 
 } // namespace Upstream
 } // namespace Envoy

@@ -6,7 +6,7 @@
 #pragma mark - Constants
 
 NSString *_CELL_ID = @"cell-id";
-NSString *_REQUEST_AUTHORITY = @"api.lyft.com";
+NSString *_REQUEST_AUTHORITY = @"localhost:10000";
 NSString *_REQUEST_PATH = @"/ping";
 NSString *_REQUEST_SCHEME = @"http";
 
@@ -38,7 +38,7 @@ NSString *_REQUEST_SCHEME = @"http";
 - (void)startEnvoy {
   NSLog(@"starting Envoy...");
   EngineBuilder *builder = [[EngineBuilder alloc] init];
-  [builder addLogLevel:LogLevelDebug];
+  [builder setLogLevel:LogLevelDebug];
   [builder enableDNSCache:YES saveInterval:1];
   [builder addKeyValueStoreWithName:@"reserved.platform_store"
                       keyValueStore:NSUserDefaults.standardUserDefaults];

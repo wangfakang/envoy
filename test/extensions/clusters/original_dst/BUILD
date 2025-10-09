@@ -11,12 +11,14 @@ envoy_package()
 envoy_cc_test(
     name = "original_dst_cluster_test",
     srcs = ["original_dst_cluster_test.cc"],
+    rbe_pool = "6gig",
     deps = [
         "//source/common/event:dispatcher_lib",
         "//source/common/network:filter_state_dst_address_lib",
         "//source/common/network:utility_lib",
         "//source/common/upstream:upstream_lib",
         "//source/extensions/clusters/original_dst:original_dst_cluster_lib",
+        "//source/extensions/load_balancing_policies/cluster_provided:config",
         "//source/extensions/transport_sockets/raw_buffer:config",
         "//test/common/upstream:utility_lib",
         "//test/mocks:common_lib",
@@ -28,7 +30,6 @@ envoy_cc_test(
         "//test/mocks/server:instance_mocks",
         "//test/mocks/ssl:ssl_mocks",
         "//test/mocks/upstream:cluster_manager_mocks",
-        "//test/test_common:test_runtime_lib",
         "//test/test_common:utility_lib",
         "@envoy_api//envoy/config/cluster/v3:pkg_cc_proto",
     ],

@@ -12,7 +12,6 @@
 #include "source/common/thread_local/thread_local_impl.h"
 #include "source/exe/process_wide.h"
 #include "source/server/listener_hooks.h"
-#include "source/server/options_impl.h"
 #include "source/server/server.h"
 
 #ifdef ENVOY_HANDLE_SIGNALS
@@ -36,15 +35,30 @@ public:
 // separate for legacy reasons.
 class StrippedMainBase {
 public:
+  using CreateInstanceFunction = std::function<std::unique_ptr<Server::Instance>(
+      Init::Manager& init_manager, const Server::Options& options, Event::TimeSystem& time_system,
+      ListenerHooks& hooks, Server::HotRestart& restarter, Stats::StoreRoot& store,
+      Thread::BasicLockable& access_log_lock, Server::ComponentFactory& component_factory,
+      Random::RandomGeneratorPtr&& random_generator, ThreadLocal::Instance& tls,
+      Thread::ThreadFactory& thread_factory, Filesystem::Instance& file_system,
+      std::unique_ptr<ProcessContext> process_context,
+      Buffer::WatermarkFactorySharedPtr watermark_factory)>;
+
   static std::string hotRestartVersion(bool hot_restart_enabled);
 
   // Consumer must guarantee that all passed references are alive until this object is
-  // destructed.
-  StrippedMainBase(const Server::Options& options, Event::TimeSystem& time_system,
-                   ListenerHooks& listener_hooks, Server::ComponentFactory& component_factory,
+  // destructed, except for `random_generator` which only needs to be alive until the constructor
+  // completes execution.
+  StrippedMainBase(const Server::Options& options, Server::ComponentFactory& component_factory,
                    std::unique_ptr<Server::Platform> platform_impl,
-                   std::unique_ptr<Random::RandomGenerator>&& random_generator,
-                   std::unique_ptr<ProcessContext> process_context);
+                   Random::RandomGenerator& random_generator);
+
+  // Initialize the Envoy server instance. Must be called prior to any other method to use the
+  // server. Separated from the constructor to allow for globals to be initialized first.
+  void init(Event::TimeSystem& time_system, ListenerHooks& listener_hooks,
+            std::unique_ptr<Random::RandomGenerator>&& random_generator,
+            std::unique_ptr<ProcessContext> process_context,
+            CreateInstanceFunction create_instance);
 
   void runServer() {
     ASSERT(options_.mode() == Server::Mode::Serve);
@@ -69,9 +83,16 @@ protected:
   ThreadLocal::InstanceImplPtr tls_;
   std::unique_ptr<Server::HotRestart> restarter_;
   Stats::ThreadLocalStoreImplPtr stats_store_;
+  // logging_context_ is only used in (some) subclasses, but it must be declared here so that it's
+  // destructed after the server_. This is necessary because the Server and its threads may log
+  // during destruction, causing data race issues with the Context's destruction and activation of
+  // the saved context.
   std::unique_ptr<Logger::Context> logging_context_;
   std::unique_ptr<Init::Manager> init_manager_{std::make_unique<Init::ManagerImpl>("Server")};
-  std::unique_ptr<Server::InstanceImpl> server_;
+  std::unique_ptr<Server::Instance> server_;
+
+  // Only used for validation mode
+  std::unique_ptr<ProcessContext> process_context_;
 
 private:
   void configureComponentLogLevels();

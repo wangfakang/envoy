@@ -6,7 +6,8 @@ load("@envoy_build_config//:extensions_build_config.bzl", "EXTENSIONS")
 _required_extensions = {
     "envoy.http.original_ip_detection.xff": "//source/extensions/http/original_ip_detection/xff:config",
     "envoy.request_id.uuid": "//source/extensions/request_id/uuid:config",
-    "envoy.transport_sockets.tls": "//source/extensions/transport_sockets/tls:config",
+    # To provide default round robin load balancer.
+    "envoy.load_balancing_policies.round_robin": "//source/extensions/load_balancing_policies/round_robin:config",
 }
 
 # Return the extension cc_library target after select
@@ -33,6 +34,8 @@ _core_extensions = [
     "envoy.transport_sockets.raw_buffer",
     "envoy.network.dns_resolver.cares",
     "envoy.network.dns_resolver.apple",
+    "envoy.load_balancing_policies.round_robin",
+    "envoy.transport_sockets.tls",
 ]
 
 # Return all core extensions to be compiled into Envoy.

@@ -22,16 +22,6 @@ using testing::ReturnRef;
 namespace Envoy {
 namespace Upstream {
 
-MockLoadBalancerSubsetInfo::MockLoadBalancerSubsetInfo() {
-  ON_CALL(*this, isEnabled()).WillByDefault(Return(false));
-  ON_CALL(*this, fallbackPolicy())
-      .WillByDefault(Return(envoy::config::cluster::v3::Cluster::LbSubsetConfig::ANY_ENDPOINT));
-  ON_CALL(*this, defaultSubset()).WillByDefault(ReturnRef(ProtobufWkt::Struct::default_instance()));
-  ON_CALL(*this, subsetSelectors()).WillByDefault(ReturnRef(subset_selectors_));
-}
-
-MockLoadBalancerSubsetInfo::~MockLoadBalancerSubsetInfo() = default;
-
 MockIdleTimeEnabledClusterInfo::MockIdleTimeEnabledClusterInfo() {
   ON_CALL(*this, idleTimeout()).WillByDefault(Return(std::chrono::milliseconds(1000)));
 }
@@ -41,10 +31,9 @@ MockIdleTimeEnabledClusterInfo::~MockIdleTimeEnabledClusterInfo() = default;
 MockUpstreamLocalAddressSelector::MockUpstreamLocalAddressSelector(
     Network::Address::InstanceConstSharedPtr& address)
     : address_(address) {
-  ON_CALL(*this, getUpstreamLocalAddress(_, _))
+  ON_CALL(*this, getUpstreamLocalAddressImpl(_))
       .WillByDefault(
-          Invoke([&](const Network::Address::InstanceConstSharedPtr&,
-                     const Network::ConnectionSocket::OptionsSharedPtr&) -> UpstreamLocalAddress {
+          Invoke([&](const Network::Address::InstanceConstSharedPtr&) -> UpstreamLocalAddress {
             UpstreamLocalAddress ret;
             ret.address_ = address_;
             ret.socket_options_ = nullptr;
@@ -54,7 +43,8 @@ MockUpstreamLocalAddressSelector::MockUpstreamLocalAddressSelector(
 
 MockClusterInfo::MockClusterInfo()
     : http2_options_(::Envoy::Http2::Utility::initializeAndValidateOptions(
-          envoy::config::core::v3::Http2ProtocolOptions())),
+                         envoy::config::core::v3::Http2ProtocolOptions())
+                         .value()),
       traffic_stat_names_(stats_store_.symbolTable()),
       config_update_stats_names_(stats_store_.symbolTable()),
       lb_stat_names_(stats_store_.symbolTable()), endpoint_stat_names_(stats_store_.symbolTable()),
@@ -63,7 +53,7 @@ MockClusterInfo::MockClusterInfo()
       cluster_request_response_size_stat_names_(stats_store_.symbolTable()),
       cluster_timeout_budget_stat_names_(stats_store_.symbolTable()),
       traffic_stats_(
-          std::make_unique<ClusterTrafficStats>(traffic_stat_names_, *stats_store_.rootScope())),
+          ClusterInfoImpl::generateStats(stats_store_.rootScope(), traffic_stat_names_, false)),
       config_update_stats_(config_update_stats_names_, *stats_store_.rootScope()),
       lb_stats_(lb_stat_names_, *stats_store_.rootScope()),
       endpoint_stats_(endpoint_stat_names_, *stats_store_.rootScope()),
@@ -95,6 +85,13 @@ MockClusterInfo::MockClusterInfo()
   ON_CALL(*this, edsServiceName()).WillByDefault(Invoke([this]() -> const std::string& {
     return eds_service_name_.has_value() ? eds_service_name_.value() : Envoy::EMPTY_STRING;
   }));
+  ON_CALL(*this, loadBalancerFactory()).WillByDefault(Invoke([this]() -> TypedLoadBalancerFactory& {
+    return *lb_factory_;
+  }));
+  ON_CALL(*this, loadBalancerConfig())
+      .WillByDefault(Invoke([this]() -> OptRef<const LoadBalancerConfig> {
+        return makeOptRefFromPtr<LoadBalancerConfig>(typed_lb_config_.get());
+      }));
   ON_CALL(*this, http1Settings()).WillByDefault(ReturnRef(http1_settings_));
   ON_CALL(*this, http2Options()).WillByDefault(ReturnRef(http2_options_));
   ON_CALL(*this, http3Options()).WillByDefault(ReturnRef(http3_options_));
@@ -103,6 +100,13 @@ MockClusterInfo::MockClusterInfo()
   ON_CALL(*this, extensionProtocolOptions(_)).WillByDefault(Return(extension_protocol_options_));
   ON_CALL(*this, maxResponseHeadersCount())
       .WillByDefault(ReturnPointee(&max_response_headers_count_));
+  ON_CALL(*this, maxResponseHeadersKb()).WillByDefault(Invoke([this]() -> absl::optional<uint16_t> {
+    if (common_http_protocol_options_.has_max_response_headers_kb()) {
+      return common_http_protocol_options_.max_response_headers_kb().value();
+    } else {
+      return absl::nullopt;
+    }
+  }));
   ON_CALL(*this, maxRequestsPerConnection())
       .WillByDefault(ReturnPointee(&max_requests_per_connection_));
   ON_CALL(*this, trafficStats()).WillByDefault(ReturnRef(traffic_stats_));
@@ -128,33 +132,6 @@ MockClusterInfo::MockClusterInfo()
   ON_CALL(*this, resourceManager(_))
       .WillByDefault(Invoke(
           [this](ResourcePriority) -> Upstream::ResourceManager& { return *resource_manager_; }));
-  ON_CALL(*this, lbType()).WillByDefault(ReturnPointee(&lb_type_));
-  ON_CALL(*this, lbSubsetInfo()).WillByDefault(ReturnRef(lb_subset_));
-  ON_CALL(*this, lbRoundRobinConfig())
-      .WillByDefault(
-          Invoke([this]() -> OptRef<const envoy::config::cluster::v3::Cluster::RoundRobinLbConfig> {
-            return makeOptRefFromPtr<const envoy::config::cluster::v3::Cluster::RoundRobinLbConfig>(
-                lb_round_robin_config_.get());
-          }));
-  ON_CALL(*this, lbRingHashConfig())
-      .WillByDefault(
-          Invoke([this]() -> OptRef<const envoy::config::cluster::v3::Cluster::RingHashLbConfig> {
-            return makeOptRefFromPtr<const envoy::config::cluster::v3::Cluster::RingHashLbConfig>(
-                lb_ring_hash_config_.get());
-          }));
-  ON_CALL(*this, lbMaglevConfig())
-      .WillByDefault(
-          Invoke([this]() -> OptRef<const envoy::config::cluster::v3::Cluster::MaglevLbConfig> {
-            return makeOptRefFromPtr<const envoy::config::cluster::v3::Cluster::MaglevLbConfig>(
-                lb_maglev_config_.get());
-          }));
-  ON_CALL(*this, lbOriginalDstConfig())
-      .WillByDefault(Invoke(
-          [this]() -> OptRef<const envoy::config::cluster::v3::Cluster::OriginalDstLbConfig> {
-            return makeOptRefFromPtr<
-                const envoy::config::cluster::v3::Cluster::OriginalDstLbConfig>(
-                lb_original_dst_config_.get());
-          }));
   ON_CALL(*this, upstreamConfig())
       .WillByDefault(
           Invoke([this]() -> OptRef<const envoy::config::core::v3::TypedExtensionConfig> {
@@ -186,25 +163,18 @@ MockClusterInfo::MockClusterInfo()
   ON_CALL(*this, upstreamHttpProtocol(_))
       .WillByDefault(Return(std::vector<Http::Protocol>{Http::Protocol::Http11}));
   ON_CALL(*this, createFilterChain(_, _))
-      .WillByDefault(
-          Invoke([&](Http::FilterChainManager& manager, bool only_create_if_configured) -> bool {
-            if (only_create_if_configured) {
-              return false;
-            }
-            Http::FilterFactoryCb factory_cb =
-                [](Http::FilterChainFactoryCallbacks& callbacks) -> void {
-              callbacks.addStreamDecoderFilter(std::make_shared<Router::UpstreamCodecFilter>());
-            };
-            manager.applyFilterFactoryCb({}, factory_cb);
-            return true;
-          }));
-  ON_CALL(*this, loadBalancerConfig())
-      .WillByDefault(Return(makeOptRefFromPtr<const LoadBalancerConfig>(nullptr)));
+      .WillByDefault(Invoke([&](Http::FilterChainManager&,
+                                const Http::FilterChainOptions&) -> bool { return false; }));
   ON_CALL(*this, makeHeaderValidator(_)).WillByDefault(Invoke([&](Http::Protocol protocol) {
     return header_validator_factory_ ? header_validator_factory_->createClientHeaderValidator(
                                            protocol, codecStats(protocol))
                                      : nullptr;
   }));
+  ON_CALL(*this, lrsReportMetricNames())
+      .WillByDefault(Invoke([this]() -> OptRef<const Envoy::Orca::LrsReportMetricNames> {
+        return makeOptRefFromPtr<const Envoy::Orca::LrsReportMetricNames>(
+            lrs_report_metric_names_.get());
+      }));
 }
 
 MockClusterInfo::~MockClusterInfo() = default;

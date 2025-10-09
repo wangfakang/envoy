@@ -32,7 +32,7 @@ struct RateLimitOnMatchActionContext {};
 
 // This class implements the on_match action behavior.
 class RateLimitOnMatchAction : public Matcher::ActionBase<BucketId>,
-                               public Logger::Loggable<Logger::Id::filter> {
+                               public Logger::Loggable<Logger::Id::rate_limit_quota> {
 public:
   explicit RateLimitOnMatchAction(RateLimitQuotaBucketSettings settings)
       : setting_(std::move(settings)) {}
@@ -40,7 +40,8 @@ public:
   absl::StatusOr<BucketId> generateBucketId(const Http::Matching::HttpMatchingDataImpl& data,
                                             Server::Configuration::FactoryContext& factory_context,
                                             RateLimitQuotaValidationVisitor& visitor) const;
-  RateLimitQuotaBucketSettings bucketSettings() const { return setting_; }
+
+  const RateLimitQuotaBucketSettings& bucketSettings() const { return setting_; }
 
 private:
   RateLimitQuotaBucketSettings setting_;
@@ -50,17 +51,15 @@ class RateLimitOnMatchActionFactory : public Matcher::ActionFactory<RateLimitOnM
 public:
   std::string name() const override { return "rate_limit_quota"; }
 
-  Matcher::ActionFactoryCb
-  createActionFactoryCb(const Protobuf::Message& config, RateLimitOnMatchActionContext&,
-                        ProtobufMessage::ValidationVisitor& validation_visitor) override {
+  Matcher::ActionConstSharedPtr
+  createAction(const Protobuf::Message& config, RateLimitOnMatchActionContext&,
+               ProtobufMessage::ValidationVisitor& validation_visitor) override {
     // Validate and then retrieve the bucket settings from config.
     const auto bucket_settings =
         MessageUtil::downcastAndValidate<const envoy::extensions::filters::http::rate_limit_quota::
                                              v3::RateLimitQuotaBucketSettings&>(config,
                                                                                 validation_visitor);
-    return [bucket_settings = std::move(bucket_settings)]() {
-      return std::make_unique<RateLimitOnMatchAction>(std::move(bucket_settings));
-    };
+    return std::make_shared<RateLimitOnMatchAction>(std::move(bucket_settings));
   }
 
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {

@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import pathlib
+import platform
 import shlex
 import shutil
 import subprocess
@@ -37,12 +38,20 @@ def binary_path(bazel_bin, target):
         *[s for s in target.replace('@', 'external/').replace(':', '/').split('/') if s != ''])
 
 
-def build_binary_with_debug_info(target):
-    targets = [target, target + ".dwp"]
-    subprocess.check_call(["bazel", *BAZEL_STARTUP_OPTIONS, "build", "-c", "dbg"] + BAZEL_OPTIONS
-                          + targets)
+def build_binary_with_debug_info(target, config=None):
+    build_args = ["bazel", *BAZEL_STARTUP_OPTIONS, "build"]
+    info_args = []
 
-    bazel_bin = bazel_info("bazel-bin", ["-c", "dbg"])
+    if config:
+        build_args.extend([f"--config={config}"])
+        info_args.extend([f"--config={config}"])
+
+    build_args.extend(["-c", "dbg", target])
+    build_args.extend(BAZEL_OPTIONS)
+
+    subprocess.check_call(build_args)
+
+    bazel_bin = bazel_info("bazel-bin", info_args + ["-c", "dbg"])
     return binary_path(bazel_bin, target)
 
 
@@ -76,7 +85,7 @@ def gdb_config(target, binary, workspace, execroot, arguments):
 
 
 def lldb_config(target, binary, workspace, execroot, arguments):
-    return {
+    cfg = {
         "name": "lldb " + target,
         "program": str(binary),
         "sourceMap": {
@@ -89,6 +98,13 @@ def lldb_config(target, binary, workspace, execroot, arguments):
         "type": "lldb",
         "request": "launch"
     }
+
+    # https://github.com/vadimcn/codelldb/discussions/517
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
+        cfg["sourceMap"] = {
+            ".": "${workspaceFolder}",
+        }
+    return cfg
 
 
 def add_to_launch_json(target, binary, workspace, execroot, arguments, debugger_type, overwrite):
@@ -124,10 +140,28 @@ def add_to_launch_json(target, binary, workspace, execroot, arguments, debugger_
     write_launch_json(workspace, launch)
 
 
+def auto_detect_config():
+    """Auto-detect the best compiler configuration based on platform and availability."""
+    try:
+        # Check if we're on ARM64 architecture
+        if platform.machine() in ['aarch64', 'arm64']:
+            # On ARM64, prefer clang for better compatibility
+            return "clang"
+        # On other architectures, try to detect available compilers
+        # This is a simple heuristic - could be made more sophisticated
+        return None  # Let Bazel use its default
+    except:
+        return None
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Build and generate launch config for VSCode')
     parser.add_argument('--debugger', default="gdb", help="debugger type, one of [gdb, lldb]")
     parser.add_argument('--args', default='', help="command line arguments if target binary")
+    parser.add_argument(
+        '--config',
+        default=None,
+        help="bazel build config (e.g., clang, gcc). Auto-detected if not specified")
     parser.add_argument(
         '--overwrite',
         action="store_true",
@@ -135,9 +169,16 @@ if __name__ == "__main__":
     parser.add_argument('target', help="target binary which you want to build")
     args = parser.parse_args()
 
+    # Auto-detect config if not specified
+    config = args.config if args.config else auto_detect_config()
+    if config:
+        print(f"Using build config: {config}")
+    else:
+        print("Using default Bazel configuration")
+
     workspace = get_workspace()
     execution_root = get_execution_root(workspace)
-    debug_binary = build_binary_with_debug_info(args.target)
+    debug_binary = build_binary_with_debug_info(args.target, config)
     add_to_launch_json(
         args.target, debug_binary, workspace, execution_root, args.args, args.debugger,
         args.overwrite)

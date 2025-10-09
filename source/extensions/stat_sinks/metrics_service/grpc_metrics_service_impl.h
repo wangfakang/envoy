@@ -14,6 +14,7 @@
 #include "envoy/upstream/cluster_manager.h"
 
 #include "source/common/buffer/buffer_impl.h"
+#include "source/common/grpc/status.h"
 #include "source/common/grpc/typed_async_client.h"
 
 namespace Envoy {
@@ -46,7 +47,7 @@ public:
   void onReceiveInitialMetadata(Http::ResponseHeaderMapPtr&&) override {}
   void onReceiveMessage(std::unique_ptr<ResponseProto>&&) override {}
   void onReceiveTrailingMetadata(Http::ResponseTrailerMapPtr&&) override {}
-  void onRemoteClose(Grpc::Status::GrpcStatus, const std::string&) override{};
+  void onRemoteClose(Grpc::Status::GrpcStatus, const std::string&) override {};
 
 protected:
   Grpc::AsyncStream<RequestProto> stream_{};
@@ -63,7 +64,8 @@ using GrpcMetricsStreamerSharedPtr =
 class GrpcMetricsStreamerImpl
     : public Singleton::Instance,
       public GrpcMetricsStreamer<envoy::service::metrics::v3::StreamMetricsMessage,
-                                 envoy::service::metrics::v3::StreamMetricsResponse> {
+                                 envoy::service::metrics::v3::StreamMetricsResponse>,
+      public Logger::Loggable<Logger::Id::stats_sinks> {
 public:
   GrpcMetricsStreamerImpl(Grpc::RawAsyncClientSharedPtr raw_async_client,
                           const LocalInfo::LocalInfo& local_info);
@@ -72,7 +74,11 @@ public:
   void send(MetricsPtr&& metrics) override;
 
   // Grpc::AsyncStreamCallbacks
-  void onRemoteClose(Grpc::Status::GrpcStatus, const std::string&) override { stream_ = nullptr; }
+  void onRemoteClose(Grpc::Status::GrpcStatus status, const std::string& message) override {
+    ENVOY_LOG(debug, "metric service stream closed with status: {} message: {}",
+              Grpc::Utility::grpcStatusToString(status), message);
+    stream_ = nullptr;
+  }
 
 private:
   const LocalInfo::LocalInfo& local_info_;

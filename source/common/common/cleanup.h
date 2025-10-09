@@ -13,12 +13,20 @@ public:
   Cleanup(std::function<void()> f) : f_(std::move(f)) {}
   ~Cleanup() { f_(); }
 
+  // Copying leads to cleanup multiple times, so only allow move.
+  Cleanup(const Cleanup&) = delete;
+  Cleanup(Cleanup&&) = default;
+
   void cancel() {
     cancelled_ = true;
     f_ = []() {};
   }
 
   bool cancelled() { return cancelled_; }
+
+  static Cleanup noop() {
+    return {[]() {}};
+  }
 
 private:
   std::function<void()> f_;

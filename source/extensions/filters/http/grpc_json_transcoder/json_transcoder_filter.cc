@@ -18,6 +18,7 @@
 #include "source/common/runtime/runtime_features.h"
 #include "source/extensions/filters/http/grpc_json_transcoder/http_body_utils.h"
 
+#include "absl/strings/str_join.h"
 #include "google/api/annotations.pb.h"
 #include "google/api/http.pb.h"
 #include "google/api/httpbody.pb.h"
@@ -25,10 +26,10 @@
 #include "grpc_transcoding/path_matcher_utility.h"
 #include "grpc_transcoding/response_to_json_translator.h"
 
+using absl::Status;
+using absl::StatusCode;
 using Envoy::Protobuf::FileDescriptorSet;
 using Envoy::Protobuf::io::ZeroCopyInputStream;
-using Envoy::ProtobufUtil::Status;
-using Envoy::ProtobufUtil::StatusCode;
 using google::api::HttpRule;
 using google::grpc::transcoding::JsonRequestTranslator;
 using JsonRequestTranslatorPtr = std::unique_ptr<JsonRequestTranslator>;
@@ -43,6 +44,8 @@ using google::grpc::transcoding::Transcoder;
 using TranscoderPtr = std::unique_ptr<Transcoder>;
 using google::grpc::transcoding::TranscoderInputStream;
 using TranscoderInputStreamPtr = std::unique_ptr<TranscoderInputStream>;
+using envoy::extensions::filters::http::grpc_json_transcoder::v3::UnknownQueryParams;
+using google::grpc::transcoding::VariableBinding;
 
 namespace Envoy {
 namespace Extensions {
@@ -90,10 +93,10 @@ public:
   ::google::grpc::transcoding::TranscoderInputStream* RequestOutput() override {
     return request_stream_.get();
   }
-  ProtobufUtil::Status RequestStatus() override { return request_message_stream_.Status(); }
+  absl::Status RequestStatus() override { return request_message_stream_.Status(); }
 
   ZeroCopyInputStream* ResponseOutput() override { return response_stream_.get(); }
-  ProtobufUtil::Status ResponseStatus() override { return response_translator_->Status(); }
+  absl::Status ResponseStatus() override { return response_translator_->Status(); }
 
 private:
   RequestMessageTranslatorPtr request_translator_;
@@ -120,12 +123,14 @@ JsonTranscoderConfig::JsonTranscoderConfig(
 
   switch (proto_config.descriptor_set_case()) {
   case envoy::extensions::filters::http::grpc_json_transcoder::v3::GrpcJsonTranscoder::
-      DescriptorSetCase::kProtoDescriptor:
-    if (!descriptor_set.ParseFromString(
-            api.fileSystem().fileReadToEnd(proto_config.proto_descriptor()))) {
+      DescriptorSetCase::kProtoDescriptor: {
+    auto file_or_error = api.fileSystem().fileReadToEnd(proto_config.proto_descriptor());
+    THROW_IF_NOT_OK_REF(file_or_error.status());
+    if (!descriptor_set.ParseFromString(file_or_error.value())) {
       throw EnvoyException("transcoding_filter: Unable to parse proto descriptor");
     }
     break;
+  }
   case envoy::extensions::filters::http::grpc_json_transcoder::v3::GrpcJsonTranscoder::
       DescriptorSetCase::kProtoDescriptorBin:
     if (!descriptor_set.ParseFromString(proto_config.proto_descriptor_bin())) {
@@ -174,7 +179,7 @@ JsonTranscoderConfig::JsonTranscoderConfig(
       if (method->options().HasExtension(google::api::http)) {
         http_rule = method->options().GetExtension(google::api::http);
       } else if (proto_config.auto_mapping()) {
-        auto post = "/" + service->full_name() + "/" + method->name();
+        auto post = absl::StrCat("/", service->full_name(), "/", method->name());
         http_rule.set_post(post);
         http_rule.set_body("*");
       }
@@ -182,14 +187,14 @@ JsonTranscoderConfig::JsonTranscoderConfig(
       MethodInfoSharedPtr method_info;
       Status status = createMethodInfo(method, http_rule, method_info);
       if (!status.ok()) {
-        throw EnvoyException("transcoding_filter: Cannot register '" + method->full_name() +
-                             "': " + status.message().ToString());
+        throw EnvoyException(absl::StrCat("transcoding_filter: Cannot register '",
+                                          method->full_name(), "': ", status.message()));
       }
 
       if (!PathMatcherUtility::RegisterByHttpRule(pmb, http_rule, ignored_query_parameters,
                                                   method_info)) {
-        throw EnvoyException("transcoding_filter: Cannot register '" + method->full_name() +
-                             "' to path matcher");
+        throw EnvoyException(absl::StrCat("transcoding_filter: Cannot register '",
+                                          method->full_name(), "' to path matcher"));
       }
     }
   }
@@ -217,16 +222,19 @@ JsonTranscoderConfig::JsonTranscoderConfig(
 
   const auto& print_config = proto_config.print_options();
   response_translate_options_.json_print_options.add_whitespace = print_config.add_whitespace();
-  response_translate_options_.json_print_options.always_print_primitive_fields =
+  response_translate_options_.json_print_options.always_print_fields_with_no_presence =
       print_config.always_print_primitive_fields();
   response_translate_options_.json_print_options.always_print_enums_as_ints =
       print_config.always_print_enums_as_ints();
   response_translate_options_.json_print_options.preserve_proto_field_names =
       print_config.preserve_proto_field_names();
   response_translate_options_.stream_newline_delimited = print_config.stream_newline_delimited();
+  response_translate_options_.stream_sse_style_delimited =
+      print_config.stream_sse_style_delimited();
 
   match_incoming_request_route_ = proto_config.match_incoming_request_route();
   ignore_unknown_query_parameters_ = proto_config.ignore_unknown_query_parameters();
+  capture_unknown_query_parameters_ = proto_config.capture_unknown_query_parameters();
   request_validation_options_ = proto_config.request_validation_options();
   case_insensitive_enum_parsing_ = proto_config.case_insensitive_enum_parsing();
   if (proto_config.has_max_request_body_size()) {
@@ -261,12 +269,13 @@ void JsonTranscoderConfig::addBuiltinSymbolDescriptor(const std::string& symbol_
 
 Status JsonTranscoderConfig::resolveField(const Protobuf::Descriptor* descriptor,
                                           const std::string& field_path_str,
-                                          std::vector<const ProtobufWkt::Field*>* field_path,
+                                          std::vector<const Protobuf::Field*>* field_path,
                                           bool* is_http_body) {
-  const ProtobufWkt::Type* message_type =
+  const Protobuf::Type* message_type =
       type_helper_->Info()->GetTypeByTypeUrl(Grpc::Common::typeUrl(descriptor->full_name()));
   if (message_type == nullptr) {
-    return {StatusCode::kNotFound, "Could not resolve type: " + descriptor->full_name()};
+    return {StatusCode::kNotFound,
+            absl::StrCat("Could not resolve type: ", descriptor->full_name())};
   }
 
   Status status = type_helper_->ResolveFieldPath(
@@ -278,7 +287,7 @@ Status JsonTranscoderConfig::resolveField(const Protobuf::Descriptor* descriptor
   if (field_path->empty()) {
     *is_http_body = descriptor->full_name() == google::api::HttpBody::descriptor()->full_name();
   } else {
-    const ProtobufWkt::Type* body_type =
+    const Protobuf::Type* body_type =
         type_helper_->Info()->GetTypeByTypeUrl(field_path->back()->type_url());
     *is_http_body = body_type != nullptr &&
                     body_type->name() == google::api::HttpBody::descriptor()->full_name();
@@ -309,8 +318,8 @@ Status JsonTranscoderConfig::createMethodInfo(const Protobuf::MethodDescriptor* 
   if (!method_info->response_body_field_path.empty() && !method_info->response_type_is_http_body_) {
     // TODO(euroelessar): Implement https://github.com/envoyproxy/envoy/issues/11136.
     return {StatusCode::kUnimplemented,
-            "Setting \"response_body\" is not supported yet for non-HttpBody fields: " +
-                descriptor->full_name()};
+            absl::StrCat("Setting \"response_body\" is not supported yet for non-HttpBody fields: ",
+                         descriptor->full_name())};
   }
 
   return {};
@@ -322,10 +331,11 @@ bool JsonTranscoderConfig::matchIncomingRequestInfo() const {
 
 bool JsonTranscoderConfig::convertGrpcStatus() const { return convert_grpc_status_; }
 
-ProtobufUtil::Status JsonTranscoderConfig::createTranscoder(
+absl::Status JsonTranscoderConfig::createTranscoder(
     const Http::RequestHeaderMap& headers, ZeroCopyInputStream& request_input,
     google::grpc::transcoding::TranscoderInputStream& response_input,
-    std::unique_ptr<Transcoder>& transcoder, MethodInfoSharedPtr& method_info) const {
+    std::unique_ptr<Transcoder>& transcoder, MethodInfoSharedPtr& method_info,
+    UnknownQueryParams& unknown_params) const {
 
   ASSERT(!disabled_);
   const std::string method(headers.getMethodValue());
@@ -359,7 +369,11 @@ ProtobufUtil::Status JsonTranscoderConfig::createTranscoder(
     status = type_helper_->ResolveFieldPath(*request_info.message_type, binding.field_path,
                                             &resolved_binding.field_path);
     if (!status.ok()) {
-      if (ignore_unknown_query_parameters_) {
+      if (capture_unknown_query_parameters_) {
+        auto binding_key = absl::StrJoin(binding.field_path, ".");
+        (*unknown_params.mutable_key())[binding_key].add_values(binding.value);
+        continue;
+      } else if (ignore_unknown_query_parameters_) {
         continue;
       }
       return status;
@@ -401,35 +415,37 @@ ProtobufUtil::Status JsonTranscoderConfig::createTranscoder(
   return {};
 }
 
-ProtobufUtil::Status
+absl::Status
 JsonTranscoderConfig::methodToRequestInfo(const MethodInfoSharedPtr& method_info,
                                           google::grpc::transcoding::RequestInfo* info) const {
-  const std::string& request_type_full_name = method_info->descriptor_->input_type()->full_name();
+  absl::string_view request_type_full_name = method_info->descriptor_->input_type()->full_name();
   auto request_type_url = Grpc::Common::typeUrl(request_type_full_name);
   info->message_type = type_helper_->Info()->GetTypeByTypeUrl(request_type_url);
   if (info->message_type == nullptr) {
     ENVOY_LOG(debug, "Cannot resolve input-type: {}", request_type_full_name);
-    return {StatusCode::kNotFound, "Could not resolve type: " + request_type_full_name};
+    return {StatusCode::kNotFound,
+            absl::StrCat("Could not resolve type: ", request_type_full_name)};
   }
 
   return {};
 }
 
-ProtobufUtil::Status
-JsonTranscoderConfig::translateProtoMessageToJson(const Protobuf::Message& message,
-                                                  std::string* json_out) const {
+absl::Status JsonTranscoderConfig::translateProtoMessageToJson(const Protobuf::Message& message,
+                                                               std::string* json_out) const {
   return ProtobufUtil::BinaryToJsonString(
       type_helper_->Resolver(), Grpc::Common::typeUrl(message.GetDescriptor()->full_name()),
       message.SerializeAsString(), json_out, response_translate_options_.json_print_options);
 }
 
-JsonTranscoderFilter::JsonTranscoderFilter(const JsonTranscoderConfig& config) : config_(config) {}
+JsonTranscoderFilter::JsonTranscoderFilter(const JsonTranscoderConfigConstSharedPtr& config,
+                                           const GrpcJsonTranscoderFilterStatsSharedPtr& stats)
+    : config_(config), stats_(stats) {}
 
 void JsonTranscoderFilter::initPerRouteConfig() {
   const auto* route_local =
       Http::Utility::resolveMostSpecificPerFilterConfig<JsonTranscoderConfig>(decoder_callbacks_);
 
-  per_route_config_ = route_local ? route_local : &config_;
+  per_route_config_ = route_local ? route_local : config_.get();
 }
 
 void JsonTranscoderFilter::maybeExpandBufferLimits() {
@@ -461,8 +477,9 @@ Http::FilterHeadersStatus JsonTranscoderFilter::decodeHeaders(Http::RequestHeade
     return Http::FilterHeadersStatus::Continue;
   }
 
-  const auto status =
-      per_route_config_->createTranscoder(headers, request_in_, response_in_, transcoder_, method_);
+  const auto status = per_route_config_->createTranscoder(headers, request_in_, response_in_,
+                                                          transcoder_, method_, unknown_params_);
+
   if (!status.ok()) {
     ENVOY_STREAM_LOG(debug, "Failed to transcode request headers: {}", *decoder_callbacks_,
                      status.message());
@@ -494,7 +511,7 @@ Http::FilterHeadersStatus JsonTranscoderFilter::decodeHeaders(Http::RequestHeade
                      *decoder_callbacks_);
     error_ = true;
     decoder_callbacks_->sendLocalReply(
-        static_cast<Http::Code>(http_code), status.message().ToString(), nullptr, absl::nullopt,
+        static_cast<Http::Code>(http_code), status.message(), nullptr, absl::nullopt,
         absl::StrCat(RcDetails::get().GrpcTranscodeFailedEarly, "{",
                      StringUtil::replaceAllEmptySpace(MessageUtil::codeEnumToString(status.code())),
                      "}"));
@@ -509,6 +526,8 @@ Http::FilterHeadersStatus JsonTranscoderFilter::decodeHeaders(Http::RequestHeade
       content_type_.assign(content_type.begin(), content_type.end());
     }
 
+    uint64_t stream_size_before = request_in_.bytesStored();
+    uint64_t buffer_size_before = initial_request_data_.length();
     bool done = !readToBuffer(*transcoder_->RequestOutput(), initial_request_data_);
     if (!done) {
       ENVOY_STREAM_LOG(
@@ -521,6 +540,9 @@ Http::FilterHeadersStatus JsonTranscoderFilter::decodeHeaders(Http::RequestHeade
           absl::StrCat(RcDetails::get().GrpcTranscodeFailedEarly, "{BAD_REQUEST}"));
       return Http::FilterHeadersStatus::StopIteration;
     }
+    uint64_t added = initial_request_data_.length() - buffer_size_before;
+    uint64_t removed = stream_size_before - request_in_.bytesStored();
+    stats_->transcoder_request_buffer_bytes_.adjust(added, removed);
     if (checkAndRejectIfRequestTranscoderFailed(RcDetails::get().GrpcTranscodeFailed)) {
       return Http::FilterHeadersStatus::StopIteration;
     }
@@ -530,8 +552,8 @@ Http::FilterHeadersStatus JsonTranscoderFilter::decodeHeaders(Http::RequestHeade
   headers.setReferenceContentType(Http::Headers::get().ContentTypeValues.Grpc);
   headers.setEnvoyOriginalPath(headers.getPathValue());
   headers.addReferenceKey(Http::Headers::get().EnvoyOriginalMethod, headers.getMethodValue());
-  headers.setPath("/" + method_->descriptor_->service()->full_name() + "/" +
-                  method_->descriptor_->name());
+  headers.setPath(absl::StrCat("/", method_->descriptor_->service()->full_name(), "/",
+                               method_->descriptor_->name()));
   headers.setReferenceMethod(Http::Headers::get().MethodValues.Post);
   headers.setReferenceTE(Http::Headers::get().TEValues.Trailers);
 
@@ -545,7 +567,9 @@ Http::FilterHeadersStatus JsonTranscoderFilter::decodeHeaders(Http::RequestHeade
     request_in_.finish();
 
     Buffer::OwnedImpl data;
+    uint64_t stream_size_before = request_in_.bytesStored();
     readToBuffer(*transcoder_->RequestOutput(), data);
+    stats_->transcoder_request_buffer_bytes_.sub(stream_size_before - request_in_.bytesStored());
     if (checkAndRejectIfRequestTranscoderFailed(RcDetails::get().GrpcTranscodeFailedEarly)) {
       return Http::FilterHeadersStatus::StopIteration;
     }
@@ -568,19 +592,32 @@ Http::FilterDataStatus JsonTranscoderFilter::decodeData(Buffer::Instance& data, 
   }
 
   if (method_->request_type_is_http_body_) {
+    stats_->transcoder_request_buffer_bytes_.add(data.length());
     request_data_.move(data);
-    if (decoderBufferLimitReached(request_data_.length())) {
+    if (!method_->descriptor_->client_streaming() &&
+        decoderBufferLimitReached(request_data_.length())) {
       return Http::FilterDataStatus::StopIterationNoBuffer;
     }
 
-    // TODO(euroelessar): Upper bound message size for streaming case.
-    if (end_stream || method_->descriptor_->client_streaming()) {
+    if (method_->descriptor_->client_streaming()) {
+      // To avoid sending a grpc frame larger than 4MB (which grpc will by default reject),
+      // split the input buffer into 1MB pieces until the buffer is smaller than 1MB.
+      Buffer::OwnedImpl remaining_request_data;
+      remaining_request_data.move(request_data_);
+      while (!first_request_sent_ || remaining_request_data.length() > 0) {
+        uint64_t piece_size = std::min<uint64_t>(remaining_request_data.length(),
+                                                 JsonTranscoderConfig::MaxStreamedPieceSize);
+        request_data_.move(remaining_request_data, piece_size);
+        maybeSendHttpBodyRequestMessage(&data);
+      }
+    } else if (end_stream) {
       maybeSendHttpBodyRequestMessage(&data);
     } else {
       // TODO(euroelessar): Avoid buffering if content length is already known.
       return Http::FilterDataStatus::StopIterationAndBuffer;
     }
   } else {
+    stats_->transcoder_request_buffer_bytes_.add(data.length());
     request_in_.move(data);
     if (decoderBufferLimitReached(request_in_.bytesStored())) {
       return Http::FilterDataStatus::StopIterationNoBuffer;
@@ -590,7 +627,10 @@ Http::FilterDataStatus JsonTranscoderFilter::decodeData(Buffer::Instance& data, 
       request_in_.finish();
     }
 
+    // Move the transcoded data to the output buffer.
+    uint64_t stream_size_before = request_in_.bytesStored();
     readToBuffer(*transcoder_->RequestOutput(), data);
+    stats_->transcoder_request_buffer_bytes_.sub(stream_size_before - request_in_.bytesStored());
   }
 
   if (checkAndRejectIfRequestTranscoderFailed(RcDetails::get().GrpcTranscodeFailed)) {
@@ -617,7 +657,9 @@ Http::FilterTrailersStatus JsonTranscoderFilter::decodeTrailers(Http::RequestTra
     request_in_.finish();
 
     Buffer::OwnedImpl data;
+    uint64_t stream_size_before = request_in_.bytesStored();
     readToBuffer(*transcoder_->RequestOutput(), data);
+    stats_->transcoder_request_buffer_bytes_.sub(stream_size_before - request_in_.bytesStored());
 
     if (data.length()) {
       ENVOY_STREAM_LOG(debug,
@@ -636,6 +678,11 @@ void JsonTranscoderFilter::setDecoderFilterCallbacks(
 
 Http::FilterHeadersStatus JsonTranscoderFilter::encodeHeaders(Http::ResponseHeaderMap& headers,
                                                               bool end_stream) {
+  if (error_ || !transcoder_) {
+    ENVOY_STREAM_LOG(debug, "Response headers is passed through", *encoder_callbacks_);
+    return Http::FilterHeadersStatus::Continue;
+  }
+
   if (!Grpc::Common::isGrpcResponseHeaders(headers, end_stream)) {
     ENVOY_STREAM_LOG(
         debug,
@@ -643,10 +690,6 @@ Http::FilterHeadersStatus JsonTranscoderFilter::encodeHeaders(Http::ResponseHead
         "without transcoding.",
         *encoder_callbacks_);
     error_ = true;
-  }
-
-  if (error_ || !transcoder_) {
-    ENVOY_STREAM_LOG(debug, "Response headers is passed through", *encoder_callbacks_);
     return Http::FilterHeadersStatus::Continue;
   }
 
@@ -654,9 +697,11 @@ Http::FilterHeadersStatus JsonTranscoderFilter::encodeHeaders(Http::ResponseHead
 
   if (end_stream) {
     if (method_->descriptor_->server_streaming()) {
-      // When there is no body in a streaming response, a empty JSON array is
-      // returned by default. Set the content type correctly.
-      headers.setReferenceContentType(Http::Headers::get().ContentTypeValues.Json);
+      if (per_route_config_->isStreamSSEStyleDelimited()) {
+        headers.setContentType(Http::Headers::get().ContentTypeValues.TextEventStream);
+      } else {
+        headers.setReferenceContentType(Http::Headers::get().ContentTypeValues.Json);
+      }
     }
 
     // In gRPC wire protocol, headers frame with end_stream is a trailers-only response.
@@ -666,7 +711,11 @@ Http::FilterHeadersStatus JsonTranscoderFilter::encodeHeaders(Http::ResponseHead
     return Http::FilterHeadersStatus::Continue;
   }
 
-  headers.setReferenceContentType(Http::Headers::get().ContentTypeValues.Json);
+  if (per_route_config_->isStreamSSEStyleDelimited()) {
+    headers.setContentType(Http::Headers::get().ContentTypeValues.TextEventStream);
+  } else {
+    headers.setReferenceContentType(Http::Headers::get().ContentTypeValues.Json);
+  }
 
   // In case of HttpBody in response - content type is unknown at this moment.
   // So "Continue" only for regular streaming use case and StopIteration for
@@ -696,8 +745,9 @@ Http::FilterDataStatus JsonTranscoderFilter::encodeData(Buffer::Instance& data, 
     return Http::FilterDataStatus::Continue;
   }
 
+  stats_->transcoder_response_buffer_bytes_.add(data.length());
   response_in_.move(data);
-  if (encoderBufferLimitReached(response_in_.bytesStored() + response_out_.length())) {
+  if (encoderBufferLimitReached(response_in_.bytesStored() + response_data_.length())) {
     return Http::FilterDataStatus::StopIterationNoBuffer;
   }
 
@@ -705,7 +755,13 @@ Http::FilterDataStatus JsonTranscoderFilter::encodeData(Buffer::Instance& data, 
     response_in_.finish();
   }
 
-  readToBuffer(*transcoder_->ResponseOutput(), response_out_);
+  uint64_t stream_size_before = response_in_.bytesStored();
+  uint64_t buffer_size_before = response_data_.length();
+  readToBuffer(*transcoder_->ResponseOutput(), response_data_);
+  uint64_t added = response_data_.length() - buffer_size_before;
+  uint64_t removed = stream_size_before - response_in_.bytesStored();
+  stats_->transcoder_response_buffer_bytes_.adjust(added, removed);
+
   if (checkAndRejectIfResponseTranscoderFailed()) {
     return Http::FilterDataStatus::StopIterationNoBuffer;
   }
@@ -714,11 +770,11 @@ Http::FilterDataStatus JsonTranscoderFilter::encodeData(Buffer::Instance& data, 
     ENVOY_STREAM_LOG(debug,
                      "internally buffering unary response waiting for end_stream during "
                      "encodeData, transcoded data size={}",
-                     *encoder_callbacks_, response_out_.length());
+                     *encoder_callbacks_, response_data_.length());
     return Http::FilterDataStatus::StopIterationNoBuffer;
   }
 
-  data.move(response_out_);
+  data.move(response_data_);
   ENVOY_STREAM_LOG(debug,
                    "continuing response during encodeData, transcoded data size={}, end_stream={}",
                    *encoder_callbacks_, data.length(), end_stream);
@@ -747,15 +803,19 @@ void JsonTranscoderFilter::doTrailers(Http::ResponseHeaderOrTrailerMap& headers_
   }
 
   if (!method_->response_type_is_http_body_) {
-    readToBuffer(*transcoder_->ResponseOutput(), response_out_);
+    uint64_t stream_size_before = response_in_.bytesStored();
+    uint64_t buffer_size_before = response_data_.length();
+    readToBuffer(*transcoder_->ResponseOutput(), response_data_);
+    stats_->transcoder_response_buffer_bytes_.add(response_data_.length() - buffer_size_before);
+    stats_->transcoder_response_buffer_bytes_.sub(stream_size_before - response_in_.bytesStored());
     if (checkAndRejectIfResponseTranscoderFailed()) {
       return;
     }
-    if (response_out_.length() > 0) {
+    if (response_data_.length() > 0) {
       ENVOY_STREAM_LOG(debug,
                        "adding remaining data during encodeTrailers, transcoded data size={}",
-                       *encoder_callbacks_, response_out_.length());
-      encoder_callbacks_->addEncodedData(response_out_, true);
+                       *encoder_callbacks_, response_data_.length());
+      encoder_callbacks_->addEncodedData(response_data_, true);
     }
   }
 
@@ -856,16 +916,30 @@ bool JsonTranscoderFilter::readToBuffer(Protobuf::io::ZeroCopyInputStream& strea
   return false;
 }
 
+void JsonTranscoderFilter::onDestroy() {
+  if (request_data_.length() || request_in_.bytesStored()) {
+    stats_->transcoder_request_buffer_bytes_.sub(request_data_.length() +
+                                                 request_in_.bytesStored());
+  }
+  if (response_data_.length() || response_in_.bytesStored()) {
+    stats_->transcoder_response_buffer_bytes_.sub(response_data_.length() +
+                                                  response_in_.bytesStored());
+  }
+}
+
 void JsonTranscoderFilter::maybeSendHttpBodyRequestMessage(Buffer::Instance* data) {
   if (first_request_sent_ && request_data_.length() == 0) {
     return;
   }
 
   Buffer::OwnedImpl message_payload;
+  stats_->transcoder_request_buffer_bytes_.sub(initial_request_data_.length());
   message_payload.move(initial_request_data_);
   HttpBodyUtils::appendHttpBodyEnvelope(message_payload, method_->request_body_field_path,
-                                        std::move(content_type_), request_data_.length());
+                                        std::move(content_type_), request_data_.length(),
+                                        unknown_params_);
   content_type_.clear();
+  stats_->transcoder_request_buffer_bytes_.sub(request_data_.length());
   message_payload.move(request_data_);
 
   Envoy::Grpc::Encoder().prependFrameHeader(Envoy::Grpc::GRPC_FH_DEFAULT, message_payload);
@@ -882,7 +956,7 @@ void JsonTranscoderFilter::maybeSendHttpBodyRequestMessage(Buffer::Instance* dat
 bool JsonTranscoderFilter::buildResponseFromHttpBodyOutput(
     Http::ResponseHeaderMap& response_headers, Buffer::Instance& data) {
   std::vector<Grpc::Frame> frames;
-  decoder_.decode(data, frames);
+  std::ignore = decoder_.decode(data, frames);
   if (frames.empty()) {
     return false;
   }
@@ -898,7 +972,7 @@ bool JsonTranscoderFilter::buildResponseFromHttpBodyOutput(
         encoder_callbacks_->resetStream();
         return true;
       }
-      const auto& body = http_body.data();
+      const auto& body = MessageUtil::bytesToString(http_body.data());
 
       data.add(body);
 

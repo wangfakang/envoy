@@ -11,10 +11,7 @@ envoy_package()
 envoy_cc_test(
     name = "dns_impl_test",
     srcs = ["dns_impl_test.cc"],
-    args = [
-        # Force creation of c-ares DnsResolverImpl when running test on macOS.
-        "--runtime-feature-disable-for-tests=envoy.restart_features.use_apple_api_for_dns_lookups",
-    ],
+    rbe_pool = "6gig",
     # TODO(envoyproxy/windows-dev): Under winsock2 this is behaving unusually for windows, even as
     # 127.0.0.1 and ::1 are explicitly added to `c:\windows\system32\drivers\etc\hosts` ... see:
     # https://gist.github.com/wrowe/24fe5b93b58bb444bce7ecc134905395
@@ -40,5 +37,16 @@ envoy_cc_test(
         "//test/test_common:threadsafe_singleton_injector_lib",
         "//test/test_common:utility_lib",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_test(
+    name = "dns_impl_integration_test",
+    srcs = ["dns_impl_integration_test.cc"],
+    tags = ["fails_on_clang_cl"],
+    deps = [
+        "//source/extensions/clusters/dns:dns_cluster_lib",
+        "//source/extensions/network/dns_resolver/cares:config",
+        "//test/integration:http_integration_lib",
     ],
 )

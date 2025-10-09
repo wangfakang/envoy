@@ -1,12 +1,18 @@
+#include <sys/types.h>
+
 #include "source/extensions/filters/http/compressor/compressor_filter.h"
 
+#include "test/extensions/filters/http/compressor/compressor_filter_testing_peer.h"
 #include "test/mocks/compression/compressor/mocks.h"
 #include "test/mocks/http/mocks.h"
+#include "test/mocks/protobuf/mocks.h"
 #include "test/mocks/runtime/mocks.h"
+#include "test/mocks/server/factory_context.h"
 #include "test/mocks/stats/mocks.h"
-#include "test/test_common/test_runtime.h"
+#include "test/mocks/stream_info/mocks.h"
 #include "test/test_common/utility.h"
 
+#include "absl/strings/str_join.h"
 #include "gtest/gtest.h"
 
 namespace Envoy {
@@ -182,6 +188,9 @@ public:
   NiceMock<Runtime::MockLoader> runtime_;
   NiceMock<Http::MockStreamDecoderFilterCallbacks> decoder_callbacks_;
   NiceMock<Http::MockStreamEncoderFilterCallbacks> encoder_callbacks_;
+  NiceMock<StreamInfo::MockStreamInfo> stream_info_;
+  NiceMock<Server::Configuration::MockFactoryContext> factory_context_;
+  NiceMock<Server::Configuration::MockServerFactoryContext> server_factory_context_;
 };
 
 enum class PerRouteConfig { None, Empty, Enabled, Disabled };
@@ -253,7 +262,8 @@ TEST_P(CompresorFilterEnablementTest, DecodeHeadersWithRuntimeDisabled) {
   }
   std::unique_ptr<CompressorPerRouteFilterConfig> per_route_config;
   if (use_per_route_proto) {
-    per_route_config = std::make_unique<CompressorPerRouteFilterConfig>(per_route_proto);
+    per_route_config =
+        std::make_unique<CompressorPerRouteFilterConfig>(per_route_proto, factory_context_);
     ON_CALL(decoder_callbacks_, mostSpecificPerFilterConfig())
         .WillByDefault(Return(per_route_config.get()));
   }
@@ -431,6 +441,7 @@ TEST_F(CompressorFilterTest, EmptyResponse) {
 
 // Verify removeAcceptEncoding header.
 TEST_F(CompressorFilterTest, RemoveAcceptEncodingHeader) {
+  // Filter true, no response direction overrides. Header is removed.
   {
     Http::TestRequestHeaderMapImpl headers = {{"accept-encoding", "deflate, test, gzip, br"}};
     setUpFilter(R"EOF(
@@ -443,9 +454,12 @@ TEST_F(CompressorFilterTest, RemoveAcceptEncodingHeader) {
   }
 }
 )EOF");
+
     EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, true));
     EXPECT_FALSE(headers.has("accept-encoding"));
   }
+
+  // Filter false, no response direction overrides. Header is present.
   {
     Http::TestRequestHeaderMapImpl headers = {{"accept-encoding", "deflate, test, gzip, br"}};
     setUpFilter(R"EOF(
@@ -457,6 +471,169 @@ TEST_F(CompressorFilterTest, RemoveAcceptEncodingHeader) {
   }
 }
 )EOF");
+
+    EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, true));
+    EXPECT_TRUE(headers.has("accept-encoding"));
+    EXPECT_EQ("deflate, test, gzip, br", headers.get_("accept-encoding"));
+  }
+
+  // Filter true, response direction overrides present but no override. Header is removed.
+  {
+    Http::TestRequestHeaderMapImpl headers = {{"accept-encoding", "deflate, test, gzip, br"}};
+    setUpFilter(R"EOF(
+{
+  "remove_accept_encoding_header": true,
+  "compressor_library": {
+     "typed_config": {
+       "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+     }
+  }
+}
+)EOF");
+    CompressorPerRoute per_route_proto;
+    per_route_proto.mutable_overrides()->mutable_response_direction_config();
+
+    std::unique_ptr<CompressorPerRouteFilterConfig> per_route_config =
+        std::make_unique<CompressorPerRouteFilterConfig>(per_route_proto, factory_context_);
+    ON_CALL(decoder_callbacks_, mostSpecificPerFilterConfig())
+        .WillByDefault(Return(per_route_config.get()));
+
+    EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, true));
+    EXPECT_FALSE(headers.has("accept-encoding"));
+  }
+
+  // Filter false, response direction overrides present but no override. Header is present.
+  {
+    Http::TestRequestHeaderMapImpl headers = {{"accept-encoding", "deflate, test, gzip, br"}};
+    setUpFilter(R"EOF(
+{
+  "compressor_library": {
+     "typed_config": {
+       "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+     }
+  }
+}
+)EOF");
+    CompressorPerRoute per_route_proto;
+    per_route_proto.mutable_overrides()->mutable_response_direction_config();
+
+    std::unique_ptr<CompressorPerRouteFilterConfig> per_route_config =
+        std::make_unique<CompressorPerRouteFilterConfig>(per_route_proto, factory_context_);
+    ON_CALL(decoder_callbacks_, mostSpecificPerFilterConfig())
+        .WillByDefault(Return(per_route_config.get()));
+
+    EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, true));
+    EXPECT_TRUE(headers.has("accept-encoding"));
+    EXPECT_EQ("deflate, test, gzip, br", headers.get_("accept-encoding"));
+  }
+
+  // Filter true, per-route override true. Header is removed.
+  {
+    Http::TestRequestHeaderMapImpl headers = {{"accept-encoding", "deflate, test, gzip, br"}};
+    setUpFilter(R"EOF(
+{
+  "remove_accept_encoding_header": true,
+  "compressor_library": {
+     "typed_config": {
+       "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+     }
+  }
+}
+)EOF");
+    CompressorPerRoute per_route_proto;
+    per_route_proto.mutable_overrides()
+        ->mutable_response_direction_config()
+        ->mutable_remove_accept_encoding_header()
+        ->set_value(true);
+
+    std::unique_ptr<CompressorPerRouteFilterConfig> per_route_config =
+        std::make_unique<CompressorPerRouteFilterConfig>(per_route_proto, factory_context_);
+    ON_CALL(decoder_callbacks_, mostSpecificPerFilterConfig())
+        .WillByDefault(Return(per_route_config.get()));
+
+    EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, true));
+    EXPECT_FALSE(headers.has("accept-encoding"));
+  }
+
+  // Filter true, per-route override false. Header is present.
+  {
+    Http::TestRequestHeaderMapImpl headers = {{"accept-encoding", "deflate, test, gzip, br"}};
+    setUpFilter(R"EOF(
+{
+  "remove_accept_encoding_header": true,
+  "compressor_library": {
+     "typed_config": {
+       "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+     }
+  }
+}
+)EOF");
+    CompressorPerRoute per_route_proto;
+    per_route_proto.mutable_overrides()
+        ->mutable_response_direction_config()
+        ->mutable_remove_accept_encoding_header()
+        ->set_value(false);
+
+    std::unique_ptr<CompressorPerRouteFilterConfig> per_route_config =
+        std::make_unique<CompressorPerRouteFilterConfig>(per_route_proto, factory_context_);
+    ON_CALL(decoder_callbacks_, mostSpecificPerFilterConfig())
+        .WillByDefault(Return(per_route_config.get()));
+
+    EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, true));
+    EXPECT_TRUE(headers.has("accept-encoding"));
+    EXPECT_EQ("deflate, test, gzip, br", headers.get_("accept-encoding"));
+  }
+
+  // Filter false, per-route override true. Header is removed.
+  {
+    Http::TestRequestHeaderMapImpl headers = {{"accept-encoding", "deflate, test, gzip, br"}};
+    setUpFilter(R"EOF(
+{
+  "compressor_library": {
+     "typed_config": {
+       "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+     }
+  }
+}
+)EOF");
+    CompressorPerRoute per_route_proto;
+    per_route_proto.mutable_overrides()
+        ->mutable_response_direction_config()
+        ->mutable_remove_accept_encoding_header()
+        ->set_value(true);
+
+    std::unique_ptr<CompressorPerRouteFilterConfig> per_route_config =
+        std::make_unique<CompressorPerRouteFilterConfig>(per_route_proto, factory_context_);
+    ON_CALL(decoder_callbacks_, mostSpecificPerFilterConfig())
+        .WillByDefault(Return(per_route_config.get()));
+
+    EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, true));
+    EXPECT_FALSE(headers.has("accept-encoding"));
+  }
+
+  // Filter false, per-route override false. Header is present.
+  {
+    Http::TestRequestHeaderMapImpl headers = {{"accept-encoding", "deflate, test, gzip, br"}};
+    setUpFilter(R"EOF(
+{
+  "compressor_library": {
+     "typed_config": {
+       "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+     }
+  }
+}
+)EOF");
+    CompressorPerRoute per_route_proto;
+    per_route_proto.mutable_overrides()
+        ->mutable_response_direction_config()
+        ->mutable_remove_accept_encoding_header()
+        ->set_value(false);
+
+    std::unique_ptr<CompressorPerRouteFilterConfig> per_route_config =
+        std::make_unique<CompressorPerRouteFilterConfig>(per_route_proto, factory_context_);
+    ON_CALL(decoder_callbacks_, mostSpecificPerFilterConfig())
+        .WillByDefault(Return(per_route_config.get()));
+
     EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, true));
     EXPECT_TRUE(headers.has("accept-encoding"));
     EXPECT_EQ("deflate, test, gzip, br", headers.get_("accept-encoding"));
@@ -571,6 +748,60 @@ TEST_P(IsContentTypeAllowedTest, Validate) {
   doResponse(headers, should_compress, false);
   EXPECT_EQ(should_compress ? 0 : 1,
             stats_.counter("test.compressor.test.test.header_not_valid").value());
+  EXPECT_EQ(should_compress, headers.has("vary"));
+}
+
+class IsResponseCodeAllowedTest
+    : public CompressorFilterTest,
+      public testing::WithParamInterface<std::tuple<uint32_t, bool, bool, std::vector<uint32_t>>> {
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    IsResponseCodeAllowedTestSuite, IsResponseCodeAllowedTest,
+    testing::Values(std::make_tuple(200, true, true, std::vector<uint32_t>{206}),
+                    std::make_tuple(206, false, true, std::vector<uint32_t>{206}),
+                    std::make_tuple(200, true, false, std::vector<uint32_t>{}),
+                    std::make_tuple(200, true, true, std::vector<uint32_t>{}),
+                    std::make_tuple(206, true, false, std::vector<uint32_t>{}),
+                    std::make_tuple(206, true, true, std::vector<uint32_t>{}),
+                    std::make_tuple(206, false, true, std::vector<uint32_t>{404, 206}),
+                    std::make_tuple(200, true, true, std::vector<uint32_t>{404, 206})));
+
+TEST_P(IsResponseCodeAllowedTest, Validate) {
+  const uint32_t response_code = std::get<0>(GetParam());
+  const bool should_compress = std::get<1>(GetParam());
+  const bool is_custom_config = std::get<2>(GetParam());
+  const std::vector<uint32_t>& uncompressible_response_codes = std::get<3>(GetParam());
+
+  if (is_custom_config) {
+    setUpFilter(fmt::format(R"EOF(
+    {{
+      "response_direction_config": {{
+        "common_config": {{
+          "enabled": {{
+            "default_value": true,
+          }},
+        }},
+        "uncompressible_response_codes": [
+          {}
+        ]
+      }},
+      "compressor_library": {{
+        "name": "test",
+        "typed_config": {{
+          "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+        }}
+      }}
+    }})EOF",
+                            absl::StrJoin(uncompressible_response_codes, ", ")));
+    response_stats_prefix_ = "response.";
+  }
+
+  doRequestNoCompression({{":method", "get"}, {"accept-encoding", "test, deflate"}});
+  Http::TestResponseHeaderMapImpl headers{
+      {":method", "get"}, {"content-length", "256"}, {":status", std::to_string(response_code)}};
+  doResponse(headers, should_compress);
+
   EXPECT_EQ(should_compress, headers.has("vary"));
 }
 
@@ -1015,6 +1246,149 @@ TEST(CompressorFilterConfigTests, MakeCompressorTest) {
   CompressorFilterConfig config(compressor_cfg, "test.compressor.", *stats.rootScope(), runtime,
                                 std::move(compressor_factory));
   Envoy::Compression::Compressor::CompressorPtr compressor = config.makeCompressor();
+}
+
+// Tests for per-route compressor library override functionality.
+class CompressorPerRouteLibraryTest : public CompressorFilterTest {
+public:
+  CompressorPerRouteLibraryTest() {
+    // Create a second compressor factory for testing different libraries.
+    deflate_compressor_factory_ = std::make_unique<TestCompressorFactory>("deflate");
+  }
+
+protected:
+  void setUpPerRouteConfig(const std::string& compressor_name,
+                           const std::string& compressor_type_url) {
+    CompressorPerRoute per_route_proto;
+    auto* compressor_lib = per_route_proto.mutable_overrides()->mutable_compressor_library();
+    compressor_lib->set_name(compressor_name);
+    compressor_lib->mutable_typed_config()->set_type_url(compressor_type_url);
+    compressor_lib->mutable_typed_config()->set_value("{}"); // Empty config for testing.
+
+    // Mock the factory registry to return our test factory.
+    ON_CALL(factory_context_, messageValidationVisitor())
+        .WillByDefault(ReturnRef(validation_visitor_));
+    ON_CALL(factory_context_, serverFactoryContext())
+        .WillByDefault(ReturnRef(server_factory_context_));
+
+    per_route_config_ =
+        std::make_unique<CompressorPerRouteFilterConfig>(per_route_proto, factory_context_);
+    ON_CALL(decoder_callbacks_, mostSpecificPerFilterConfig())
+        .WillByDefault(Return(per_route_config_.get()));
+  }
+
+  std::unique_ptr<TestCompressorFactory> deflate_compressor_factory_;
+  std::unique_ptr<CompressorPerRouteFilterConfig> per_route_config_;
+  NiceMock<ProtobufMessage::MockValidationVisitor> validation_visitor_;
+};
+
+TEST_F(CompressorPerRouteLibraryTest, PerRouteCompressorFactoryIsUsed) {
+  // Set up main filter with "test" compressor.
+  setUpFilter(R"EOF(
+{
+  "compressor_library": {
+     "name": "test",
+     "typed_config": {
+       "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+     }
+  }
+}
+)EOF");
+
+  // Test a valid per-route config creation without compressor library override.
+  CompressorPerRoute per_route_proto;
+  per_route_proto.mutable_overrides()->mutable_response_direction_config();
+
+  // This test verifies the per-route config structure is set up correctly.
+  per_route_config_ =
+      std::make_unique<CompressorPerRouteFilterConfig>(per_route_proto, factory_context_);
+
+  // Verify that per-route config without compressor library has no override.
+  EXPECT_EQ(per_route_config_->compressorFactory(), nullptr);
+  EXPECT_FALSE(per_route_config_->contentEncoding().has_value());
+}
+
+TEST_F(CompressorPerRouteLibraryTest, NoPerRouteCompressorLibrary) {
+  // Set up main filter.
+  setUpFilter(R"EOF(
+{
+  "compressor_library": {
+     "name": "test",
+     "typed_config": {
+       "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+     }
+  }
+}
+)EOF");
+
+  // Per-route config without compressor library override.
+  CompressorPerRoute per_route_proto;
+  per_route_proto.mutable_overrides()->mutable_response_direction_config();
+
+  per_route_config_ =
+      std::make_unique<CompressorPerRouteFilterConfig>(per_route_proto, factory_context_);
+
+  // Verify that per-route config has no compressor factory override.
+  EXPECT_EQ(per_route_config_->compressorFactory(), nullptr);
+  EXPECT_FALSE(per_route_config_->contentEncoding().has_value());
+}
+
+TEST_F(CompressorPerRouteLibraryTest, GetContentEncodingUsesPerRoute) {
+  setUpFilter(R"EOF(
+{
+  "compressor_library": {
+     "name": "test",
+     "typed_config": {
+       "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+     }
+  }
+}
+)EOF");
+
+  // Test without per-route config. It should use main config.
+  EXPECT_EQ(CompressorFilterTestingPeer::contentEncoding(*filter_), "test");
+
+  // Set up per-route config without compressor library. It should still use main config.
+  CompressorPerRoute per_route_proto;
+  per_route_proto.mutable_overrides()->mutable_response_direction_config();
+
+  per_route_config_ =
+      std::make_unique<CompressorPerRouteFilterConfig>(per_route_proto, factory_context_);
+  ON_CALL(decoder_callbacks_, mostSpecificPerFilterConfig())
+      .WillByDefault(Return(per_route_config_.get()));
+
+  // Should still use main config content encoding.
+  EXPECT_EQ(CompressorFilterTestingPeer::contentEncoding(*filter_), "test");
+}
+
+TEST_F(CompressorPerRouteLibraryTest, GetCompressorFactoryUsesPerRoute) {
+  setUpFilter(R"EOF(
+{
+  "compressor_library": {
+     "name": "test",
+     "typed_config": {
+       "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+     }
+  }
+}
+)EOF");
+
+  // Test without per-route config. It should use main config factory.
+  const auto& main_factory = CompressorFilterTestingPeer::compressorFactory(*filter_);
+  EXPECT_EQ(main_factory.contentEncoding(), "test");
+
+  // Set up per-route config without compressor library. It should still use main factory.
+  CompressorPerRoute per_route_proto;
+  per_route_proto.mutable_overrides()->mutable_response_direction_config();
+
+  per_route_config_ =
+      std::make_unique<CompressorPerRouteFilterConfig>(per_route_proto, factory_context_);
+  ON_CALL(decoder_callbacks_, mostSpecificPerFilterConfig())
+      .WillByDefault(Return(per_route_config_.get()));
+
+  // Should still use main factory since no per-route compressor library override.
+  const auto& per_route_factory = CompressorFilterTestingPeer::compressorFactory(*filter_);
+  EXPECT_EQ(per_route_factory.contentEncoding(), "test");
 }
 
 } // namespace

@@ -1,8 +1,8 @@
-load("@envoy//bazel:envoy_build_system.bzl", "envoy_cc_test", "envoy_package")
+load("@envoy//bazel:envoy_build_system.bzl", "envoy_cc_test", "envoy_mobile_package")
 
 licenses(["notice"])  # Apache 2
 
-envoy_package()
+envoy_mobile_package()
 
 envoy_cc_test(
     name = "connectivity_manager_test",
@@ -10,6 +10,7 @@ envoy_cc_test(
     repository = "@envoy",
     deps = [
         "//library/common/network:connectivity_manager_lib",
+        "//test/common/mocks/common:common_mocks",
         "@envoy//test/extensions/common/dynamic_forward_proxy:mocks",
         "@envoy//test/mocks/upstream:cluster_manager_mocks",
     ],

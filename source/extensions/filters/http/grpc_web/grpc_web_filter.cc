@@ -251,6 +251,10 @@ Http::FilterHeadersStatus GrpcWebFilter::encodeHeaders(Http::ResponseHeaderMap& 
   needs_transformation_for_non_proto_encoded_response_ =
       needsTransformationForNonProtoEncodedResponse(headers, end_stream);
 
+  // If upstream sets a content length, we must remove it because we're going to change the
+  // length of the body
+  headers.removeContentLength();
+
   if (is_text_response_) {
     headers.setReferenceContentType(Http::Headers::get().ContentTypeValues.GrpcWebTextProto);
   } else {
@@ -300,7 +304,7 @@ Http::FilterDataStatus GrpcWebFilter::encodeData(Buffer::Instance& data, bool en
   // The decoder always consumes and drains the given buffer. Incomplete data frame is buffered
   // inside the decoder.
   std::vector<Grpc::Frame> frames;
-  decoder_.decode(data, frames);
+  std::ignore = decoder_.decode(data, frames);
   if (frames.empty()) {
     // We don't have enough data to decode for one single frame, stop iteration until more data
     // comes in.

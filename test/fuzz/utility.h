@@ -6,6 +6,7 @@
 #include "source/common/network/resolver_impl.h"
 #include "source/common/network/socket_impl.h"
 #include "source/common/network/utility.h"
+#include "source/common/protobuf/utility.h"
 
 #include "test/common/stream_info/test_util.h"
 #include "test/fuzz/common.pb.h"
@@ -71,7 +72,7 @@ replaceInvalidStringValues(const envoy::config::core::v3::Metadata& upstream_met
     // This clears any invalid characters in string values. It may not be likely a coverage-driven
     // fuzzer will explore recursive structs, so this case is not handled here.
     for (auto& field : *metadata_struct.second.mutable_fields()) {
-      if (field.second.kind_case() == ProtobufWkt::Value::kStringValue) {
+      if (field.second.kind_case() == Protobuf::Value::kStringValue) {
         field.second.set_string_value(replaceInvalidCharacters(field.second.string_value()));
       }
     }
@@ -151,7 +152,7 @@ inline std::unique_ptr<TestStreamInfo> fromStreamInfo(const test::fuzz::StreamIn
           : stream_info.start_time() / 1000;
   test_stream_info->start_time_ = SystemTime(std::chrono::microseconds(start_time));
   if (stream_info.has_response_code()) {
-    test_stream_info->response_code_ = stream_info.response_code().value();
+    test_stream_info->setResponseCode(stream_info.response_code().value());
   }
   auto upstream_host = std::make_shared<NiceMock<Upstream::MockHostDescription>>();
   auto upstream_metadata = std::make_shared<envoy::config::core::v3::Metadata>(
@@ -170,15 +171,22 @@ inline std::unique_ptr<TestStreamInfo> fromStreamInfo(const test::fuzz::StreamIn
           replaceInvalidHostCharacters(
               stream_info.address().envoy_internal_address().server_listener_name()));
     } else {
-      address = Envoy::Network::Address::resolveProtoAddress(stream_info.address());
+      auto address_or_error = Envoy::Network::Address::resolveProtoAddress(stream_info.address());
+      THROW_IF_NOT_OK_REF(address_or_error.status());
+      address = address_or_error.value();
     }
   } else {
-    address = Network::Utility::resolveUrl("tcp://10.0.0.1:443");
+    address = *Network::Utility::resolveUrl("tcp://10.0.0.1:443");
   }
-  auto upstream_local_address =
-      stream_info.has_upstream_local_address()
-          ? Envoy::Network::Address::resolveProtoAddress(stream_info.upstream_local_address())
-          : Network::Utility::resolveUrl("tcp://10.0.0.1:10000");
+  Envoy::Network::Address::InstanceConstSharedPtr upstream_local_address;
+  if (stream_info.has_upstream_local_address()) {
+    auto upstream_local_address_or_error =
+        Envoy::Network::Address::resolveProtoAddress(stream_info.upstream_local_address());
+    THROW_IF_NOT_OK_REF(upstream_local_address_or_error.status());
+    upstream_local_address = upstream_local_address_or_error.value();
+  } else {
+    upstream_local_address = *Network::Utility::resolveUrl("tcp://10.0.0.1:10000");
+  }
   test_stream_info->upstreamInfo()->setUpstreamLocalAddress(upstream_local_address);
   test_stream_info->downstream_connection_info_provider_ =
       std::make_shared<Network::ConnectionInfoSetterImpl>(address, address);
@@ -201,8 +209,8 @@ inline std::vector<std::string> parseHttpData(const test::fuzz::HttpData& data) 
       data_chunks.push_back(http_data);
     }
   } else if (data.has_proto_body()) {
-    const std::string serialized = data.proto_body().message().value();
-    data_chunks = absl::StrSplit(serialized, absl::ByLength(data.proto_body().chunk_size()));
+    data_chunks = absl::StrSplit(MessageUtil::bytesToString(data.proto_body().message().value()),
+                                 absl::ByLength(data.proto_body().chunk_size()));
   }
 
   return data_chunks;

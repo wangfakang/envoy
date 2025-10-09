@@ -18,7 +18,6 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
-using Envoy::Http::HeaderValueOf;
 using testing::_;
 using testing::ReturnRef;
 
@@ -57,10 +56,11 @@ TEST_F(ReverseBridgeTest, InvalidGrpcRequest) {
                                             {":path", "/testing.ExampleService/SendData"}});
     EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, false));
 
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/x-protobuf"));
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentLength, "20"));
     EXPECT_THAT(headers,
-                HeaderValueOf(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
+                ContainsHeader(Http::Headers::get().ContentType, "application/x-protobuf"));
+    EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentLength, "20"));
+    EXPECT_THAT(headers,
+                ContainsHeader(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
   }
 
   {
@@ -69,11 +69,11 @@ TEST_F(ReverseBridgeTest, InvalidGrpcRequest) {
     buffer.add("abc", 3);
     EXPECT_CALL(decoder_callbacks_, sendLocalReply(_, _, _, _, _));
     EXPECT_CALL(decoder_callbacks_, encodeHeaders_(_, _)).WillOnce(Invoke([](auto& headers, auto) {
-      EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().Status, "200"));
-      EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().GrpcStatus, "2"));
+      EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().Status, "200"));
+      EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().GrpcStatus, "2"));
       EXPECT_THAT(headers,
-                  HeaderValueOf(Http::Headers::get().GrpcMessage,
-                                Http::Utility::PercentEncoding::encode("invalid request body")));
+                  ContainsHeader(Http::Headers::get().GrpcMessage,
+                                 Http::Utility::PercentEncoding::encode("invalid request body")));
     }));
     EXPECT_EQ(Http::FilterDataStatus::StopIterationNoBuffer, filter_->decodeData(buffer, false));
     EXPECT_EQ(decoder_callbacks_.details(), "grpc_bridge_data_too_small");
@@ -92,8 +92,8 @@ TEST_F(ReverseBridgeTest, HeaderOnlyGrpcRequest) {
     EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, true));
 
     // Verify that headers are unmodified.
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/grpc"));
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentLength, "25"));
+    EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentType, "application/grpc"));
+    EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentLength, "25"));
   }
 
   // Verify no modification on encoding path as well.
@@ -101,8 +101,8 @@ TEST_F(ReverseBridgeTest, HeaderOnlyGrpcRequest) {
       {{"content-type", "application/grpc"}, {"content-length", "20"}});
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->encodeHeaders(headers, true));
   // Ensure we didn't mutate content type or length.
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/grpc"));
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentLength, "20"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentType, "application/grpc"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentLength, "20"));
 
   // We should not drain the buffer, nor stop iteration.
   Envoy::Buffer::OwnedImpl buffer;
@@ -121,8 +121,8 @@ TEST_F(ReverseBridgeTest, NoGrpcRequest) {
         {{"content-type", "application/json"}, {"content-length", "10"}});
     EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, false));
     // Ensure we didn't mutate content type or length.
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/json"));
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentLength, "10"));
+    EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentType, "application/json"));
+    EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentLength, "10"));
   }
 
   {
@@ -140,8 +140,8 @@ TEST_F(ReverseBridgeTest, NoGrpcRequest) {
         {{"content-type", "application/json"}, {"content-length", "20"}});
     EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->encodeHeaders(headers, false));
     // Ensure we didn't mutate content type or length.
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/json"));
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentLength, "20"));
+    EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentType, "application/json"));
+    EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentLength, "20"));
   }
 
   Envoy::Buffer::OwnedImpl buffer;
@@ -154,8 +154,8 @@ TEST_F(ReverseBridgeTest, NoGrpcRequest) {
       {{"content-type", "application/grpc"}, {"content-length", "20"}});
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->encodeHeaders(headers, true));
   // Ensure we didn't mutate content type or length.
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/grpc"));
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentLength, "20"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentType, "application/grpc"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentLength, "20"));
 }
 
 // Verifies that if we receive a gRPC request but have configured the filter to not handle the gRPC
@@ -172,10 +172,11 @@ TEST_F(ReverseBridgeTest, GrpcRequestNoManageFrameHeader) {
                                             {":path", "/testing.ExampleService/SendData"}});
     EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, false));
 
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/x-protobuf"));
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentLength, "25"));
     EXPECT_THAT(headers,
-                HeaderValueOf(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
+                ContainsHeader(Http::Headers::get().ContentType, "application/x-protobuf"));
+    EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentLength, "25"));
+    EXPECT_THAT(headers,
+                ContainsHeader(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
   }
 
   {
@@ -195,8 +196,8 @@ TEST_F(ReverseBridgeTest, GrpcRequestNoManageFrameHeader) {
   Http::TestResponseHeaderMapImpl headers(
       {{":status", "200"}, {"content-length", "30"}, {"content-type", "application/x-protobuf"}});
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->encodeHeaders(headers, false));
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/grpc"));
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentLength, "30"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentType, "application/grpc"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentLength, "30"));
 
   {
     // We should not drain the buffer, nor stop iteration.
@@ -215,7 +216,7 @@ TEST_F(ReverseBridgeTest, GrpcRequestNoManageFrameHeader) {
     buffer.add("ghj", 3);
     EXPECT_EQ(Http::FilterDataStatus::Continue, filter_->encodeData(buffer, true));
     EXPECT_EQ(3, buffer.length());
-    EXPECT_THAT(trailers, HeaderValueOf(Http::Headers::get().GrpcStatus, "0"));
+    EXPECT_THAT(trailers, ContainsHeader(Http::Headers::get().GrpcStatus, "0"));
   }
 }
 
@@ -233,10 +234,11 @@ TEST_F(ReverseBridgeTest, GrpcRequest) {
                                             {":path", "/testing.ExampleService/SendData"}});
     EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, false));
 
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/x-protobuf"));
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentLength, "20"));
     EXPECT_THAT(headers,
-                HeaderValueOf(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
+                ContainsHeader(Http::Headers::get().ContentType, "application/x-protobuf"));
+    EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentLength, "20"));
+    EXPECT_THAT(headers,
+                ContainsHeader(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
   }
 
   {
@@ -263,8 +265,8 @@ TEST_F(ReverseBridgeTest, GrpcRequest) {
   Http::TestResponseHeaderMapImpl headers(
       {{":status", "200"}, {"content-length", "30"}, {"content-type", "application/x-protobuf"}});
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->encodeHeaders(headers, false));
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/grpc"));
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentLength, "35"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentType, "application/grpc"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentLength, "35"));
 
   {
     // First few calls should drain the buffer
@@ -289,11 +291,11 @@ TEST_F(ReverseBridgeTest, GrpcRequest) {
     buffer.add("ghj", 4);
     EXPECT_EQ(Http::FilterDataStatus::Continue, filter_->encodeData(buffer, true));
     EXPECT_EQ(17, buffer.length());
-    EXPECT_THAT(trailers, HeaderValueOf(Http::Headers::get().GrpcStatus, "0"));
+    EXPECT_THAT(trailers, ContainsHeader(Http::Headers::get().GrpcStatus, "0"));
 
     Grpc::Decoder decoder;
     std::vector<Grpc::Frame> frames;
-    decoder.decode(buffer, frames);
+    std::ignore = decoder.decode(buffer, frames);
 
     EXPECT_EQ(1, frames.size());
     EXPECT_EQ(12, frames[0].length_);
@@ -314,9 +316,10 @@ TEST_F(ReverseBridgeTest, GrpcRequestNoContentLength) {
         {{"content-type", "application/grpc"}, {":path", "/testing.ExampleService/SendData"}});
     EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, false));
 
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/x-protobuf"));
     EXPECT_THAT(headers,
-                HeaderValueOf(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
+                ContainsHeader(Http::Headers::get().ContentType, "application/x-protobuf"));
+    EXPECT_THAT(headers,
+                ContainsHeader(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
     // Ensure that we don't insert a content-length header.
     EXPECT_EQ(nullptr, headers.ContentLength());
   }
@@ -345,7 +348,7 @@ TEST_F(ReverseBridgeTest, GrpcRequestNoContentLength) {
   Http::TestResponseHeaderMapImpl headers(
       {{":status", "200"}, {"content-type", "application/x-protobuf"}});
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->encodeHeaders(headers, false));
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/grpc"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentType, "application/grpc"));
   // Ensure that we don't insert a content-length header.
   EXPECT_EQ(nullptr, headers.ContentLength());
 
@@ -372,19 +375,20 @@ TEST_F(ReverseBridgeTest, GrpcRequestNoContentLength) {
     buffer.add("ghj", 4);
     EXPECT_EQ(Http::FilterDataStatus::Continue, filter_->encodeData(buffer, true));
     EXPECT_EQ(17, buffer.length());
-    EXPECT_THAT(trailers, HeaderValueOf(Http::Headers::get().GrpcStatus, "0"));
+    EXPECT_THAT(trailers, ContainsHeader(Http::Headers::get().GrpcStatus, "0"));
 
     Grpc::Decoder decoder;
     std::vector<Grpc::Frame> frames;
-    decoder.decode(buffer, frames);
+    std::ignore = decoder.decode(buffer, frames);
 
     EXPECT_EQ(1, frames.size());
     EXPECT_EQ(12, frames[0].length_);
   }
 }
 
-// Regression tests that header-only responses do not get the content-length
-// adjusted (https://github.com/envoyproxy/envoy/issues/11099)
+// Regression tests that header-only responses get the gRPC frame appended and
+// content-length header adjusted, as well as trailers added.
+// (https://github.com/envoyproxy/envoy/issues/29989).
 TEST_F(ReverseBridgeTest, GrpcRequestHeaderOnlyResponse) {
   initialize();
   decoder_callbacks_.is_grpc_request_ = true;
@@ -397,10 +401,11 @@ TEST_F(ReverseBridgeTest, GrpcRequestHeaderOnlyResponse) {
                                             {":path", "/testing.ExampleService/SendData"}});
     EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, false));
 
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/x-protobuf"));
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentLength, "20"));
     EXPECT_THAT(headers,
-                HeaderValueOf(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
+                ContainsHeader(Http::Headers::get().ContentType, "application/x-protobuf"));
+    EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentLength, "20"));
+    EXPECT_THAT(headers,
+                ContainsHeader(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
   }
 
   {
@@ -424,11 +429,17 @@ TEST_F(ReverseBridgeTest, GrpcRequestHeaderOnlyResponse) {
     EXPECT_EQ(Http::FilterTrailersStatus::Continue, filter_->decodeTrailers(trailers));
   }
 
+  // call should prefix the buffer with the gRPC frame header and insert the
+  // gRPC status into trailers.
+  EXPECT_CALL(encoder_callbacks_, addEncodedData(_, false));
+  Http::TestResponseTrailerMapImpl trailers;
+  EXPECT_CALL(encoder_callbacks_, addEncodedTrailers()).WillOnce(ReturnRef(trailers));
+
   Http::TestResponseHeaderMapImpl headers(
       {{":status", "200"}, {"content-length", "0"}, {"content-type", "application/x-protobuf"}});
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->encodeHeaders(headers, true));
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/grpc"));
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentLength, "0"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentType, "application/grpc"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentLength, "5"));
 }
 
 // Tests that a gRPC is downgraded to application/x-protobuf and upgraded back
@@ -444,9 +455,10 @@ TEST_F(ReverseBridgeTest, GrpcRequestInternalError) {
     Http::TestRequestHeaderMapImpl headers(
         {{"content-type", "application/grpc"}, {":path", "/testing.ExampleService/SendData"}});
     EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, false));
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/x-protobuf"));
     EXPECT_THAT(headers,
-                HeaderValueOf(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
+                ContainsHeader(Http::Headers::get().ContentType, "application/x-protobuf"));
+    EXPECT_THAT(headers,
+                ContainsHeader(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
   }
 
   {
@@ -473,7 +485,8 @@ TEST_F(ReverseBridgeTest, GrpcRequestInternalError) {
   Http::TestResponseHeaderMapImpl headers(
       {{":status", "400"}, {"content-type", "application/x-protobuf"}});
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->encodeHeaders(headers, false));
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/grpc"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentType, "application/grpc"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().Status, "200"));
 
   {
     // First few calls should drain the buffer
@@ -497,11 +510,11 @@ TEST_F(ReverseBridgeTest, GrpcRequestInternalError) {
     Envoy::Buffer::OwnedImpl buffer;
     buffer.add("ghj", 4);
     EXPECT_EQ(Http::FilterDataStatus::Continue, filter_->encodeData(buffer, true));
-    EXPECT_THAT(trailers, HeaderValueOf(Http::Headers::get().GrpcStatus, "13"));
+    EXPECT_THAT(trailers, ContainsHeader(Http::Headers::get().GrpcStatus, "13"));
 
     Grpc::Decoder decoder;
     std::vector<Grpc::Frame> frames;
-    decoder.decode(buffer, frames);
+    std::ignore = decoder.decode(buffer, frames);
 
     EXPECT_EQ(1, frames.size());
     EXPECT_EQ(12, frames[0].length_);
@@ -520,9 +533,10 @@ TEST_F(ReverseBridgeTest, GrpcRequestBadResponseNoContentType) {
     Http::TestRequestHeaderMapImpl headers(
         {{"content-type", "application/grpc"}, {":path", "/testing.ExampleService/SendData"}});
     EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, false));
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/x-protobuf"));
     EXPECT_THAT(headers,
-                HeaderValueOf(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
+                ContainsHeader(Http::Headers::get().ContentType, "application/x-protobuf"));
+    EXPECT_THAT(headers,
+                ContainsHeader(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
   }
 
   {
@@ -567,9 +581,10 @@ TEST_F(ReverseBridgeTest, GrpcRequestBadResponse) {
     Http::TestRequestHeaderMapImpl headers(
         {{"content-type", "application/grpc"}, {":path", "/testing.ExampleService/SendData"}});
     EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, false));
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/x-protobuf"));
     EXPECT_THAT(headers,
-                HeaderValueOf(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
+                ContainsHeader(Http::Headers::get().ContentType, "application/x-protobuf"));
+    EXPECT_THAT(headers,
+                ContainsHeader(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
   }
 
   {
@@ -626,10 +641,10 @@ TEST_F(ReverseBridgeTest, FilterConfigPerRouteDisabled) {
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, false));
 
   // Verify that headers are unmodified.
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/grpc"));
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentLength, "25"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentType, "application/grpc"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentLength, "25"));
   EXPECT_THAT(headers,
-              HeaderValueOf(Http::Headers::get().Path, "/testing.ExampleService/SendData"));
+              ContainsHeader(Http::Headers::get().Path, "/testing.ExampleService/SendData"));
 }
 
 // Tests that a gRPC is downgraded to application/x-protobuf and upgraded back
@@ -654,10 +669,11 @@ TEST_F(ReverseBridgeTest, FilterConfigPerRouteEnabled) {
                                             {":path", "/testing.ExampleService/SendData"}});
     EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, false));
 
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/x-protobuf"));
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentLength, "20"));
     EXPECT_THAT(headers,
-                HeaderValueOf(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
+                ContainsHeader(Http::Headers::get().ContentType, "application/x-protobuf"));
+    EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentLength, "20"));
+    EXPECT_THAT(headers,
+                ContainsHeader(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
   }
 
   {
@@ -684,8 +700,8 @@ TEST_F(ReverseBridgeTest, FilterConfigPerRouteEnabled) {
   Http::TestResponseHeaderMapImpl headers(
       {{":status", "200"}, {"content-length", "30"}, {"content-type", "application/x-protobuf"}});
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->encodeHeaders(headers, false));
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/grpc"));
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentLength, "35"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentType, "application/grpc"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentLength, "35"));
 
   {
     // First few calls should drain the buffer
@@ -710,11 +726,11 @@ TEST_F(ReverseBridgeTest, FilterConfigPerRouteEnabled) {
     buffer.add("ghj", 4);
     EXPECT_EQ(Http::FilterDataStatus::Continue, filter_->encodeData(buffer, true));
     EXPECT_EQ(17, buffer.length());
-    EXPECT_THAT(trailers, HeaderValueOf(Http::Headers::get().GrpcStatus, "0"));
+    EXPECT_THAT(trailers, ContainsHeader(Http::Headers::get().GrpcStatus, "0"));
 
     Grpc::Decoder decoder;
     std::vector<Grpc::Frame> frames;
-    decoder.decode(buffer, frames);
+    std::ignore = decoder.decode(buffer, frames);
 
     EXPECT_EQ(1, frames.size());
     EXPECT_EQ(12, frames[0].length_);
@@ -740,10 +756,11 @@ TEST_F(ReverseBridgeTest, RouteWithTrailers) {
                                             {"content-length", "25"},
                                             {":path", "/testing.ExampleService/SendData"}});
     EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, false));
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/x-protobuf"));
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentLength, "20"));
     EXPECT_THAT(headers,
-                HeaderValueOf(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
+                ContainsHeader(Http::Headers::get().ContentType, "application/x-protobuf"));
+    EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentLength, "20"));
+    EXPECT_THAT(headers,
+                ContainsHeader(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
   }
 
   {
@@ -762,8 +779,8 @@ TEST_F(ReverseBridgeTest, RouteWithTrailers) {
   Http::TestResponseHeaderMapImpl headers(
       {{":status", "200"}, {"content-length", "30"}, {"content-type", "application/x-protobuf"}});
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->encodeHeaders(headers, false));
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/grpc"));
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentLength, "35"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentType, "application/grpc"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentLength, "35"));
 
   {
     // First few calls should drain the buffer
@@ -787,11 +804,11 @@ TEST_F(ReverseBridgeTest, RouteWithTrailers) {
         .WillOnce(Invoke([&](Envoy::Buffer::Instance& buf, bool) -> void { buffer.move(buf); }));
     Http::TestResponseTrailerMapImpl trailers({{"foo", "bar"}, {"one", "two"}, {"three", "four"}});
     EXPECT_EQ(Http::FilterTrailersStatus::Continue, filter_->encodeTrailers(trailers));
-    EXPECT_THAT(trailers, HeaderValueOf(Http::Headers::get().GrpcStatus, "0"));
+    EXPECT_THAT(trailers, ContainsHeader(Http::Headers::get().GrpcStatus, "0"));
 
     Grpc::Decoder decoder;
     std::vector<Grpc::Frame> frames;
-    decoder.decode(buffer, frames);
+    std::ignore = decoder.decode(buffer, frames);
 
     EXPECT_EQ(4, trailers.size());
     EXPECT_EQ(1, frames.size());
@@ -813,10 +830,11 @@ TEST_F(ReverseBridgeTest, WithholdGrpcStreamResponse) {
                                             {":path", "/testing.ExampleService/SendData"}});
     EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, false));
 
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/x-protobuf"));
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentLength, "20"));
     EXPECT_THAT(headers,
-                HeaderValueOf(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
+                ContainsHeader(Http::Headers::get().ContentType, "application/x-protobuf"));
+    EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentLength, "20"));
+    EXPECT_THAT(headers,
+                ContainsHeader(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
   }
 
   {
@@ -846,8 +864,8 @@ TEST_F(ReverseBridgeTest, WithholdGrpcStreamResponse) {
        {"custom-content-length", "8"},
        {"content-type", "application/x-protobuf"}});
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->encodeHeaders(headers, false));
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/grpc"));
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentLength, "13"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentType, "application/grpc"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentLength, "13"));
 
   {
     // The response data should be streamed to the client instead of buffered. Additionally, the
@@ -867,7 +885,7 @@ TEST_F(ReverseBridgeTest, WithholdGrpcStreamResponse) {
     buffer.add("ghj", 4);
     EXPECT_EQ(Http::FilterDataStatus::Continue, filter_->encodeData(buffer, true));
     EXPECT_EQ(4, buffer.length());
-    EXPECT_THAT(trailers, HeaderValueOf(Http::Headers::get().GrpcStatus, "0"));
+    EXPECT_THAT(trailers, ContainsHeader(Http::Headers::get().GrpcStatus, "0"));
   }
 }
 
@@ -883,9 +901,10 @@ TEST_F(ReverseBridgeTest, WithholdGrpcStreamResponseNoContentLength) {
     Http::TestRequestHeaderMapImpl headers(
         {{"content-type", "application/grpc"}, {":path", "/testing.ExampleService/SendData"}});
     EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, false));
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/x-protobuf"));
     EXPECT_THAT(headers,
-                HeaderValueOf(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
+                ContainsHeader(Http::Headers::get().ContentType, "application/x-protobuf"));
+    EXPECT_THAT(headers,
+                ContainsHeader(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
   }
 
   {
@@ -930,9 +949,10 @@ TEST_F(ReverseBridgeTest, WithholdGrpcStreamResponseWrongContentLength) {
     Http::TestRequestHeaderMapImpl headers(
         {{"content-type", "application/grpc"}, {":path", "/testing.ExampleService/SendData"}});
     EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers, false));
-    EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/x-protobuf"));
     EXPECT_THAT(headers,
-                HeaderValueOf(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
+                ContainsHeader(Http::Headers::get().ContentType, "application/x-protobuf"));
+    EXPECT_THAT(headers,
+                ContainsHeader(Http::CustomHeaders::get().Accept, "application/x-protobuf"));
   }
 
   {
@@ -962,8 +982,8 @@ TEST_F(ReverseBridgeTest, WithholdGrpcStreamResponseWrongContentLength) {
        {"content-type", "application/x-protobuf"}});
 
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->encodeHeaders(headers, false));
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentType, "application/grpc"));
-  EXPECT_THAT(headers, HeaderValueOf(Http::Headers::get().ContentLength, "35"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentType, "application/grpc"));
+  EXPECT_THAT(headers, ContainsHeader(Http::Headers::get().ContentLength, "35"));
 
   {
     // The response data should be streamed to the client instead of buffered. Additionally, the
@@ -988,7 +1008,7 @@ TEST_F(ReverseBridgeTest, WithholdGrpcStreamResponseWrongContentLength) {
             absl::make_optional(static_cast<Grpc::Status::GrpcStatus>(Grpc::Status::Internal)), _));
     EXPECT_EQ(Http::FilterDataStatus::StopIterationNoBuffer, filter_->encodeData(buffer, true));
     EXPECT_EQ(4, buffer.length());
-    EXPECT_THAT(trailers, HeaderValueOf(Http::Headers::get().GrpcStatus, "0"));
+    EXPECT_THAT(trailers, ContainsHeader(Http::Headers::get().GrpcStatus, "0"));
   }
 }
 } // namespace

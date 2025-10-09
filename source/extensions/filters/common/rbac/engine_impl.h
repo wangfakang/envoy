@@ -19,6 +19,8 @@ class DynamicMetadataKeys {
 public:
   const std::string ShadowEffectivePolicyIdField{"shadow_effective_policy_id"};
   const std::string ShadowEngineResultField{"shadow_engine_result"};
+  const std::string EnforcedEffectivePolicyIdField{"enforced_effective_policy_id"};
+  const std::string EnforcedEngineResultField{"enforced_engine_result"};
   const std::string EngineResultAllowed{"allowed"};
   const std::string EngineResultDenied{"denied"};
   const std::string AccessLogKey{"access_log_hint"};
@@ -48,9 +50,9 @@ private:
 
 class ActionFactory : public Envoy::Matcher::ActionFactory<ActionContext> {
 public:
-  Envoy::Matcher::ActionFactoryCb
-  createActionFactoryCb(const Protobuf::Message& config, ActionContext& context,
-                        ProtobufMessage::ValidationVisitor& validation_visitor) override;
+  Envoy::Matcher::ActionConstSharedPtr
+  createAction(const Protobuf::Message& config, ActionContext& context,
+               ProtobufMessage::ValidationVisitor& validation_visitor) override;
   std::string name() const override { return "envoy.filters.rbac.action"; }
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
     return std::make_unique<envoy::config::rbac::v3::Action>();
@@ -65,6 +67,7 @@ class RoleBasedAccessControlEngineImpl : public RoleBasedAccessControlEngine, No
 public:
   RoleBasedAccessControlEngineImpl(const envoy::config::rbac::v3::RBAC& rules,
                                    ProtobufMessage::ValidationVisitor& validation_visitor,
+                                   Server::Configuration::CommonFactoryContext& context,
                                    const EnforcementMode mode = EnforcementMode::Enforced);
 
   bool handleAction(const Network::Connection& connection,
@@ -85,8 +88,13 @@ private:
 
   std::map<std::string, std::unique_ptr<PolicyMatcher>> policies_;
 
-  Protobuf::Arena constant_arena_;
-  Expr::BuilderPtr builder_;
+  // Encapsulated the CEL expression builder with the arena, that will only be
+  // allocated if CEL is configured.
+  struct ExprBuilderWithArena {
+    Protobuf::Arena constant_arena_;
+    Expr::BuilderInstanceSharedPtr builder_;
+  };
+  std::unique_ptr<ExprBuilderWithArena> builder_with_arena_;
 };
 
 class RoleBasedAccessControlMatcherEngineImpl : public RoleBasedAccessControlEngine, NonCopyable {

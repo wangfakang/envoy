@@ -1,6 +1,7 @@
 #include <memory>
 
 #include "source/extensions/filters/http/stateful_session/stateful_session.h"
+#include "source/server/generic_factory_context.h"
 
 #include "test/mocks/http/mocks.h"
 #include "test/mocks/http/stateful_session.h"
@@ -32,8 +33,10 @@ public:
     ASSERT(!config.empty());
     ProtoConfig proto_config;
     TestUtility::loadFromYaml(std::string(config), proto_config);
+    Envoy::Server::GenericFactoryContextImpl generic_context(context_);
 
-    config_ = std::make_shared<StatefulSessionConfig>(proto_config, context_);
+    config_ = std::make_shared<StatefulSessionConfig>(proto_config, generic_context, "",
+                                                      context_.scope());
 
     filter_ = std::make_shared<StatefulSession>(config_);
     filter_->setDecoderFilterCallbacks(decoder_callbacks_);
@@ -49,7 +52,8 @@ public:
             .WillOnce(Return(route_factory_));
       }
 
-      route_config_ = std::make_shared<PerRouteStatefulSession>(proto_route_config, context_);
+      route_config_ =
+          std::make_shared<PerRouteStatefulSession>(proto_route_config, generic_context);
 
       ON_CALL(*decoder_callbacks_.route_, mostSpecificPerFilterConfig(_))
           .WillByDefault(Return(route_config_.get()));
@@ -101,7 +105,9 @@ TEST_F(StatefulSessionTest, NormalSessionStateTest) {
   EXPECT_CALL(*raw_session_state, upstreamAddress())
       .WillOnce(Return(absl::make_optional<absl::string_view>("1.2.3.4")));
   EXPECT_CALL(decoder_callbacks_, setUpstreamOverrideHost(_))
-      .WillOnce(testing::Invoke([&](absl::string_view host) { EXPECT_EQ("1.2.3.4", host); }));
+      .WillOnce(testing::Invoke([&](Upstream::LoadBalancerContext::OverrideHost host) {
+        EXPECT_EQ("1.2.3.4", host.first);
+      }));
 
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers, true));
 
@@ -139,7 +145,9 @@ TEST_F(StatefulSessionTest, SessionStateOverrideByRoute) {
   EXPECT_CALL(*raw_session_state, upstreamAddress())
       .WillOnce(Return(absl::make_optional<absl::string_view>("1.2.3.4")));
   EXPECT_CALL(decoder_callbacks_, setUpstreamOverrideHost(_))
-      .WillOnce(testing::Invoke([&](absl::string_view host) { EXPECT_EQ("1.2.3.4", host); }));
+      .WillOnce(testing::Invoke([&](Upstream::LoadBalancerContext::OverrideHost host) {
+        EXPECT_EQ("1.2.3.4", host.first);
+      }));
 
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers, true));
 
@@ -181,7 +189,9 @@ TEST_F(StatefulSessionTest, NoUpstreamHost) {
   EXPECT_CALL(*raw_session_state, upstreamAddress())
       .WillOnce(Return(absl::make_optional<absl::string_view>("1.2.3.4")));
   EXPECT_CALL(decoder_callbacks_, setUpstreamOverrideHost(_))
-      .WillOnce(testing::Invoke([&](absl::string_view host) { EXPECT_EQ("1.2.3.4", host); }));
+      .WillOnce(testing::Invoke([&](Upstream::LoadBalancerContext::OverrideHost host) {
+        EXPECT_EQ("1.2.3.4", host.first);
+      }));
 
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers, true));
 
@@ -208,13 +218,125 @@ TEST_F(StatefulSessionTest, NullSessionState) {
 
 TEST(EmpytProtoConfigTest, EmpytProtoConfigTest) {
   ProtoConfig empty_proto_config;
-  testing::NiceMock<Server::Configuration::MockServerFactoryContext> server_context;
+  testing::NiceMock<Server::Configuration::MockFactoryContext> context;
 
-  StatefulSessionConfig config(empty_proto_config, server_context);
+  StatefulSessionConfig config(empty_proto_config, context, "", context.scope());
 
   Http::TestRequestHeaderMapImpl request_headers{
       {":path", "/"}, {":method", "GET"}, {":authority", "test.com"}};
   EXPECT_EQ(nullptr, config.createSessionState(request_headers));
+}
+
+// Test stats functionality.
+TEST_F(StatefulSessionTest, StatsRouted) {
+  const std::string config_with_stats = R"EOF(
+session_state:
+  name: envoy.http.stateful_session.mock
+  typed_config:
+    "@type": type.googleapis.com/google.protobuf.Struct
+stat_prefix: "test"
+)EOF";
+  initialize(config_with_stats);
+  Http::TestRequestHeaderMapImpl request_headers{
+      {":path", "/"}, {":method", "GET"}, {":authority", "test.com"}};
+  Http::TestResponseHeaderMapImpl response_headers{{":status", "200"}};
+
+  auto raw_session_state = new testing::NiceMock<Http::MockSessionState>();
+  EXPECT_CALL(*factory_, create(_))
+      .WillOnce(Return(testing::ByMove(std::unique_ptr<Http::SessionState>(raw_session_state))));
+  EXPECT_CALL(*raw_session_state, upstreamAddress())
+      .WillOnce(Return(absl::make_optional<absl::string_view>("127.0.0.1:8080")));
+
+  // Initial stats should be zero.
+  EXPECT_EQ(0, context_.scope().counterFromString("stateful_session.test.routed").value());
+  EXPECT_EQ(0, context_.scope().counterFromString("stateful_session.test.failed_open").value());
+  EXPECT_EQ(0, context_.scope().counterFromString("stateful_session.test.failed_closed").value());
+
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers, true));
+
+  // Mock that the host didn't change (successful routing).
+  EXPECT_CALL(*raw_session_state, onUpdate(_, _)).WillOnce(::testing::Return(false));
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->encodeHeaders(response_headers, true));
+
+  // Verify routed counter incremented.
+  EXPECT_EQ(1, context_.scope().counterFromString("stateful_session.test.routed").value());
+  EXPECT_EQ(0, context_.scope().counterFromString("stateful_session.test.failed_open").value());
+  EXPECT_EQ(0, context_.scope().counterFromString("stateful_session.test.failed_closed").value());
+}
+
+TEST_F(StatefulSessionTest, StatsFailedOpen) {
+  const std::string config_with_stats = R"EOF(
+session_state:
+  name: envoy.http.stateful_session.mock
+  typed_config:
+    "@type": type.googleapis.com/google.protobuf.Struct
+stat_prefix: "test"
+)EOF";
+  initialize(config_with_stats);
+  Http::TestRequestHeaderMapImpl request_headers{
+      {":path", "/"}, {":method", "GET"}, {":authority", "test.com"}};
+  Http::TestResponseHeaderMapImpl response_headers{{":status", "200"}};
+
+  auto raw_session_state = new testing::NiceMock<Http::MockSessionState>();
+  EXPECT_CALL(*factory_, create(_))
+      .WillOnce(Return(testing::ByMove(std::unique_ptr<Http::SessionState>(raw_session_state))));
+  EXPECT_CALL(*raw_session_state, upstreamAddress())
+      .WillOnce(Return(absl::make_optional<absl::string_view>("127.0.0.1:8080")));
+
+  // Initial stats should be zero.
+  EXPECT_EQ(0, context_.scope().counterFromString("stateful_session.test.routed").value());
+  EXPECT_EQ(0, context_.scope().counterFromString("stateful_session.test.failed_open").value());
+  EXPECT_EQ(0, context_.scope().counterFromString("stateful_session.test.failed_closed").value());
+
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers, true));
+
+  // Mock that the host changed (failed override, fallback occurred).
+  EXPECT_CALL(*raw_session_state, onUpdate(_, _)).WillOnce(::testing::Return(true));
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->encodeHeaders(response_headers, true));
+
+  // Verify failed_open counter incremented.
+  EXPECT_EQ(0, context_.scope().counterFromString("stateful_session.test.routed").value());
+  EXPECT_EQ(1, context_.scope().counterFromString("stateful_session.test.failed_open").value());
+  EXPECT_EQ(0, context_.scope().counterFromString("stateful_session.test.failed_closed").value());
+}
+
+TEST_F(StatefulSessionTest, StatsFailedClosed) {
+  const std::string strict_config = R"EOF(
+session_state:
+  name: envoy.http.stateful_session.mock
+  typed_config:
+    "@type": type.googleapis.com/google.protobuf.Struct
+strict: true
+stat_prefix: "test"
+)EOF";
+
+  initialize(strict_config);
+  Http::TestRequestHeaderMapImpl request_headers{
+      {":path", "/"}, {":method", "GET"}, {":authority", "test.com"}};
+  Http::TestResponseHeaderMapImpl response_headers{{":status", "503"}};
+
+  auto raw_session_state = new testing::NiceMock<Http::MockSessionState>();
+  EXPECT_CALL(*factory_, create(_))
+      .WillOnce(Return(testing::ByMove(std::unique_ptr<Http::SessionState>(raw_session_state))));
+  EXPECT_CALL(*raw_session_state, upstreamAddress())
+      .WillOnce(Return(absl::make_optional<absl::string_view>("127.0.0.1:8080")));
+
+  // Initial stats should be zero.
+  EXPECT_EQ(0, context_.scope().counterFromString("stateful_session.test.routed").value());
+  EXPECT_EQ(0, context_.scope().counterFromString("stateful_session.test.failed_open").value());
+  EXPECT_EQ(0, context_.scope().counterFromString("stateful_session.test.failed_closed").value());
+
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers, true));
+
+  // Simulate no healthy upstream (503) in strict mode, upstream_info is nullptr.
+  encoder_callbacks_.stream_info_.setUpstreamInfo(nullptr);
+  encoder_callbacks_.stream_info_.setResponseFlag(StreamInfo::CoreResponseFlag::NoHealthyUpstream);
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->encodeHeaders(response_headers, true));
+
+  // Verify failed_closed counter incremented.
+  EXPECT_EQ(0, context_.scope().counterFromString("stateful_session.test.routed").value());
+  EXPECT_EQ(0, context_.scope().counterFromString("stateful_session.test.failed_open").value());
+  EXPECT_EQ(1, context_.scope().counterFromString("stateful_session.test.failed_closed").value());
 }
 
 } // namespace

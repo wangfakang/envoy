@@ -37,14 +37,15 @@ public:
                        Event::Dispatcher& dispatcher, Thread::BasicLockable& lock,
                        Stats::Store& stats_store)
       : file_flush_interval_msec_(file_flush_interval_msec), api_(api), dispatcher_(dispatcher),
-        lock_(lock), file_stats_{
-                         ACCESS_LOG_FILE_STATS(POOL_COUNTER_PREFIX(stats_store, "filesystem."),
-                                               POOL_GAUGE_PREFIX(stats_store, "filesystem."))} {}
+        lock_(lock),
+        file_stats_{ACCESS_LOG_FILE_STATS(POOL_COUNTER_PREFIX(stats_store, "filesystem."),
+                                          POOL_GAUGE_PREFIX(stats_store, "filesystem."))} {}
   ~AccessLogManagerImpl() override;
 
   // AccessLog::AccessLogManager
   void reopen() override;
-  AccessLogFileSharedPtr createAccessLog(const Filesystem::FilePathAndType& file_info) override;
+  absl::StatusOr<AccessLogFileSharedPtr>
+  createAccessLog(const Filesystem::FilePathAndType& file_info) override;
 
 private:
   const std::chrono::milliseconds file_flush_interval_msec_;
@@ -84,11 +85,7 @@ public:
 private:
   void doWrite(Buffer::Instance& buffer);
   void flushThreadFunc();
-  Api::IoCallBoolResult open();
   void createFlushStructures();
-
-  // return default flags set which used by open
-  static Filesystem::FlagSet defaultFlags();
 
   // Minimum size before the flush thread will be told to flush.
   static const uint64_t MIN_FLUSH_SIZE = 1024 * 64;

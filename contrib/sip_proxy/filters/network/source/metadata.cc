@@ -28,7 +28,7 @@ void SipHeader::parseHeader() {
   if (std::size_t found = header.find(": "); found != absl::string_view::npos) {
     header = header.substr(found + 2);
   }
-  if (std::size_t found = header.find("<"); found != absl::string_view::npos) {
+  if (std::size_t found = header.find('<'); found != absl::string_view::npos) {
     header = header.substr(found + 1);
   }
 
@@ -40,7 +40,7 @@ void SipHeader::parseHeader() {
       str = header.substr(pos, found - pos);
     }
 
-    std::size_t value_pos = str.find("=");
+    std::size_t value_pos = str.find('=');
     if (value_pos == absl::string_view::npos) {
       // First as host
       if (isHost) {
@@ -124,7 +124,7 @@ void MessageMetadata::addEPOperation(
     return;
   }
 
-  auto pos = header.find(">");
+  auto pos = header.find('>');
   if (pos == absl::string_view::npos) {
     // no url
     return;
@@ -177,8 +177,8 @@ void MessageMetadata::addMsgHeader(HeaderType type, absl::string_view value) {
     break;
   default:
     if (type <= HeaderType::TopLine || type >= HeaderType::Other) {
-      ENVOY_LOG(error, "Wrong HeaderType {}, should be in [{},{}]", type, HeaderType::TopLine,
-                HeaderType::Other);
+      ENVOY_LOG(error, "Wrong HeaderType {}, should be in [{},{}]", static_cast<int>(type),
+                static_cast<int>(HeaderType::TopLine), static_cast<int>(HeaderType::Other));
       return;
     }
     headers_[type].emplace_back(SipHeader(type, value));

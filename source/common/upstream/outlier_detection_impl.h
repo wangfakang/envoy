@@ -34,7 +34,7 @@ namespace Outlier {
  */
 class DetectorImplFactory {
 public:
-  static DetectorSharedPtr
+  static absl::StatusOr<DetectorSharedPtr>
   createForCluster(Cluster& cluster, const envoy::config::cluster::v3::Cluster& cluster_config,
                    Event::Dispatcher& dispatcher, Runtime::Loader& runtime,
                    EventLoggerSharedPtr event_logger, Random::RandomGenerator& random);
@@ -135,13 +135,14 @@ public:
 
   // Upstream::Outlier::DetectorHostMonitor
   uint32_t numEjections() override { return num_ejections_; }
-  void putHttpResponseCode(uint64_t response_code) override;
   void putResult(Result result, absl::optional<uint64_t> code) override;
   void putResponseTime(std::chrono::milliseconds) override {}
   const absl::optional<MonotonicTime>& lastEjectionTime() override { return last_ejection_time_; }
   const absl::optional<MonotonicTime>& lastUnejectionTime() override {
     return last_unejection_time_;
   }
+
+  void putHttpResponseCode(uint64_t response_code);
 
   const SuccessRateMonitor& getSRMonitor(SuccessRateMonitorType type) const {
     return (SuccessRateMonitorType::ExternalOrigin == type) ? external_origin_sr_monitor_
@@ -290,6 +291,7 @@ public:
   uint64_t consecutive5xx() const { return consecutive_5xx_; }
   uint64_t consecutiveGatewayFailure() const { return consecutive_gateway_failure_; }
   uint64_t maxEjectionPercent() const { return max_ejection_percent_; }
+  bool alwaysEjectOneHost() const { return always_eject_one_host_; }
   uint64_t successRateMinimumHosts() const { return success_rate_minimum_hosts_; }
   uint64_t successRateRequestVolume() const { return success_rate_request_volume_; }
   uint64_t successRateStdevFactor() const { return success_rate_stdev_factor_; }
@@ -313,6 +315,9 @@ public:
   uint64_t enforcingLocalOriginSuccessRate() const { return enforcing_local_origin_success_rate_; }
   uint64_t maxEjectionTimeMs() const { return max_ejection_time_ms_; }
   uint64_t maxEjectionTimeJitterMs() const { return max_ejection_time_jitter_ms_; }
+  bool successfulActiveHealthCheckUnejectHost() const {
+    return successful_active_health_check_uneject_host_;
+  }
 
 private:
   const uint64_t interval_ms_;
@@ -320,6 +325,7 @@ private:
   const uint64_t consecutive_5xx_;
   const uint64_t consecutive_gateway_failure_;
   const uint64_t max_ejection_percent_;
+  const bool always_eject_one_host_;
   const uint64_t success_rate_minimum_hosts_;
   const uint64_t success_rate_request_volume_;
   const uint64_t success_rate_stdev_factor_;
@@ -337,6 +343,7 @@ private:
   const uint64_t enforcing_local_origin_success_rate_;
   const uint64_t max_ejection_time_ms_;
   const uint64_t max_ejection_time_jitter_ms_;
+  const bool successful_active_health_check_uneject_host_;
 
   static constexpr uint64_t DEFAULT_INTERVAL_MS = 10000;
   static constexpr uint64_t DEFAULT_BASE_EJECTION_TIME_MS = 30000;
@@ -368,7 +375,7 @@ private:
  */
 class DetectorImpl : public Detector, public std::enable_shared_from_this<DetectorImpl> {
 public:
-  static std::shared_ptr<DetectorImpl>
+  static absl::StatusOr<std::shared_ptr<DetectorImpl>>
   create(Cluster& cluster, const envoy::config::cluster::v3::OutlierDetection& config,
          Event::Dispatcher& dispatcher, Runtime::Loader& runtime, TimeSource& time_source,
          EventLoggerSharedPtr event_logger, Random::RandomGenerator& random);
@@ -487,17 +494,24 @@ private:
 
 class EventLoggerImpl : public EventLogger {
 public:
-  EventLoggerImpl(AccessLog::AccessLogManager& log_manager, const std::string& file_name,
-                  TimeSource& time_source)
-      : file_(log_manager.createAccessLog(
-            Filesystem::FilePathAndType{Filesystem::DestinationType::File, file_name})),
-        time_source_(time_source) {}
-
+  static absl::StatusOr<std::unique_ptr<EventLoggerImpl>>
+  create(AccessLog::AccessLogManager& log_manager, const std::string& file_name,
+         TimeSource& time_source) {
+    auto file_or_error = log_manager.createAccessLog(
+        Filesystem::FilePathAndType{Filesystem::DestinationType::File, file_name});
+    RETURN_IF_NOT_OK_REF(file_or_error.status());
+    return std::unique_ptr<EventLoggerImpl>(
+        new EventLoggerImpl(std::move(*file_or_error), time_source));
+  }
   // Upstream::Outlier::EventLogger
   void logEject(const HostDescriptionConstSharedPtr& host, Detector& detector,
                 envoy::data::cluster::v3::OutlierEjectionType type, bool enforced) override;
 
   void logUneject(const HostDescriptionConstSharedPtr& host) override;
+
+protected:
+  EventLoggerImpl(AccessLog::AccessLogFileSharedPtr&& file, TimeSource& time_source)
+      : file_(std::move(file)), time_source_(time_source) {}
 
 private:
   void setCommonEventParams(envoy::data::cluster::v3::OutlierDetectionEvent& event,

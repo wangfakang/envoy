@@ -1,4 +1,4 @@
-#include "redis_cluster.h"
+#include "source/extensions/clusters/redis/redis_cluster.h"
 
 #include <cstdint>
 #include <memory>
@@ -14,14 +14,38 @@ namespace Extensions {
 namespace Clusters {
 namespace Redis {
 
+absl::StatusOr<std::unique_ptr<RedisCluster::RedisHost>> RedisCluster::RedisHost::create(
+    Upstream::ClusterInfoConstSharedPtr cluster, const std::string& hostname,
+    Network::Address::InstanceConstSharedPtr address, RedisCluster& parent, bool primary) {
+  absl::Status creation_status = absl::OkStatus();
+  auto ret = std::unique_ptr<RedisCluster::RedisHost>(
+      new RedisCluster::RedisHost(cluster, hostname, address, parent, primary, creation_status));
+  RETURN_IF_NOT_OK(creation_status);
+  return ret;
+}
+
+absl::StatusOr<std::unique_ptr<RedisCluster>> RedisCluster::create(
+    const envoy::config::cluster::v3::Cluster& cluster,
+    const envoy::extensions::clusters::redis::v3::RedisClusterConfig& redis_cluster,
+    Upstream::ClusterFactoryContext& context,
+    NetworkFilters::Common::Redis::Client::ClientFactory& client_factory,
+    Network::DnsResolverSharedPtr dns_resolver, ClusterSlotUpdateCallBackSharedPtr factory) {
+  absl::Status creation_status = absl::OkStatus();
+  std::unique_ptr<RedisCluster> ret = absl::WrapUnique(new RedisCluster(
+      cluster, redis_cluster, context, client_factory, dns_resolver, factory, creation_status));
+  RETURN_IF_NOT_OK(creation_status);
+  return ret;
+}
+
 RedisCluster::RedisCluster(
     const envoy::config::cluster::v3::Cluster& cluster,
     const envoy::extensions::clusters::redis::v3::RedisClusterConfig& redis_cluster,
     Upstream::ClusterFactoryContext& context,
     NetworkFilters::Common::Redis::Client::ClientFactory& redis_client_factory,
-    Network::DnsResolverSharedPtr dns_resolver, ClusterSlotUpdateCallBackSharedPtr lb_factory)
-    : Upstream::BaseDynamicClusterImpl(cluster, context),
-      cluster_manager_(context.clusterManager()),
+    Network::DnsResolverSharedPtr dns_resolver, ClusterSlotUpdateCallBackSharedPtr lb_factory,
+    absl::Status& creation_status)
+    : Upstream::BaseDynamicClusterImpl(cluster, context, creation_status),
+      cluster_manager_(context.serverFactoryContext().clusterManager()),
       cluster_refresh_rate_(std::chrono::milliseconds(
           PROTOBUF_GET_MS_OR_DEFAULT(redis_cluster, cluster_refresh_rate, 5000))),
       cluster_refresh_timeout_(std::chrono::milliseconds(
@@ -38,21 +62,19 @@ RedisCluster::RedisCluster(
       load_assignment_(cluster.load_assignment()),
       local_info_(context.serverFactoryContext().localInfo()),
       random_(context.serverFactoryContext().api().randomGenerator()),
-      redis_discovery_session_(*this, redis_client_factory), lb_factory_(std::move(lb_factory)),
+      redis_discovery_session_(
+          std::make_shared<RedisDiscoverySession>(*this, redis_client_factory)),
+      lb_factory_(std::move(lb_factory)),
       auth_username_(NetworkFilters::RedisProxy::ProtocolOptionsConfigImpl::authUsername(
           info(), context.serverFactoryContext().api())),
       auth_password_(NetworkFilters::RedisProxy::ProtocolOptionsConfigImpl::authPassword(
           info(), context.serverFactoryContext().api())),
-      cluster_name_(cluster.name()),
-      refresh_manager_(Common::Redis::getClusterRefreshManager(
-          context.serverFactoryContext().singletonManager(),
-          context.serverFactoryContext().mainThreadDispatcher(), context.clusterManager(),
-          context.serverFactoryContext().api().timeSource())),
-      registration_handle_(refresh_manager_->registerCluster(
-          cluster_name_, redirect_refresh_interval_, redirect_refresh_threshold_,
-          failure_refresh_threshold_, host_degraded_refresh_threshold_, [&]() {
-            redis_discovery_session_.resolve_timer_->enableTimer(std::chrono::milliseconds(0));
-          })) {
+      cluster_name_(cluster.name()), refresh_manager_(Common::Redis::getClusterRefreshManager(
+                                         context.serverFactoryContext().singletonManager(),
+                                         context.serverFactoryContext().mainThreadDispatcher(),
+                                         context.serverFactoryContext().clusterManager(),
+                                         context.serverFactoryContext().api().timeSource())),
+      registration_handle_(nullptr) {
   const auto& locality_lb_endpoints = load_assignment_.endpoints();
   for (const auto& locality_lb_endpoint : locality_lb_endpoints) {
     for (const auto& lb_endpoint : locality_lb_endpoint.lb_endpoints()) {
@@ -61,6 +83,32 @@ RedisCluster::RedisCluster(
           *this, host.socket_address().address(), host.socket_address().port_value()));
     }
   }
+
+  // Register the cluster callback using weak_ptr to avoid use-after-free
+  std::weak_ptr<RedisDiscoverySession> weak_session = redis_discovery_session_;
+  registration_handle_ = refresh_manager_->registerCluster(
+      cluster_name_, redirect_refresh_interval_, redirect_refresh_threshold_,
+      failure_refresh_threshold_, host_degraded_refresh_threshold_, [weak_session]() {
+        // Try to lock the weak pointer to ensure the session is still alive
+        auto session = weak_session.lock();
+        if (session && session->resolve_timer_) {
+          session->resolve_timer_->enableTimer(std::chrono::milliseconds(0));
+        }
+      });
+}
+
+RedisCluster::~RedisCluster() {
+  // Set flag to prevent any callbacks from executing during destruction
+  is_destroying_.store(true);
+
+  // Reset redis_discovery_session_ before other members are destroyed
+  // to ensure any pending callbacks from refresh_manager_ don't access it.
+  // This matches the approach in PR #39625.
+  redis_discovery_session_.reset();
+
+  // Also clear DNS discovery targets to prevent their callbacks from
+  // accessing the destroyed cluster.
+  dns_discovery_resolve_targets_.clear();
 }
 
 void RedisCluster::startPreInit() {
@@ -87,7 +135,7 @@ void RedisCluster::updateAllHosts(const Upstream::HostVector& hosts_added,
 
   priority_state_manager.updateClusterPrioritySet(
       current_priority, std::move(priority_state_manager.priorityState()[current_priority].first),
-      hosts_added, hosts_removed, absl::nullopt);
+      hosts_added, hosts_removed, absl::nullopt, absl::nullopt, absl::nullopt);
 }
 
 void RedisCluster::onClusterSlotUpdate(ClusterSlotsSharedPtr&& slots) {
@@ -96,13 +144,15 @@ void RedisCluster::onClusterSlotUpdate(ClusterSlotsSharedPtr&& slots) {
 
   for (const ClusterSlot& slot : *slots) {
     if (all_new_hosts.count(slot.primary()->asString()) == 0) {
-      new_hosts.emplace_back(new RedisHost(info(), "", slot.primary(), *this, true, time_source_));
+      new_hosts.emplace_back(THROW_OR_RETURN_VALUE(
+          RedisHost::create(info(), "", slot.primary(), *this, true), std::unique_ptr<RedisHost>));
       all_new_hosts.emplace(slot.primary()->asString());
     }
     for (auto const& replica : slot.replicas()) {
       if (all_new_hosts.count(replica.first) == 0) {
         new_hosts.emplace_back(
-            new RedisHost(info(), "", replica.second, *this, false, time_source_));
+            THROW_OR_RETURN_VALUE(RedisHost::create(info(), "", replica.second, *this, false),
+                                  std::unique_ptr<RedisHost>));
         all_new_hosts.emplace(replica.first);
       }
     }
@@ -170,7 +220,7 @@ RedisCluster::DnsDiscoveryResolveTarget::~DnsDiscoveryResolveTarget() {
     active_query_->cancel(Network::ActiveDnsQuery::CancelReason::QueryAbandoned);
   }
   // Disable timer for mock tests.
-  if (resolve_timer_) {
+  if (resolve_timer_ && resolve_timer_->enabled()) {
     resolve_timer_->disableTimer();
   }
 }
@@ -180,7 +230,7 @@ void RedisCluster::DnsDiscoveryResolveTarget::startResolveDns() {
 
   active_query_ = parent_.dns_resolver_->resolve(
       dns_address_, parent_.dns_lookup_family_,
-      [this](Network::DnsResolver::ResolutionStatus status,
+      [this](Network::DnsResolver::ResolutionStatus status, absl::string_view,
              std::list<Network::DnsResponse>&& response) -> void {
         active_query_ = nullptr;
         ENVOY_LOG(trace, "async DNS resolution complete for {}", dns_address_);
@@ -192,8 +242,13 @@ void RedisCluster::DnsDiscoveryResolveTarget::startResolveDns() {
           }
 
           if (!resolve_timer_) {
-            resolve_timer_ =
-                parent_.dispatcher_.createTimer([this]() -> void { startResolveDns(); });
+            resolve_timer_ = parent_.dispatcher_.createTimer([this]() -> void {
+              // Check if the parent cluster is being destroyed
+              if (parent_.is_destroying_.load()) {
+                return;
+              }
+              startResolveDns();
+            });
           }
           // if the initial dns resolved to empty, we'll skip the redis discovery phase and
           // treat it as an empty cluster.
@@ -205,8 +260,8 @@ void RedisCluster::DnsDiscoveryResolveTarget::startResolveDns() {
           // slots" command for service discovery and slot allocation. All subsequent
           // discoveries are handled by RedisDiscoverySession and will not use DNS
           // resolution again.
-          parent_.redis_discovery_session_.registerDiscoveryAddress(std::move(response), port_);
-          parent_.redis_discovery_session_.startResolveRedis();
+          parent_.redis_discovery_session_->registerDiscoveryAddress(std::move(response), port_);
+          parent_.redis_discovery_session_->startResolveRedis();
         }
       });
 }
@@ -216,7 +271,13 @@ RedisCluster::RedisDiscoverySession::RedisDiscoverySession(
     Envoy::Extensions::Clusters::Redis::RedisCluster& parent,
     NetworkFilters::Common::Redis::Client::ClientFactory& client_factory)
     : parent_(parent), dispatcher_(parent.dispatcher_),
-      resolve_timer_(parent.dispatcher_.createTimer([this]() -> void { startResolveRedis(); })),
+      resolve_timer_(parent.dispatcher_.createTimer([this]() -> void {
+        // Check if the parent cluster is being destroyed
+        if (parent_.is_destroying_.load()) {
+          return;
+        }
+        startResolveRedis();
+      })),
       client_factory_(client_factory), buffer_timeout_(0),
       redis_command_stats_(
           NetworkFilters::Common::Redis::RedisCommandStats::createRedisCommandStats(
@@ -283,8 +344,8 @@ void RedisCluster::RedisDiscoverySession::startResolveRedis() {
   if (parent_.hosts_.empty()) {
     const int rand_idx = parent_.random_.random() % discovery_address_list_.size();
     auto it = std::next(discovery_address_list_.begin(), rand_idx);
-    host = Upstream::HostSharedPtr{
-        new RedisHost(parent_.info(), "", *it, parent_, true, parent_.timeSource())};
+    host = Upstream::HostSharedPtr{THROW_OR_RETURN_VALUE(
+        RedisHost::create(parent_.info(), "", *it, parent_, true), std::unique_ptr<RedisHost>)};
   } else {
     const int rand_idx = parent_.random_.random() % parent_.hosts_.size();
     host = parent_.hosts_[rand_idx];
@@ -295,9 +356,11 @@ void RedisCluster::RedisDiscoverySession::startResolveRedis() {
   if (!client) {
     client = std::make_unique<RedisDiscoveryClient>(*this);
     client->host_ = current_host_address_;
-    client->client_ = client_factory_.create(host, dispatcher_, *this, redis_command_stats_,
-                                             parent_.info()->statsScope(), parent_.auth_username_,
-                                             parent_.auth_password_, false);
+    // absl::nullopt here disables AWS IAM authentication in redis client which is not supported by
+    // redis cluster implementation
+    client->client_ = client_factory_.create(
+        host, dispatcher_, shared_from_this(), redis_command_stats_, parent_.info()->statsScope(),
+        parent_.auth_username_, parent_.auth_password_, false, absl::nullopt, absl::nullopt);
     client->client_->addConnectionCallbacks(*client);
   }
   ENVOY_LOG(debug, "executing redis cluster slot request for '{}'", parent_.info_->name());
@@ -338,9 +401,9 @@ void RedisCluster::RedisDiscoverySession::resolveClusterHostnames(
                 slot.primary_hostname_, slot_idx);
       parent_.dns_resolver_->resolve(
           slot.primary_hostname_, parent_.dns_lookup_family_,
-          [this, slot_idx, slots,
-           hostname_resolution_required_cnt](Network::DnsResolver::ResolutionStatus status,
-                                             std::list<Network::DnsResponse>&& response) -> void {
+          [this, slot_idx, slots, hostname_resolution_required_cnt](
+              Network::DnsResolver::ResolutionStatus status, absl::string_view,
+              std::list<Network::DnsResponse>&& response) -> void {
             auto& slot = (*slots)[slot_idx];
             ENVOY_LOG(
                 debug,
@@ -349,8 +412,15 @@ void RedisCluster::RedisDiscoverySession::resolveClusterHostnames(
             updateDnsStats(status, response.empty());
             // If DNS resolution for a primary fails, we stop resolution for remaining, and reset
             // the timer.
-            if (status != Network::DnsResolver::ResolutionStatus::Success) {
+            if (status != Network::DnsResolver::ResolutionStatus::Completed) {
               ENVOY_LOG(error, "Unable to resolve cluster slot primary hostname {}",
+                        slot.primary_hostname_);
+              resolve_timer_->enableTimer(parent_.cluster_refresh_rate_);
+              return;
+            }
+            // A successful query can return an empty response.
+            if (response.empty()) {
+              ENVOY_LOG(error, "DNS resolution for primary slot address {} returned no results",
                         slot.primary_hostname_);
               resolve_timer_->enableTimer(parent_.cluster_refresh_rate_);
               return;
@@ -394,17 +464,21 @@ void RedisCluster::RedisDiscoverySession::resolveReplicas(
     ENVOY_LOG(debug, "starting async DNS resolution for replica address {}", replica.first);
     parent_.dns_resolver_->resolve(
         replica.first, parent_.dns_lookup_family_,
-        [this, index, slots, replica_idx,
-         hostname_resolution_required_cnt](Network::DnsResolver::ResolutionStatus status,
-                                           std::list<Network::DnsResponse>&& response) -> void {
+        [this, index, slots, replica_idx, hostname_resolution_required_cnt](
+            Network::DnsResolver::ResolutionStatus status, absl::string_view,
+            std::list<Network::DnsResponse>&& response) -> void {
           auto& slot = (*slots)[index];
           auto& replica = slot.replicas_to_resolve_[replica_idx];
           ENVOY_LOG(debug, "async DNS resolution complete for replica address {}", replica.first);
           updateDnsStats(status, response.empty());
           // If DNS resolution fails here, we move on to resolve other replicas in the list.
           // We log a warn message.
-          if (status != Network::DnsResolver::ResolutionStatus::Success) {
+          if (status != Network::DnsResolver::ResolutionStatus::Completed) {
             ENVOY_LOG(warn, "Unable to resolve cluster replica address {}", replica.first);
+          } else if (response.empty()) {
+            // A successful query can return an empty response.
+            ENVOY_LOG(warn, "DNS resolution for cluster replica address {} returned no results",
+                      replica.first);
           } else {
             // Replica resolved
             slot.addReplica(Network::Utility::getAddressWithPort(
@@ -571,29 +645,36 @@ void RedisCluster::RedisDiscoverySession::onFailure() {
 
 RedisCluster::ClusterSlotsRequest RedisCluster::ClusterSlotsRequest::instance_;
 
-std::pair<Upstream::ClusterImplBaseSharedPtr, Upstream::ThreadAwareLoadBalancerPtr>
+absl::StatusOr<std::pair<Upstream::ClusterImplBaseSharedPtr, Upstream::ThreadAwareLoadBalancerPtr>>
 RedisClusterFactory::createClusterWithConfig(
     const envoy::config::cluster::v3::Cluster& cluster,
     const envoy::extensions::clusters::redis::v3::RedisClusterConfig& proto_config,
     Upstream::ClusterFactoryContext& context) {
   if (!cluster.has_cluster_type() || cluster.cluster_type().name() != "envoy.clusters.redis") {
-    throw EnvoyException("Redis cluster can only created with redis cluster type.");
+    return absl::InvalidArgumentError("Redis cluster can only created with redis cluster type.");
   }
+  auto resolver =
+      THROW_OR_RETURN_VALUE(selectDnsResolver(cluster, context), Network::DnsResolverSharedPtr);
   // TODO(hyang): This is needed to migrate existing cluster, disallow using other lb_policy
   // in the future
+  absl::Status creation_status = absl::OkStatus();
   if (cluster.lb_policy() != envoy::config::cluster::v3::Cluster::CLUSTER_PROVIDED) {
-    return std::make_pair(std::make_shared<RedisCluster>(
-                              cluster, proto_config, context,
-                              NetworkFilters::Common::Redis::Client::ClientFactoryImpl::instance_,
-                              selectDnsResolver(cluster, context), nullptr),
-                          nullptr);
+    auto ret =
+        std::make_pair(std::shared_ptr<RedisCluster>(new RedisCluster(
+                           cluster, proto_config, context,
+                           NetworkFilters::Common::Redis::Client::ClientFactoryImpl::instance_,
+                           resolver, nullptr, creation_status)),
+                       nullptr);
+    RETURN_IF_NOT_OK(creation_status);
+    return ret;
   }
   auto lb_factory = std::make_shared<RedisClusterLoadBalancerFactory>(
       context.serverFactoryContext().api().randomGenerator());
-  return std::make_pair(std::make_shared<RedisCluster>(
-                            cluster, proto_config, context,
-                            NetworkFilters::Common::Redis::Client::ClientFactoryImpl::instance_,
-                            selectDnsResolver(cluster, context), lb_factory),
+  absl::StatusOr<std::unique_ptr<RedisCluster>> cluster_or_error = RedisCluster::create(
+      cluster, proto_config, context,
+      NetworkFilters::Common::Redis::Client::ClientFactoryImpl::instance_, resolver, lb_factory);
+  RETURN_IF_NOT_OK(cluster_or_error.status());
+  return std::make_pair(std::shared_ptr<RedisCluster>(std::move(*cluster_or_error)),
                         std::make_unique<RedisClusterThreadAwareLoadBalancer>(lb_factory));
 }
 

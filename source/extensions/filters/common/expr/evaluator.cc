@@ -1,7 +1,13 @@
 #include "source/extensions/filters/common/expr/evaluator.h"
 
 #include "envoy/common/exception.h"
+#include "envoy/singleton/manager.h"
 
+#include "source/common/runtime/runtime_features.h"
+
+#include "extensions/regex_functions.h"
+
+#include "cel/expr/syntax.pb.h"
 #include "eval/public/builtin_func_registrar.h"
 #include "eval/public/cel_expr_builder_factory.h"
 
@@ -15,7 +21,7 @@ namespace {
 
 #define ACTIVATION_TOKENS(_f)                                                                      \
   _f(Request) _f(Response) _f(Connection) _f(Upstream) _f(Source) _f(Destination) _f(Metadata)     \
-      _f(FilterState) _f(XDS)
+      _f(FilterState) _f(XDS) _f(UpstreamFilterState)
 
 #define _DECLARE(_t) _t,
 enum class ActivationToken { ACTIVATION_TOKENS(_DECLARE) };
@@ -33,15 +39,19 @@ const ActivationLookupTable& getActivationTokens() {
 
 absl::optional<CelValue> StreamActivation::FindValue(absl::string_view name,
                                                      Protobuf::Arena* arena) const {
-  if (activation_info_ == nullptr) {
-    return {};
-  }
-  const StreamInfo::StreamInfo& info = *activation_info_;
   const auto& tokens = getActivationTokens();
   const auto token = tokens.find(name);
   if (token == tokens.end()) {
     return {};
   }
+  if (token->second == ActivationToken::XDS) {
+    return CelValue::CreateMap(
+        Protobuf::Arena::Create<XDSWrapper>(arena, *arena, activation_info_, local_info_));
+  }
+  if (activation_info_ == nullptr) {
+    return {};
+  }
+  const StreamInfo::StreamInfo& info = *activation_info_;
   switch (token->second) {
   case ActivationToken::Request:
     return CelValue::CreateMap(
@@ -63,36 +73,51 @@ absl::optional<CelValue> StreamActivation::FindValue(absl::string_view name,
     return CelValue::CreateMap(
         Protobuf::Arena::Create<FilterStateWrapper>(arena, *arena, info.filterState()));
   case ActivationToken::XDS:
-    return CelValue::CreateMap(Protobuf::Arena::Create<XDSWrapper>(arena, *arena, info));
-  };
+    return {};
+  case ActivationToken::UpstreamFilterState:
+    if (info.upstreamInfo().has_value() &&
+        info.upstreamInfo().value().get().upstreamFilterState() != nullptr) {
+      return CelValue::CreateMap(Protobuf::Arena::Create<FilterStateWrapper>(
+          arena, *arena, *info.upstreamInfo().value().get().upstreamFilterState()));
+    }
+  }
   return {};
 }
 
 void StreamActivation::resetActivation() const {
+  local_info_ = nullptr;
   activation_info_ = nullptr;
   activation_request_headers_ = nullptr;
   activation_response_headers_ = nullptr;
   activation_response_trailers_ = nullptr;
 }
 
-ActivationPtr createActivation(const StreamInfo::StreamInfo& info,
+ActivationPtr createActivation(const LocalInfo::LocalInfo* local_info,
+                               const StreamInfo::StreamInfo& info,
                                const Http::RequestHeaderMap* request_headers,
                                const Http::ResponseHeaderMap* response_headers,
                                const Http::ResponseTrailerMap* response_trailers) {
-  return std::make_unique<StreamActivation>(info, request_headers, response_headers,
+  return std::make_unique<StreamActivation>(local_info, info, request_headers, response_headers,
                                             response_trailers);
 }
 
-BuilderPtr createBuilder(Protobuf::Arena* arena) {
+BuilderInstanceSharedPtr createBuilder(Protobuf::Arena* arena) {
+  ASSERT_IS_MAIN_OR_TEST_THREAD();
   google::api::expr::runtime::InterpreterOptions options;
 
   // Security-oriented defaults
   options.enable_comprehension = false;
   options.enable_regex = true;
   options.regex_max_program_size = 100;
+  options.enable_qualified_identifier_rewrites = true;
   options.enable_string_conversion = false;
   options.enable_string_concat = false;
   options.enable_list_concat = false;
+
+  // Performance-oriented defaults
+  if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.enable_cel_regex_precompilation")) {
+    options.enable_regex_precompilation = true;
+  }
 
   // Enable constant folding (performance optimization)
   if (arena != nullptr) {
@@ -107,26 +132,80 @@ BuilderPtr createBuilder(Protobuf::Arena* arena) {
     throw CelException(
         absl::StrCat("failed to register built-in functions: ", register_status.message()));
   }
-  return builder;
-}
-
-ExpressionPtr createExpression(Builder& builder, const google::api::expr::v1alpha1::Expr& expr) {
-  google::api::expr::v1alpha1::SourceInfo source_info;
-  auto cel_expression_status = builder.CreateExpression(&expr, &source_info);
-  if (!cel_expression_status.ok()) {
-    throw CelException(
-        absl::StrCat("failed to create an expression: ", cel_expression_status.status().message()));
+  auto ext_register_status =
+      cel::extensions::RegisterRegexFunctions(builder->GetRegistry(), options);
+  if (!ext_register_status.ok()) {
+    throw CelException(absl::StrCat("failed to register extension regex functions: ",
+                                    ext_register_status.message()));
   }
-  return std::move(cel_expression_status.value());
+  return std::make_shared<BuilderInstance>(std::move(builder));
 }
 
-absl::optional<CelValue> evaluate(const Expression& expr, Protobuf::Arena& arena,
-                                  const StreamInfo::StreamInfo& info,
-                                  const Http::RequestHeaderMap* request_headers,
-                                  const Http::ResponseHeaderMap* response_headers,
-                                  const Http::ResponseTrailerMap* response_trailers) {
-  auto activation = createActivation(info, request_headers, response_headers, response_trailers);
-  auto eval_status = expr.Evaluate(*activation, &arena);
+SINGLETON_MANAGER_REGISTRATION(expression_builder);
+
+BuilderInstanceSharedConstPtr getBuilder(Server::Configuration::CommonFactoryContext& context) {
+  return context.singletonManager().getTyped<BuilderInstance>(
+      SINGLETON_MANAGER_REGISTERED_NAME(expression_builder), [] { return createBuilder(nullptr); });
+}
+
+absl::StatusOr<CompiledExpression>
+CompiledExpression::Create(const BuilderInstanceSharedConstPtr& builder,
+                           const cel::expr::Expr& expr) {
+  std::vector<absl::Status> warnings;
+  CompiledExpression out = CompiledExpression(builder, expr);
+  auto cel_expression_status = out.builder_->builder().CreateExpression(
+      &out.source_expr_, &cel::expr::SourceInfo::default_instance(), &warnings);
+  if (!cel_expression_status.ok()) {
+    return cel_expression_status.status();
+  }
+  out.expr_ = std::move(cel_expression_status.value());
+  return out;
+}
+
+absl::StatusOr<CompiledExpression>
+CompiledExpression::Create(const BuilderInstanceSharedConstPtr& builder,
+                           const xds::type::v3::CelExpression& xds_expr) {
+  // First try to get expression from the new CEL canonical format
+  if (xds_expr.has_cel_expr_checked()) {
+    return Create(builder, xds_expr.cel_expr_checked().expr());
+  } else if (xds_expr.has_cel_expr_parsed()) {
+    return Create(builder, xds_expr.cel_expr_parsed().expr());
+  }
+  // Fallback to handling legacy formats for backward compatibility
+  switch (xds_expr.expr_specifier_case()) {
+  case xds::type::v3::CelExpression::ExprSpecifierCase::kParsedExpr:
+    return Create(builder, xds_expr.parsed_expr().expr());
+  case xds::type::v3::CelExpression::ExprSpecifierCase::kCheckedExpr:
+    return Create(builder, xds_expr.checked_expr().expr());
+  default:
+    return absl::InvalidArgumentError("CEL expression not set.");
+  }
+  PANIC_DUE_TO_CORRUPT_ENUM;
+}
+
+absl::StatusOr<CompiledExpression>
+CompiledExpression::Create(const BuilderInstanceSharedConstPtr& builder,
+                           const google::api::expr::v1alpha1::Expr& expr) {
+  std::string serialized;
+  if (!expr.SerializeToString(&serialized)) {
+    return absl::InvalidArgumentError(
+        "Failed to serialize google::api::expr::v1alpha1 expression.");
+  }
+  cel::expr::Expr new_expr;
+  if (!new_expr.ParseFromString(serialized)) {
+    return absl::InvalidArgumentError("Failed to convert to cel::expr expression.");
+  }
+  return Create(builder, new_expr);
+}
+
+absl::optional<CelValue> CompiledExpression::evaluate(
+    Protobuf::Arena& arena, const ::Envoy::LocalInfo::LocalInfo* local_info,
+    const StreamInfo::StreamInfo& info, const ::Envoy::Http::RequestHeaderMap* request_headers,
+    const ::Envoy::Http::ResponseHeaderMap* response_headers,
+    const ::Envoy::Http::ResponseTrailerMap* response_trailers) const {
+  auto activation =
+      createActivation(local_info, info, request_headers, response_headers, response_trailers);
+  auto eval_status = expr_->Evaluate(*activation, &arena);
   if (!eval_status.ok()) {
     return {};
   }
@@ -134,10 +213,15 @@ absl::optional<CelValue> evaluate(const Expression& expr, Protobuf::Arena& arena
   return eval_status.value();
 }
 
-bool matches(const Expression& expr, const StreamInfo::StreamInfo& info,
-             const Http::RequestHeaderMap& headers) {
+absl::StatusOr<CelValue> CompiledExpression::evaluate(const Activation& activation,
+                                                      Protobuf::Arena* arena) const {
+  return expr_->Evaluate(activation, arena);
+}
+
+bool CompiledExpression::matches(const StreamInfo::StreamInfo& info,
+                                 const Http::RequestHeaderMap& headers) const {
   Protobuf::Arena arena;
-  auto eval_status = Expr::evaluate(expr, arena, info, &headers, nullptr, nullptr);
+  auto eval_status = evaluate(arena, nullptr, info, &headers, nullptr, nullptr);
   if (!eval_status.has_value()) {
     return false;
   }

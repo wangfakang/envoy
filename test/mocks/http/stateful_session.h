@@ -11,15 +11,15 @@ namespace Http {
 class MockSessionState : public SessionState {
 public:
   MOCK_METHOD(absl::optional<absl::string_view>, upstreamAddress, (), (const));
-  MOCK_METHOD(void, onUpdate,
-              (const Upstream::HostDescription& host, Http::ResponseHeaderMap& headers));
+  MOCK_METHOD(bool, onUpdate, (absl::string_view host_address, Http::ResponseHeaderMap& headers));
 };
 
 class MockSessionStateFactory : public Http::SessionStateFactory {
 public:
   MockSessionStateFactory();
 
-  MOCK_METHOD(Http::SessionStatePtr, create, (const Http::RequestHeaderMap& headers), (const));
+  MOCK_METHOD(Http::SessionStatePtr, create, (Http::RequestHeaderMap & headers), (const));
+  MOCK_METHOD(bool, isStrict, (), (const));
 };
 
 class MockSessionStateFactoryConfig : public Http::SessionStateFactoryConfig {
@@ -27,11 +27,11 @@ public:
   MockSessionStateFactoryConfig();
 
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
-    return std::make_unique<ProtobufWkt::Struct>();
+    return std::make_unique<Protobuf::Struct>();
   }
 
   MOCK_METHOD(SessionStateFactorySharedPtr, createSessionStateFactory,
-              (const Protobuf::Message&, Server::Configuration::CommonFactoryContext&));
+              (const Protobuf::Message&, Server::Configuration::GenericFactoryContext&));
 
   std::string name() const override { return "envoy.http.stateful_session.mock"; }
 };

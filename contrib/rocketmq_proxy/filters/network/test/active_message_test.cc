@@ -23,8 +23,9 @@ class ActiveMessageTest : public testing::Test {
 public:
   ActiveMessageTest()
       : stats_(RocketmqFilterStats::generateStats("test.", *store_.rootScope())),
-        config_(rocketmq_proxy_config_, factory_context_),
-        connection_manager_(config_, factory_context_.mainThreadDispatcher().timeSource()) {
+        config_(std::make_shared<ConfigImpl>(rocketmq_proxy_config_, factory_context_)),
+        connection_manager_(
+            config_, factory_context_.serverFactoryContext().mainThreadDispatcher().timeSource()) {
     connection_manager_.initializeReadFilterCallbacks(filter_callbacks_);
   }
 
@@ -38,7 +39,7 @@ protected:
   NiceMock<Server::Configuration::MockFactoryContext> factory_context_;
   Stats::IsolatedStoreImpl store_;
   RocketmqFilterStats stats_;
-  ConfigImpl config_;
+  std::shared_ptr<ConfigImpl> config_;
   ConnectionManager connection_manager_;
 };
 
@@ -171,7 +172,7 @@ TEST_F(ActiveMessageTest, RecordPopRouteInfo) {
   auto host_description = new NiceMock<Upstream::MockHostDescription>();
 
   auto metadata = std::make_shared<envoy::config::core::v3::Metadata>();
-  ProtobufWkt::Struct topic_route_data;
+  Protobuf::Struct topic_route_data;
   auto* fields = topic_route_data.mutable_fields();
 
   std::string broker_name = "broker-a";
@@ -183,7 +184,7 @@ TEST_F(ActiveMessageTest, RecordPopRouteInfo) {
   (*fields)[RocketmqConstants::get().BrokerName] = ValueUtil::stringValue(broker_name);
   (*fields)[RocketmqConstants::get().BrokerId] = ValueUtil::numberValue(broker_id);
   (*fields)[RocketmqConstants::get().Perm] = ValueUtil::numberValue(6);
-  metadata->mutable_filter_metadata()->insert(Protobuf::MapPair<std::string, ProtobufWkt::Struct>(
+  metadata->mutable_filter_metadata()->insert(Protobuf::MapPair<std::string, Protobuf::Struct>(
       NetworkFilterNames::get().RocketmqProxy, topic_route_data));
 
   EXPECT_CALL(*host_description, metadata()).WillRepeatedly(Return(metadata));

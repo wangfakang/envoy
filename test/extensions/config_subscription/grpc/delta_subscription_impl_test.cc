@@ -17,7 +17,7 @@ using ::testing::Return;
 class DeltaSubscriptionImplTest : public DeltaSubscriptionTestHarness,
                                   public testing::TestWithParam<LegacyOrUnified> {
 protected:
-  DeltaSubscriptionImplTest() : DeltaSubscriptionTestHarness(GetParam()){};
+  DeltaSubscriptionImplTest() : DeltaSubscriptionTestHarness(GetParam()) {};
 
   // We need to destroy the subscription before the test's destruction, because the subscription's
   // destructor removes its watch from the NewGrpcMuxImpl, and that removal process involves
@@ -82,7 +82,7 @@ TEST_P(DeltaSubscriptionImplTest, PauseQueuesAcks) {
     resource->set_version("version1A");
     const std::string nonce = std::to_string(HashUtil::xxHash64("version1A"));
     message->set_nonce(nonce);
-    message->set_type_url(Config::TypeUrl::get().ClusterLoadAssignment);
+    message->set_type_url(Config::TestTypeUrl::get().ClusterLoadAssignment);
     nonce_acks_required_.push(nonce);
     onDiscoveryResponse(std::move(message));
   }
@@ -95,7 +95,7 @@ TEST_P(DeltaSubscriptionImplTest, PauseQueuesAcks) {
     resource->set_version("version2A");
     const std::string nonce = std::to_string(HashUtil::xxHash64("version2A"));
     message->set_nonce(nonce);
-    message->set_type_url(Config::TypeUrl::get().ClusterLoadAssignment);
+    message->set_type_url(Config::TestTypeUrl::get().ClusterLoadAssignment);
     nonce_acks_required_.push(nonce);
     onDiscoveryResponse(std::move(message));
   }
@@ -108,7 +108,7 @@ TEST_P(DeltaSubscriptionImplTest, PauseQueuesAcks) {
     resource->set_version("version1B");
     const std::string nonce = std::to_string(HashUtil::xxHash64("version1B"));
     message->set_nonce(nonce);
-    message->set_type_url(Config::TypeUrl::get().ClusterLoadAssignment);
+    message->set_type_url(Config::TestTypeUrl::get().ClusterLoadAssignment);
     nonce_acks_required_.push(nonce);
     onDiscoveryResponse(std::move(message));
   }
@@ -154,23 +154,30 @@ TEST_P(DeltaSubscriptionNoGrpcStreamTest, NoGrpcStream) {
   auto backoff_strategy = std::make_unique<JitteredExponentialBackOffStrategy>(
       SubscriptionFactory::RetryInitialDelayMs, SubscriptionFactory::RetryMaxDelayMs, random);
 
+  GrpcMuxContext grpc_mux_context{
+      /*async_client_=*/std::unique_ptr<Grpc::MockAsyncClient>(async_client),
+      /*failover_async_client_=*/nullptr,
+      /*dispatcher_=*/dispatcher,
+      /*service_method_=*/*method_descriptor,
+      /*local_info_=*/local_info,
+      /*rate_limit_settings_=*/rate_limit_settings,
+      /*scope_=*/*stats_store.rootScope(),
+      /*config_validators_=*/std::make_unique<NiceMock<MockCustomConfigValidators>>(),
+      /*xds_resources_delegate_=*/XdsResourcesDelegateOptRef(),
+      /*xds_config_tracker_=*/XdsConfigTrackerOptRef(),
+      /*backoff_strategy_=*/std::move(backoff_strategy),
+      /*target_xds_authority_=*/"",
+      /*eds_resources_cache_=*/nullptr};
   if (GetParam() == LegacyOrUnified::Unified) {
-    xds_context = std::make_shared<Config::XdsMux::GrpcMuxDelta>(
-        std::unique_ptr<Grpc::MockAsyncClient>(async_client), dispatcher, *method_descriptor,
-        *stats_store.rootScope(), rate_limit_settings, local_info, false,
-        std::make_unique<NiceMock<MockCustomConfigValidators>>(), std::move(backoff_strategy),
-        /*xds_config_tracker=*/XdsConfigTrackerOptRef());
+    xds_context = std::make_shared<Config::XdsMux::GrpcMuxDelta>(grpc_mux_context, false);
   } else {
-    xds_context = std::make_shared<NewGrpcMuxImpl>(
-        std::unique_ptr<Grpc::MockAsyncClient>(async_client), dispatcher, *method_descriptor,
-        *stats_store.rootScope(), rate_limit_settings, local_info,
-        std::make_unique<NiceMock<MockCustomConfigValidators>>(), std::move(backoff_strategy),
-        /*xds_config_tracker=*/XdsConfigTrackerOptRef());
+    xds_context = std::make_shared<NewGrpcMuxImpl>(grpc_mux_context);
   }
 
   GrpcSubscriptionImplPtr subscription = std::make_unique<GrpcSubscriptionImpl>(
-      xds_context, callbacks, resource_decoder, stats, Config::TypeUrl::get().ClusterLoadAssignment,
-      dispatcher, std::chrono::milliseconds(12345), false, SubscriptionOptions());
+      xds_context, callbacks, resource_decoder, stats,
+      Config::TestTypeUrl::get().ClusterLoadAssignment, dispatcher,
+      std::chrono::milliseconds(12345), false, SubscriptionOptions());
 
   EXPECT_CALL(*async_client, startRaw(_, _, _, _)).WillOnce(Return(nullptr));
 

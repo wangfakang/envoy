@@ -50,22 +50,28 @@ public:
     EXPECT_CALL(dispatcher_, createTimer_(_)).Times(2);
     auto backoff_strategy = std::make_unique<JitteredExponentialBackOffStrategy>(
         SubscriptionFactory::RetryInitialDelayMs, SubscriptionFactory::RetryMaxDelayMs, random_);
+    GrpcMuxContext grpc_mux_context{
+        /*async_client_=*/std::unique_ptr<Grpc::MockAsyncClient>(async_client_),
+        /*failover_async_client_=*/nullptr,
+        /*dispatcher_=*/dispatcher_,
+        /*service_method_=*/*method_descriptor_,
+        /*local_info_=*/local_info_,
+        /*rate_limit_settings_=*/rate_limit_settings_,
+        /*scope_=*/*stats_store_.rootScope(),
+        /*config_validators_=*/std::make_unique<NiceMock<MockCustomConfigValidators>>(),
+        /*xds_resources_delegate_=*/XdsResourcesDelegateOptRef(),
+        /*xds_config_tracker_=*/XdsConfigTrackerOptRef(),
+        /*backoff_strategy_=*/std::move(backoff_strategy),
+        /*target_xds_authority_=*/"",
+        /*eds_resources_cache_=*/nullptr};
     if (should_use_unified_) {
-      xds_context_ = std::make_shared<Config::XdsMux::GrpcMuxDelta>(
-          std::unique_ptr<Grpc::MockAsyncClient>(async_client_), dispatcher_, *method_descriptor_,
-          *stats_store_.rootScope(), rate_limit_settings_, local_info_, false,
-          std::make_unique<NiceMock<MockCustomConfigValidators>>(), std::move(backoff_strategy),
-          /*xds_config_tracker=*/XdsConfigTrackerOptRef());
+      xds_context_ = std::make_shared<Config::XdsMux::GrpcMuxDelta>(grpc_mux_context, false);
     } else {
-      xds_context_ = std::make_shared<NewGrpcMuxImpl>(
-          std::unique_ptr<Grpc::MockAsyncClient>(async_client_), dispatcher_, *method_descriptor_,
-          *stats_store_.rootScope(), rate_limit_settings_, local_info_,
-          std::make_unique<NiceMock<MockCustomConfigValidators>>(), std::move(backoff_strategy),
-          /*xds_config_tracker=*/XdsConfigTrackerOptRef());
+      xds_context_ = std::make_shared<NewGrpcMuxImpl>(grpc_mux_context);
     }
     subscription_ = std::make_unique<GrpcSubscriptionImpl>(
         xds_context_, callbacks_, resource_decoder_, stats_,
-        Config::TypeUrl::get().ClusterLoadAssignment, dispatcher_, init_fetch_timeout, false,
+        Config::TestTypeUrl::get().ClusterLoadAssignment, dispatcher_, init_fetch_timeout, false,
         SubscriptionOptions());
     EXPECT_CALL(*async_client_, startRaw(_, _, _, _)).WillOnce(Return(&async_stream_));
   }
@@ -122,7 +128,7 @@ public:
       nonce_acks_required_.push(last_response_nonce_);
       last_response_nonce_ = "";
     }
-    expected_request.set_type_url(Config::TypeUrl::get().ClusterLoadAssignment);
+    expected_request.set_type_url(Config::TestTypeUrl::get().ClusterLoadAssignment);
 
     for (auto const& resource : initial_resource_versions) {
       (*expected_request.mutable_initial_resource_versions())[resource.first] = resource.second;
@@ -163,7 +169,7 @@ public:
     last_response_nonce_ = std::to_string(HashUtil::xxHash64(version));
     response->set_nonce(last_response_nonce_);
     response->set_system_version_info(version);
-    response->set_type_url(Config::TypeUrl::get().ClusterLoadAssignment);
+    response->set_type_url(Config::TestTypeUrl::get().ClusterLoadAssignment);
 
     Protobuf::RepeatedPtrField<envoy::config::endpoint::v3::ClusterLoadAssignment> typed_resources;
     for (const auto& cluster : cluster_names) {

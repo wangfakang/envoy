@@ -5,6 +5,7 @@
 
 #include "envoy/common/optref.h"
 #include "envoy/http/persistent_quic_info.h"
+#include "envoy/server/overload/overload_manager.h"
 #include "envoy/upstream/upstream.h"
 
 #include "source/common/http/codec_client.h"
@@ -14,7 +15,9 @@
 #include "source/common/quic/client_connection_factory_impl.h"
 #include "source/common/quic/envoy_quic_utils.h"
 #include "source/common/quic/quic_transport_socket_factory.h"
+#include "source/common/quic/envoy_quic_network_observer_registry_factory.h"
 #include "quiche/quic/core/deterministic_connection_id_generator.h"
+
 #else
 #error "http3 conn pool should not be built with QUIC disabled"
 #endif
@@ -36,13 +39,22 @@ public:
   // Http::ConnectionCallbacks
   void onMaxStreamsChanged(uint32_t num_streams) override;
 
-  RequestEncoder& newStreamEncoder(ResponseDecoder& response_decoder) override {
+  void updateQuicheCapacity() {
     ASSERT(quiche_capacity_ != 0);
     has_created_stream_ = true;
     // Each time a quic stream is allocated the quic capacity needs to get
     // decremented. See comments by quiche_capacity_.
     updateCapacity(quiche_capacity_ - 1);
+  }
+
+  RequestEncoder& newStreamEncoder(ResponseDecoder& response_decoder) override {
+    updateQuicheCapacity();
     return MultiplexedActiveClientBase::newStreamEncoder(response_decoder);
+  }
+
+  RequestEncoder& newStreamEncoder(ResponseDecoderHandlePtr response_decoder_handle) override {
+    updateQuicheCapacity();
+    return MultiplexedActiveClientBase::newStreamEncoder(std::move(response_decoder_handle));
   }
 
   uint32_t effectiveConcurrentStreamLimit() const override {
@@ -146,12 +158,26 @@ public:
                     Upstream::ClusterConnectivityState& state, CreateClientFn client_fn,
                     CreateCodecFn codec_fn, std::vector<Http::Protocol> protocol,
                     OptRef<PoolConnectResultCallback> connect_callback,
-                    Http::PersistentQuicInfo& quic_info);
+                    Http::PersistentQuicInfo& quic_info,
+                    OptRef<Quic::EnvoyQuicNetworkObserverRegistry> network_observer_registry,
+                    Server::OverloadManager& overload_manager, bool attempt_happy_eyeballs = false);
 
   ~Http3ConnPoolImpl() override;
   ConnectionPool::Cancellable* newStream(Http::ResponseDecoder& response_decoder,
                                          ConnectionPool::Callbacks& callbacks,
                                          const Instance::StreamOptions& options) override;
+
+  void drainConnections(Envoy::ConnectionPool::DrainBehavior drain_behavior) override {
+    if (drain_behavior ==
+            Envoy::ConnectionPool::DrainBehavior::DrainExistingNonMigratableConnections &&
+        quic_info_.migration_config_.migrate_session_on_network_change) {
+      // If connection migration is enabled, don't drain existing connections.
+      // Each connection will observe network change signals and decide whether
+      // to migrate or drain.
+      return;
+    }
+    FixedHttpConnPoolImpl::drainConnections(drain_behavior);
+  }
 
   // For HTTP/3 the base connection pool does not track stream capacity, rather
   // the HTTP3 active client does.
@@ -178,6 +204,12 @@ private:
 
   quic::DeterministicConnectionIdGenerator connection_id_generator_{
       quic::kQuicDefaultConnectionIdLength};
+
+  // Make a best effort attempt to find an address family other than the initial
+  // address. This fails over to using the primary address if the second address
+  // in the list isn't of a different address family.
+  bool attempt_happy_eyeballs_;
+  OptRef<Quic::EnvoyQuicNetworkObserverRegistry> network_observer_registry_;
 };
 
 std::unique_ptr<Http3ConnPoolImpl>
@@ -188,7 +220,9 @@ allocateConnPool(Event::Dispatcher& dispatcher, Random::RandomGenerator& random_
                  Upstream::ClusterConnectivityState& state, Quic::QuicStatNames& quic_stat_names,
                  OptRef<Http::HttpServerPropertiesCache> rtt_cache, Stats::Scope& scope,
                  OptRef<PoolConnectResultCallback> connect_callback,
-                 Http::PersistentQuicInfo& quic_info);
+                 Http::PersistentQuicInfo& quic_info,
+                 OptRef<Quic::EnvoyQuicNetworkObserverRegistry> network_observer_registry,
+                 Server::OverloadManager& overload_manager, bool attempt_happy_eyeballs = false);
 
 } // namespace Http3
 } // namespace Http

@@ -2,9 +2,9 @@ import Envoy
 import UIKit
 
 private let kCellID = "cell-id"
-private let kRequestAuthority = "api.lyft.com"
+private let kRequestAuthority = "localhost:10000"
 private let kRequestPath = "/ping"
-private let kRequestScheme = "https"
+private let kRequestScheme = "http"
 private let kFilteredHeaders =
   ["server", "filter-demo", "async-filter-demo", "x-envoy-upstream-service-time"]
 
@@ -18,18 +18,15 @@ final class ViewController: UITableViewController {
     super.viewDidLoad()
 
     let engine = EngineBuilder()
-      .addLogLevel(.debug)
+      .setLogLevel(.debug)
       .addPlatformFilter(DemoFilter.init)
       .addPlatformFilter(BufferDemoFilter.init)
       .addPlatformFilter(AsyncDemoFilter.init)
+      .respectSystemProxySettings(true)
       .addNativeFilter(
         name: "envoy.filters.http.buffer",
-        typedConfig: """
-            {\
-            "@type":"type.googleapis.com/envoy.extensions.filters.http.buffer.v3.Buffer",\
-            "max_request_bytes":5242880\
-            }
-            """
+        // swiftlint:disable:next line_length
+        typedConfig: "[type.googleapis.com/envoy.extensions.filters.http.buffer.v3.Buffer] { max_request_bytes: { value: 5242880 } }"
       )
       .setOnEngineRunning { NSLog("Envoy async internal setup completed") }
       .addStringAccessor(name: "demo-accessor", accessor: { return "PlatformString" })

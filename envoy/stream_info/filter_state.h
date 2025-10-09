@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "envoy/common/pure.h"
+#include "envoy/config/typed_config.h"
 
 #include "source/common/common/fmt.h"
 #include "source/common/common/utility.h"
@@ -86,11 +87,13 @@ public:
 
   class Object {
   public:
+    using FieldType = absl::variant<absl::monostate, absl::string_view, int64_t>;
+
     virtual ~Object() = default;
 
     /**
      * @return Protobuf::MessagePtr an unique pointer to the proto serialization of the filter
-     * state. If returned message type is ProtobufWkt::Any it will be directly used in protobuf
+     * state. If returned message type is Protobuf::Any it will be directly used in protobuf
      * logging. nullptr if the filter state cannot be serialized or serialization is not supported.
      */
     virtual ProtobufTypes::MessagePtr serializeAsProto() const { return nullptr; }
@@ -101,6 +104,34 @@ public:
      * This method can be used to get an unstructured serialization result.
      */
     virtual absl::optional<std::string> serializeAsString() const { return absl::nullopt; }
+
+    /**
+     * @return bool true if the object supports field access. False if the object does not support
+     * field access. Default implementation returns false.
+     */
+    virtual bool hasFieldSupport() const { return false; }
+
+    /**
+     * @return FieldType a single state property or field value for a name.
+     */
+    virtual FieldType getField(absl::string_view) const { return absl::monostate{}; }
+  };
+
+  /**
+   * Generic factory for filter state objects. The factory registry uses the
+   * object data name as the index for the object factory. This factory should be used by the
+   * dynamic extensions that cannot use the object constructors directly.
+   */
+  class ObjectFactory : public Config::UntypedFactory {
+  public:
+    // Config::UntypedFactory
+    std::string category() const override { return "filter_state.object"; }
+
+    /**
+     * @return std::unique_ptr<Object> from the serialized object data or nullptr if the input
+     * is malformed.
+     */
+    virtual std::unique_ptr<Object> createFromBytes(absl::string_view data) const PURE;
   };
 
   struct FilterObject {

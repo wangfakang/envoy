@@ -2,8 +2,11 @@
 
 #include "envoy/extensions/filters/http/rate_limit_quota/v3/rate_limit_quota.pb.h"
 #include "envoy/extensions/filters/http/rate_limit_quota/v3/rate_limit_quota.pb.validate.h"
+#include "envoy/thread_local/thread_local.h"
 
 #include "source/extensions/filters/http/common/factory_base.h"
+#include "source/extensions/filters/http/rate_limit_quota/global_client_impl.h"
+#include "source/extensions/filters/http/rate_limit_quota/quota_bucket_cache.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -16,7 +19,7 @@ class RateLimitQuotaFilterFactory
     : public Common::FactoryBase<
           envoy::extensions::filters::http::rate_limit_quota::v3::RateLimitQuotaFilterConfig,
           envoy::extensions::filters::http::rate_limit_quota::v3::RateLimitQuotaOverride>,
-      public Logger::Loggable<Logger::Id::filter> {
+      public Logger::Loggable<Logger::Id::rate_limit_quota> {
 public:
   RateLimitQuotaFilterFactory() : FactoryBase(std::string(FilterName)) {}
 

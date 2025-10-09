@@ -27,13 +27,13 @@ public:
   std::string name() const override { return std::string(kMetadataKey); }
 
   std::unique_ptr<const Config::TypedMetadata::Object>
-  parse(const ProtobufWkt::Struct&) const override {
+  parse(const Protobuf::Struct&) const override {
     ADD_FAILURE() << "Filter should not parse struct-typed metadata.";
     return nullptr;
   }
   std::unique_ptr<const Config::TypedMetadata::Object>
-  parse(const ProtobufWkt::Any& d) const override {
-    ProtobufWkt::StringValue v;
+  parse(const Protobuf::Any& d) const override {
+    Protobuf::StringValue v;
     EXPECT_TRUE(d.UnpackTo(&v));
     auto object = std::make_unique<Baz>();
     object->item_ = v.value();
@@ -58,11 +58,11 @@ public:
   ListenerTypedMetadataFilterFactory() : EmptyHttpFilterConfig(std::string(kFilterName)) {}
 
 private:
-  Http::FilterFactoryCb createFilter(const std::string&,
-                                     Server::Configuration::FactoryContext& context) override {
+  absl::StatusOr<Http::FilterFactoryCb>
+  createFilter(const std::string&, Server::Configuration::FactoryContext& context) override {
 
     // Main assertions to ensure the metadata from the listener was parsed correctly.
-    const auto& typed_metadata = context.listenerTypedMetadata();
+    const auto& typed_metadata = context.listenerInfo().typedMetadata();
     const Baz* value = typed_metadata.get<Baz>(std::string(kMetadataKey));
     EXPECT_NE(value, nullptr);
     EXPECT_EQ(value->item_, kExpectedMetadataValue);

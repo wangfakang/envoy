@@ -29,6 +29,26 @@ public:
    * Signals that the request should be cancelled. No further callbacks will be invoked.
    */
   virtual void cancel() PURE;
+
+  /**
+   * Returns the underlying stream info.
+   */
+  virtual const StreamInfo::StreamInfo& streamInfo() const PURE;
+
+  /**
+   * Detach the pending request. This is used for the case where we send a side
+   * request but never cancel it even if the related downstream main request is
+   * completed.
+   *
+   * This will will clean up all context associated with downstream request like
+   * downstream stream info, parent tracing span, and so on, to avoid potential
+   * dangling references.
+   *
+   * NOTE: the callbacks that registered to take the response will be kept to do
+   * some clean up or operations when response arrives. The caller is responsible
+   * for ensuring that the callbacks have enough lifetime.
+   */
+  virtual void detach() PURE;
 };
 
 /**
@@ -60,6 +80,14 @@ public:
    */
   virtual void resetStream() PURE;
 
+  /**
+   * Wait for the server to half-close its stream and then delete the RawAsyncStream object. No
+   * further methods may be invoked on the stream object and no further callbacks will be invoked.
+   * The server is expected to half-close within the interval specific in the StreamOptions,
+   * otherwise the stream is reset.
+   */
+  virtual void waitForRemoteCloseAndDelete() PURE;
+
   /***
    * @returns if the stream has enough buffered outbound data to be over the configured buffer
    * limits
@@ -70,6 +98,21 @@ public:
    * @returns the stream info object associated with this stream.
    */
   virtual const StreamInfo::StreamInfo& streamInfo() const PURE;
+  virtual StreamInfo::StreamInfo& streamInfo() PURE;
+
+  /***
+   * Register a callback to be called when high/low write buffer watermark events occur on the
+   * stream. This callback must persist beyond the lifetime of the stream or be unregistered via
+   * removeWatermarkCallbacks. If there's already a watermark callback registered, this method
+   * will trigger ENVOY_BUG.
+   */
+  virtual void setWatermarkCallbacks(Http::SidestreamWatermarkCallbacks& callbacks) PURE;
+
+  /***
+   * Remove previously set watermark callbacks. If there's no watermark callback registered, this
+   * method will trigger ENVOY_BUG.
+   */
+  virtual void removeWatermarkCallbacks() PURE;
 };
 
 class RawAsyncRequestCallbacks {
@@ -175,7 +218,6 @@ public:
 
   /**
    * Start a gRPC stream asynchronously.
-   * TODO(mattklein123): Determine if tracing should be added to streaming requests.
    * @param service_full_name full name of the service (i.e. service_method.service()->full_name()).
    * @param method_name name of the method (i.e. service_method.name()).
    * @param callbacks the callbacks to be notified of stream status.

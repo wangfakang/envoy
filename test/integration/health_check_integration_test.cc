@@ -3,6 +3,8 @@
 #include "envoy/config/core/v3/health_check.pb.h"
 #include "envoy/type/v3/range.pb.h"
 
+#include "source/common/upstream/health_discovery_service.h"
+
 #include "test/common/grpc/grpc_client_integration.h"
 #include "test/common/http/http2/http2_frame.h"
 #include "test/common/upstream/utility.h"
@@ -194,9 +196,10 @@ public:
     }
 
     // Introduce the cluster using compareDiscoveryRequest / sendDiscoveryResponse.
-    EXPECT_TRUE(compareDiscoveryRequest(Config::TypeUrl::get().Cluster, "", {}, {}, {}, true));
-    sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(
-        Config::TypeUrl::get().Cluster, {cluster_data.cluster_}, {cluster_data.cluster_}, {}, "55");
+    EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Cluster, "", {}, {}, {}, true));
+    sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(Config::TestTypeUrl::get().Cluster,
+                                                               {cluster_data.cluster_},
+                                                               {cluster_data.cluster_}, {}, "55");
 
     // Wait for upstream to receive health check request.
     ASSERT_TRUE(cluster_data.host_upstream_->waitForHttpConnection(
@@ -496,7 +499,7 @@ TEST_P(HttpHealthCheckIntegrationTest, SingleEndpointGoAway) {
 // followup health check would happen. Using real time solves this because then
 // the ordering of advancing the time system and enabling the health check timer
 // is inconsequential.
-TEST_P(RealTimeHttpHealthCheckIntegrationTest, SingleEndpointGoAwayErroSingleEndpointGoAwayErrorr) {
+TEST_P(RealTimeHttpHealthCheckIntegrationTest, SingleEndpointGoAwayError) {
   initialize();
 
   // GOAWAY doesn't exist in HTTP1.
@@ -558,15 +561,55 @@ public:
     health_check->mutable_tcp_health_check()->add_receive()->set_text("506F6E67");  // "Pong"
 
     // Introduce the cluster using compareDiscoveryRequest / sendDiscoveryResponse.
-    EXPECT_TRUE(compareDiscoveryRequest(Config::TypeUrl::get().Cluster, "", {}, {}, {}, true));
-    sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(
-        Config::TypeUrl::get().Cluster, {cluster_data.cluster_}, {cluster_data.cluster_}, {}, "55");
+    EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Cluster, "", {}, {}, {}, true));
+    sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(Config::TestTypeUrl::get().Cluster,
+                                                               {cluster_data.cluster_},
+                                                               {cluster_data.cluster_}, {}, "55");
 
     // Wait for upstream to receive TCP HC request.
     ASSERT_TRUE(
         cluster_data.host_upstream_->waitForRawConnection(cluster_data.host_fake_raw_connection_));
     ASSERT_TRUE(cluster_data.host_fake_raw_connection_->waitForData(
         FakeRawConnection::waitForInexactMatch("Ping")));
+  }
+
+  void
+  initProxyProtoHealthCheck(uint32_t cluster_idx,
+                            envoy::config::core::v3::ProxyProtocolConfig proxy_protocol_config) {
+    auto& cluster_data = clusters_[cluster_idx];
+    auto health_check = addHealthCheck(cluster_data.cluster_);
+    health_check->mutable_tcp_health_check()->mutable_send()->set_text("50696E67"); // "Ping"
+    health_check->mutable_tcp_health_check()->add_receive()->set_text("506F6E67");  // "Pong"
+    health_check->mutable_tcp_health_check()->mutable_proxy_protocol_config()->CopyFrom(
+        proxy_protocol_config);
+
+    // Introduce the cluster using compareDiscoveryRequest / sendDiscoveryResponse.
+    EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Cluster, "", {}, {}, {}, true));
+    sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(Config::TestTypeUrl::get().Cluster,
+                                                               {cluster_data.cluster_},
+                                                               {cluster_data.cluster_}, {}, "55");
+
+    // Wait for upstream to receive TCP HC request.
+    ASSERT_TRUE(
+        cluster_data.host_upstream_->waitForRawConnection(cluster_data.host_fake_raw_connection_));
+    if (proxy_protocol_config.version() ==
+        envoy::config::core::v3::ProxyProtocolConfig_Version_V1) {
+      ASSERT_TRUE(
+          cluster_data.host_fake_raw_connection_->waitForData([](const std::string& data) -> bool {
+            if (GetParam() == Network::Address::IpVersion::v4) {
+              return data.find("Ping") != std::string::npos &&
+                     data.find("PROXY TCP4 127.0.0.1 127.0.0.1") != std::string::npos;
+            }
+            return data.find("Ping") != std::string::npos &&
+                   data.find("PROXY TCP6 ::1 ::1") != std::string::npos;
+          }));
+    } else {
+      // ProxyProtocol Signature + Local Command + "Ping"
+      const char header[] = {0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49,
+                             0x54, 0x0a, 0x20, 0x00, 0x00, 0x00, 0x50, 0x69, 0x6e, 0x67};
+      ASSERT_TRUE(cluster_data.host_fake_raw_connection_->waitForData(
+          FakeRawConnection::waitForInexactMatch(std::string(header).c_str())));
+    }
   }
 };
 
@@ -607,6 +650,39 @@ TEST_P(TcpHealthCheckIntegrationTest, SingleEndpointWrongResponseTcp) {
   EXPECT_EQ(1, test_server_->counter("cluster.cluster_1.health_check.failure")->value());
 }
 
+// Tests that a healthy endpoint returns a valid TCP health check response with ProxyProtocol.
+TEST_P(TcpHealthCheckIntegrationTest, SingleEndpointHealthyTcpWithProxyProtocolV1) {
+  envoy::config::core::v3::ProxyProtocolConfig proxy_protocol_config;
+  proxy_protocol_config.set_version(envoy::config::core::v3::ProxyProtocolConfig_Version_V1);
+
+  const uint32_t cluster_idx = 0;
+  initialize();
+  initProxyProtoHealthCheck(cluster_idx, proxy_protocol_config);
+
+  AssertionResult result = clusters_[cluster_idx].host_fake_raw_connection_->write("Pong");
+  RELEASE_ASSERT(result, result.message());
+
+  test_server_->waitForCounterGe("cluster.cluster_1.health_check.success", 1);
+  EXPECT_EQ(1, test_server_->counter("cluster.cluster_1.health_check.success")->value());
+  EXPECT_EQ(0, test_server_->counter("cluster.cluster_1.health_check.failure")->value());
+}
+
+TEST_P(TcpHealthCheckIntegrationTest, SingleEndpointHealthyTcpWithProxyProtocolV2) {
+  envoy::config::core::v3::ProxyProtocolConfig proxy_protocol_config;
+  proxy_protocol_config.set_version(envoy::config::core::v3::ProxyProtocolConfig_Version_V2);
+
+  const uint32_t cluster_idx = 0;
+  initialize();
+  initProxyProtoHealthCheck(cluster_idx, proxy_protocol_config);
+
+  AssertionResult result = clusters_[cluster_idx].host_fake_raw_connection_->write("Pong");
+  RELEASE_ASSERT(result, result.message());
+
+  test_server_->waitForCounterGe("cluster.cluster_1.health_check.success", 1);
+  EXPECT_EQ(1, test_server_->counter("cluster.cluster_1.health_check.success")->value());
+  EXPECT_EQ(0, test_server_->counter("cluster.cluster_1.health_check.failure")->value());
+}
+
 // Tests that no TCP health check response results in timeout and unhealthy endpoint.
 TEST_P(TcpHealthCheckIntegrationTest, SingleEndpointTimeoutTcp) {
   const uint32_t cluster_idx = 0;
@@ -640,9 +716,10 @@ public:
     health_check->mutable_grpc_health_check();
 
     // Introduce the cluster using compareDiscoveryRequest / sendDiscoveryResponse.
-    EXPECT_TRUE(compareDiscoveryRequest(Config::TypeUrl::get().Cluster, "", {}, {}, {}, true));
-    sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(
-        Config::TypeUrl::get().Cluster, {cluster_data.cluster_}, {cluster_data.cluster_}, {}, "55");
+    EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Cluster, "", {}, {}, {}, true));
+    sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(Config::TestTypeUrl::get().Cluster,
+                                                               {cluster_data.cluster_},
+                                                               {cluster_data.cluster_}, {}, "55");
 
     // Wait for upstream to receive HC request.
     grpc::health::v1::HealthCheckRequest request;
@@ -813,9 +890,10 @@ public:
         cluster_data.external_host_upstream_->localAddress()->ip()->port());
 
     // Introduce the cluster using compareDiscoveryRequest / sendDiscoveryResponse.
-    EXPECT_TRUE(compareDiscoveryRequest(Config::TypeUrl::get().Cluster, "", {}, {}, {}, true));
-    sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(
-        Config::TypeUrl::get().Cluster, {cluster_data.cluster_}, {cluster_data.cluster_}, {}, "55");
+    EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Cluster, "", {}, {}, {}, true));
+    sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(Config::TestTypeUrl::get().Cluster,
+                                                               {cluster_data.cluster_},
+                                                               {cluster_data.cluster_}, {}, "55");
 
     // Wait for upstream to receive EXTERNAL HC request.
     ASSERT_TRUE(cluster_data.external_host_upstream_->waitForRawConnection(
@@ -875,6 +953,117 @@ TEST_P(ExternalHealthCheckIntegrationTest, SingleEndpointTimeoutExternal) {
   test_server_->waitForCounterGe("cluster.cluster_1.health_check.failure", 1);
   EXPECT_EQ(0, test_server_->counter("cluster.cluster_1.health_check.success")->value());
   EXPECT_EQ(1, test_server_->counter("cluster.cluster_1.health_check.failure")->value());
+}
+
+// Test HTTP health check with POST method and payload
+TEST_P(HttpHealthCheckIntegrationTest, SingleEndpointHealthyHttpWithPayload) {
+  const uint32_t cluster_idx = 0;
+  initialize();
+
+  // Setup HTTP health check with POST method and payload
+  const envoy::type::v3::CodecClientType codec_client_type =
+      (Http::CodecType::HTTP1 == upstream_protocol_) ? envoy::type::v3::CodecClientType::HTTP1
+                                                     : envoy::type::v3::CodecClientType::HTTP2;
+
+  auto& cluster_data = clusters_[cluster_idx];
+  auto* health_check = addHealthCheck(cluster_data.cluster_);
+  health_check->mutable_http_health_check()->set_path("/api/health");
+  health_check->mutable_http_health_check()->set_method(envoy::config::core::v3::POST);
+  health_check->mutable_http_health_check()->set_codec_client_type(codec_client_type);
+
+  // Set request payload
+  health_check->mutable_http_health_check()->mutable_send()->set_text(
+      "48656C6C6F20576F726C64"); // "Hello World" in hex
+
+  health_check->mutable_unhealthy_threshold()->set_value(1);
+
+  // Introduce the cluster using compareDiscoveryRequest / sendDiscoveryResponse.
+  EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Cluster, "", {}, {}, {}, true));
+  sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(Config::TestTypeUrl::get().Cluster,
+                                                             {cluster_data.cluster_},
+                                                             {cluster_data.cluster_}, {}, "55");
+
+  // Wait for upstream to receive health check request.
+  ASSERT_TRUE(cluster_data.host_upstream_->waitForHttpConnection(
+      *dispatcher_, cluster_data.host_fake_connection_));
+  ASSERT_TRUE(cluster_data.host_fake_connection_->waitForNewStream(*dispatcher_,
+                                                                   cluster_data.host_stream_));
+  ASSERT_TRUE(cluster_data.host_stream_->waitForEndStream(*dispatcher_));
+
+  // Verify the health check request
+  EXPECT_EQ(cluster_data.host_stream_->headers().getPathValue(), "/api/health");
+  EXPECT_EQ(cluster_data.host_stream_->headers().getMethodValue(), "POST");
+  EXPECT_EQ(cluster_data.host_stream_->headers().getHostValue(), cluster_data.name_);
+  EXPECT_EQ(cluster_data.host_stream_->headers().getContentLengthValue(),
+            "11"); // "Hello World" is 11 bytes
+
+  // Verify the request body
+  EXPECT_EQ(cluster_data.host_stream_->body().toString(), "Hello World");
+
+  // Endpoint responds with healthy status to the health check.
+  cluster_data.host_stream_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}},
+                                           false);
+  cluster_data.host_stream_->encodeData(1024, true);
+
+  // Verify that Envoy detected the health check response.
+  test_server_->waitForCounterGe("cluster.cluster_1.health_check.success", 1);
+  EXPECT_EQ(1, test_server_->counter("cluster.cluster_1.health_check.success")->value());
+  EXPECT_EQ(0, test_server_->counter("cluster.cluster_1.health_check.failure")->value());
+}
+
+// Test HTTP health check with PUT method and binary payload
+TEST_P(HttpHealthCheckIntegrationTest, SingleEndpointHealthyHttpWithBinaryPayload) {
+  const uint32_t cluster_idx = 0;
+  initialize();
+
+  const envoy::type::v3::CodecClientType codec_client_type =
+      (Http::CodecType::HTTP1 == upstream_protocol_) ? envoy::type::v3::CodecClientType::HTTP1
+                                                     : envoy::type::v3::CodecClientType::HTTP2;
+
+  auto& cluster_data = clusters_[cluster_idx];
+  auto* health_check = addHealthCheck(cluster_data.cluster_);
+  health_check->mutable_http_health_check()->set_path("/health");
+  health_check->mutable_http_health_check()->set_method(envoy::config::core::v3::PUT);
+  health_check->mutable_http_health_check()->set_codec_client_type(codec_client_type);
+
+  // Set hex payload - JSON
+  const std::string json_payload = "{\"check\":\"health\"}";
+  health_check->mutable_http_health_check()->mutable_send()->set_text(
+      "7B22636865636B223A226865616C7468227D"); // {"check":"health"} in hex
+
+  health_check->mutable_unhealthy_threshold()->set_value(1);
+
+  // Introduce the cluster using compareDiscoveryRequest / sendDiscoveryResponse.
+  EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Cluster, "", {}, {}, {}, true));
+  sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(Config::TestTypeUrl::get().Cluster,
+                                                             {cluster_data.cluster_},
+                                                             {cluster_data.cluster_}, {}, "55");
+
+  // Wait for upstream to receive health check request.
+  ASSERT_TRUE(cluster_data.host_upstream_->waitForHttpConnection(
+      *dispatcher_, cluster_data.host_fake_connection_));
+  ASSERT_TRUE(cluster_data.host_fake_connection_->waitForNewStream(*dispatcher_,
+                                                                   cluster_data.host_stream_));
+  ASSERT_TRUE(cluster_data.host_stream_->waitForEndStream(*dispatcher_));
+
+  // Verify the health check request
+  EXPECT_EQ(cluster_data.host_stream_->headers().getPathValue(), "/health");
+  EXPECT_EQ(cluster_data.host_stream_->headers().getMethodValue(), "PUT");
+  EXPECT_EQ(cluster_data.host_stream_->headers().getContentLengthValue(),
+            std::to_string(json_payload.length()));
+
+  // Verify the request body
+  EXPECT_EQ(cluster_data.host_stream_->body().toString(), json_payload);
+
+  // Endpoint responds with healthy status to the health check.
+  cluster_data.host_stream_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}},
+                                           false);
+  cluster_data.host_stream_->encodeData(1024, true);
+
+  // Verify that Envoy detected the health check response.
+  test_server_->waitForCounterGe("cluster.cluster_1.health_check.success", 1);
+  EXPECT_EQ(1, test_server_->counter("cluster.cluster_1.health_check.success")->value());
+  EXPECT_EQ(0, test_server_->counter("cluster.cluster_1.health_check.failure")->value());
 }
 
 } // namespace

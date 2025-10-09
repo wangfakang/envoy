@@ -11,6 +11,7 @@
 #include "test/integration/utility.h"
 #include "test/test_common/network_utility.h"
 #include "test/test_common/printers.h"
+#include "test/test_common/test_runtime.h"
 #include "test/test_common/utility.h"
 
 #include "absl/strings/str_cat.h"
@@ -33,6 +34,10 @@ Http::TestRequestHeaderMapImpl upgradeRequestHeaders(const char* upgrade_type = 
 Http::TestResponseHeaderMapImpl upgradeResponseHeaders(const char* upgrade_type = "websocket") {
   return Http::TestResponseHeaderMapImpl{
       {":status", "101"}, {"connection", "upgrade"}, {"upgrade", upgrade_type}};
+}
+
+Http::TestResponseHeaderMapImpl upgradeFailedResponseHeaders() {
+  return Http::TestResponseHeaderMapImpl{{":status", "500"}};
 }
 
 template <class ProxiedHeaders, class OriginalHeaders>
@@ -117,6 +122,18 @@ ConfigHelper::HttpModifierFunction setRouteUsingWebsocket() {
                 hcm) { hcm.add_upgrade_configs()->set_upgrade_type("websocket"); };
 }
 
+ConfigHelper::HttpModifierFunction setRouteRetryOn5xxPolicy() {
+  return [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+                hcm) {
+    auto* route_config = hcm.mutable_route_config();
+    auto* virtual_host = route_config->mutable_virtual_hosts(0);
+    auto* route = virtual_host->mutable_routes(0)->mutable_route();
+    auto* retry_policy = route->mutable_retry_policy();
+    retry_policy->set_retry_on("5xx");
+    retry_policy->mutable_num_retries()->set_value(1);
+  };
+}
+
 void WebsocketIntegrationTest::initialize() {
   if (upstreamProtocol() == Http::CodecType::HTTP2) {
     config_helper_.addConfigModifier(
@@ -129,7 +146,6 @@ void WebsocketIntegrationTest::initialize() {
               *bootstrap.mutable_static_resources()->mutable_clusters(0), protocol_options);
         });
   } else if (upstreamProtocol() == Http::CodecType::HTTP3) {
-    Runtime::maybeSetRuntimeGuard("envoy.reloadable_features.use_http3_header_normalisation", true);
     config_helper_.addConfigModifier(
         [&](envoy::config::bootstrap::v3::Bootstrap& bootstrap) -> void {
           ConfigHelper::HttpProtocolOptions protocol_options;
@@ -146,7 +162,6 @@ void WebsocketIntegrationTest::initialize() {
         [&](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
                 hcm) -> void { hcm.mutable_http2_protocol_options()->set_allow_connect(true); });
   } else if (downstreamProtocol() == Http::CodecType::HTTP3) {
-    Runtime::maybeSetRuntimeGuard("envoy.reloadable_features.use_http3_header_normalisation", true);
     config_helper_.addConfigModifier(
         [&](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
                 hcm) -> void {
@@ -158,7 +173,7 @@ void WebsocketIntegrationTest::initialize() {
 
 void WebsocketIntegrationTest::performUpgrade(
     const Http::TestRequestHeaderMapImpl& upgrade_request_headers,
-    const Http::TestResponseHeaderMapImpl& upgrade_response_headers) {
+    const Http::TestResponseHeaderMapImpl& upgrade_response_headers, bool upgrade_should_fail) {
   // Establish the initial connection.
   codec_client_ = makeHttpConnection(lookupPort("http"));
 
@@ -180,7 +195,9 @@ void WebsocketIntegrationTest::performUpgrade(
 
   // Verify the upgrade response was received downstream.
   response_->waitForHeaders();
-  validateUpgradeResponseHeaders(response_->headers(), upgrade_response_headers);
+  if (!upgrade_should_fail) {
+    validateUpgradeResponseHeaders(response_->headers(), upgrade_response_headers);
+  }
 }
 
 void WebsocketIntegrationTest::sendBidirectionalData() {
@@ -235,53 +252,6 @@ TEST_P(WebsocketIntegrationTest, PortStrippingForHttp2) {
   // Verify the final data was received and that the connection is torn down.
   ASSERT_TRUE(upstream_request_->waitForData(*dispatcher_, "bye!"));
   ASSERT_TRUE(waitForUpstreamDisconnectOrReset());
-}
-
-TEST_P(WebsocketIntegrationTest, EarlyData) {
-  if (downstreamProtocol() != Http::CodecType::HTTP1 ||
-      upstreamProtocol() != Http::CodecType::HTTP1) {
-    return;
-  }
-  config_helper_.addConfigModifier(setRouteUsingWebsocket());
-  initialize();
-
-  // Establish the initial connection.
-  codec_client_ = makeHttpConnection(lookupPort("http"));
-
-  const std::string early_data_req_str = "hello";
-  const std::string early_data_resp_str = "world";
-
-  // Send websocket upgrade request with early data.
-  auto encoder_decoder =
-      codec_client_->startRequest(upgradeRequestHeaders("websocket", early_data_req_str.size()));
-  request_encoder_ = &encoder_decoder.first;
-  response_ = std::move(encoder_decoder.second);
-  codec_client_->sendData(*request_encoder_, early_data_req_str, false);
-
-  // Wait for both the upgrade, and the early data.
-  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
-  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
-  ASSERT_TRUE(upstream_request_->waitForHeadersComplete());
-  ASSERT_TRUE(upstream_request_->waitForData(*dispatcher_, "hello"));
-
-  // Accept websocket upgrade request
-  upstream_request_->encodeHeaders(upgradeResponseHeaders(), false);
-  // Reply also with early data
-  upstream_request_->encodeData(early_data_resp_str, false);
-  // upstream disconnect
-  ASSERT_TRUE(fake_upstream_connection_->close());
-  ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
-
-  response_->waitForHeaders();
-  auto upgrade_response_headers(upgradeResponseHeaders());
-  validateUpgradeResponseHeaders(response_->headers(), upgrade_response_headers);
-
-  if (downstreamProtocol() == Http::CodecType::HTTP1) {
-    // For H2, the disconnect may result in the terminal data not being proxied.
-    response_->waitForBodyData(5);
-  }
-  waitForClientDisconnectOrReset();
-  EXPECT_EQ("world", response_->body());
 }
 
 TEST_P(WebsocketIntegrationTest, WebSocketConnectionIdleTimeout) {
@@ -630,4 +600,419 @@ TEST_P(WebsocketIntegrationTest, BidirectionalConnectNoContentLengthNoTransferEn
   ASSERT_TRUE(fake_upstream_connection->waitForDisconnect());
 }
 
+// Test Websocket Upgrade in HTTP1 with 200 response code.
+TEST_P(WebsocketIntegrationTest, Http1UpgradeStatusCodeOK) {
+  if (downstreamProtocol() != Http::CodecType::HTTP1 ||
+      upstreamProtocol() != Http::CodecType::HTTP1) {
+    return;
+  }
+
+  config_helper_.addConfigModifier(setRouteUsingWebsocket());
+  initialize();
+
+  auto in_correct_status_response_headers = upgradeResponseHeaders();
+  in_correct_status_response_headers.setStatus(200);
+
+  // The upgrade should be paused, but the response header is proxied back to downstream.
+  performUpgrade(upgradeRequestHeaders(), in_correct_status_response_headers, true);
+  EXPECT_EQ("200", response_->headers().Status()->value().getStringView());
+  EXPECT_EQ("upgrade", response_->headers().Connection()->value().getStringView());
+  EXPECT_EQ("websocket", response_->headers().Upgrade()->value().getStringView());
+
+  test_server_->waitForCounterEq("cluster.cluster_0.upstream_cx_destroy", 1);
+  test_server_->waitForGaugeEq("http.config_test.downstream_cx_upgrades_active", 0);
+  ASSERT_TRUE(codec_client_->waitForDisconnect());
+  ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
+}
+
+// Test Websocket Upgrade with 200 response code from no HTTP1 upstream and downstream.
+TEST_P(WebsocketIntegrationTest, NonHttp1UpgradeStatusCodeOK) {
+  if (upstreamProtocol() == Http::CodecType::HTTP1 ||
+      downstreamProtocol() == Http::CodecType::HTTP1) {
+    return;
+  }
+
+  config_helper_.addConfigModifier(setRouteUsingWebsocket());
+  initialize();
+
+  auto correct_status_response_headers = upgradeResponseHeaders();
+  correct_status_response_headers.setStatus(200);
+  performUpgrade(upgradeRequestHeaders(), correct_status_response_headers, true);
+
+  // HTTP2 upstream response 200 is converted to 101.
+  EXPECT_EQ("101", response_->headers().Status()->value().getStringView());
+  test_server_->waitForGaugeEq("http.config_test.downstream_cx_upgrades_active", 1);
+  codec_client_->close();
+}
+
+// Test Websocket Upgrade with 201 response code from no HTTP1 upstream and downstream.
+// This patch will not impact no H/1 behaviors.
+TEST_P(WebsocketIntegrationTest, NoHttp1UpstreamUpgradeStatus201) {
+  if (upstreamProtocol() == Http::CodecType::HTTP1 ||
+      downstreamProtocol() == Http::CodecType::HTTP1) {
+    return;
+  }
+
+  config_helper_.addConfigModifier(setRouteUsingWebsocket());
+  initialize();
+
+  auto correct_status_response_headers = upgradeResponseHeaders();
+  correct_status_response_headers.setStatus(201);
+  performUpgrade(upgradeRequestHeaders(), correct_status_response_headers, true);
+
+  EXPECT_EQ("201", response_->headers().Status()->value().getStringView());
+  test_server_->waitForGaugeEq("http.config_test.downstream_cx_upgrades_active", 1);
+  codec_client_->close();
+}
+
+// Test Websocket Upgrade in HTTP1 with 426 response code.
+// Upgrade is a HTTP1 header.
+TEST_P(WebsocketIntegrationTest, Http1UpgradeStatusCodeUpgradeRequired) {
+  if (downstreamProtocol() != Http::CodecType::HTTP1 ||
+      upstreamProtocol() != Http::CodecType::HTTP1) {
+    return;
+  }
+
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues(
+      {{"envoy.reloadable_features.websocket_allow_4xx_5xx_through_filter_chain", "false"}});
+
+  useAccessLog("%RESPONSE_CODE_DETAILS%");
+  config_helper_.addConfigModifier(setRouteUsingWebsocket());
+  initialize();
+
+  auto in_correct_status_response_headers = upgradeResponseHeaders();
+  in_correct_status_response_headers.setStatus(426);
+
+  // The upgrade should be paused, but the response header is proxied back to downstream.
+  performUpgrade(upgradeRequestHeaders(), in_correct_status_response_headers, true);
+  EXPECT_EQ("426", response_->headers().Status()->value().getStringView());
+  EXPECT_EQ("upgrade", response_->headers().Connection()->value().getStringView());
+  EXPECT_EQ("websocket", response_->headers().Upgrade()->value().getStringView());
+
+  test_server_->waitForCounterEq("cluster.cluster_0.upstream_cx_destroy", 1);
+  test_server_->waitForGaugeEq("http.config_test.downstream_cx_upgrades_active", 0);
+  ASSERT_TRUE(codec_client_->waitForDisconnect());
+  ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
+}
+
+// Test Websocket Upgrade in HTTP1 with 500 response code.
+// Upgrade is a HTTP1 header.
+TEST_P(WebsocketIntegrationTest, Http1UpgradeStatus5OOWithFilterChain) {
+  if (downstreamProtocol() != Http::CodecType::HTTP1 ||
+      upstreamProtocol() != Http::CodecType::HTTP1) {
+    return;
+  }
+
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues(
+      {{"envoy.reloadable_features.websocket_allow_4xx_5xx_through_filter_chain", "true"}});
+
+  useAccessLog("%RESPONSE_CODE_DETAILS%");
+  config_helper_.addConfigModifier(setRouteUsingWebsocket());
+  initialize();
+
+  auto in_correct_status_response_headers = upgradeFailedResponseHeaders();
+
+  // The upgrade should be paused, but the response header is proxied back to downstream.
+  performUpgrade(upgradeRequestHeaders(), in_correct_status_response_headers, true);
+  EXPECT_EQ("500", response_->headers().Status()->value().getStringView());
+
+  test_server_->waitForCounterEq("cluster.cluster_0.upstream_cx_destroy", 0);
+  test_server_->waitForGaugeEq("http.config_test.downstream_cx_upgrades_active", 1);
+  codec_client_->close();
+  ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
+}
+
+// Test Websocket Upgrade in HTTP1 with a retry policy.
+TEST_P(WebsocketIntegrationTest, Http1UpgradeRetryWithFilterChain) {
+  if (downstreamProtocol() != Http::CodecType::HTTP1 ||
+      upstreamProtocol() != Http::CodecType::HTTP1) {
+    return;
+  }
+
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues(
+      {{"envoy.reloadable_features.websocket_allow_4xx_5xx_through_filter_chain", "true"}});
+
+  useAccessLog("%RESPONSE_CODE_DETAILS%");
+  config_helper_.addConfigModifier(setRouteUsingWebsocket());
+  config_helper_.addConfigModifier(setRouteRetryOn5xxPolicy());
+
+  initialize();
+
+  // Establish the initial connection.
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  // Send websocket upgrade request
+  auto encoder_decoder = codec_client_->startRequest(upgradeRequestHeaders());
+  request_encoder_ = &encoder_decoder.first;
+  response_ = std::move(encoder_decoder.second);
+  test_server_->waitForCounterGe("http.config_test.downstream_cx_upgrades_total", 1);
+  test_server_->waitForGaugeGe("http.config_test.downstream_cx_upgrades_active", 1);
+
+  // Verify the first upgrade was received upstream.
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForHeadersComplete());
+  validateUpgradeRequestHeaders(upstream_request_->headers(), upgradeRequestHeaders());
+
+  // Send a 500 response to trigger retry
+  auto failed_response_headers = upgradeFailedResponseHeaders();
+  upstream_request_->encodeHeaders(failed_response_headers, false);
+
+  // For HTTP/1, the connection will be closed and a new one established for retry
+  ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
+
+  // Wait for the retry - new upstream connection and request
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForHeadersComplete());
+  validateUpgradeRequestHeaders(upstream_request_->headers(), upgradeRequestHeaders());
+  test_server_->waitForCounterEq("cluster.cluster_0.upstream_rq_retry", 1);
+
+  // Send the successful 101 upgrade response on the second try
+  auto success_response_headers = upgradeResponseHeaders();
+  upstream_request_->encodeHeaders(success_response_headers, false);
+
+  // Verify the successful upgrade response was received downstream.
+  response_->waitForHeaders();
+  EXPECT_EQ("101", response_->headers().Status()->value().getStringView());
+  EXPECT_EQ("upgrade", response_->headers().Connection()->value().getStringView());
+  EXPECT_EQ("websocket", response_->headers().Upgrade()->value().getStringView());
+  validateUpgradeResponseHeaders(response_->headers(), success_response_headers);
+  test_server_->waitForCounterEq("cluster.cluster_0.upstream_rq_retry_success", 1);
+
+  // Verify successful websocket connection by sending bidirectional data
+  sendBidirectionalData();
+
+  // Clean up
+  codec_client_->sendData(*request_encoder_, "bye!", false);
+  codec_client_->close();
+  ASSERT_TRUE(upstream_request_->waitForData(*dispatcher_, "hellobye!"));
+  ASSERT_TRUE(waitForUpstreamDisconnectOrReset());
+}
+
+// Test data flow when websocket handshake failed.
+TEST_P(WebsocketIntegrationTest, BidirectionalUpgradeFailedWithPrePayload) {
+  if (downstreamProtocol() != Http::CodecType::HTTP1 ||
+      upstreamProtocol() != Http::CodecType::HTTP1) {
+    return;
+  }
+
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues(
+      {{"envoy.reloadable_features.websocket_allow_4xx_5xx_through_filter_chain", "true"}});
+
+  config_helper_.addConfigModifier(setRouteUsingWebsocket());
+  initialize();
+
+  IntegrationTcpClientPtr tcp_client = makeTcpConnection(lookupPort("http"));
+
+  // Send upgrade request with additional data.
+  ASSERT_TRUE(tcp_client->write(
+      "GET / HTTP/1.1\r\nHost: host\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\nfoo boo",
+      false, false));
+
+  FakeRawConnectionPtr fake_upstream_connection;
+  ASSERT_TRUE(fake_upstreams_[0]->waitForRawConnection(fake_upstream_connection));
+  ASSERT(fake_upstream_connection != nullptr);
+  std::string received_data;
+  ASSERT_TRUE(fake_upstream_connection->waitForData(
+      FakeRawConnection::waitForInexactMatch("\r\n\r\n"), &received_data));
+  // Make sure Envoy did not add TE or CL headers
+  ASSERT_FALSE(absl::StrContains(received_data, "content-length"));
+  ASSERT_FALSE(absl::StrContains(received_data, "transfer-encoding"));
+  ASSERT_TRUE(fake_upstream_connection->write(
+      "HTTP/1.1 426 Upgrade Required\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n", false));
+
+  tcp_client->waitForData("\r\n\r\n", false);
+
+  // Should not receive any data before handshake is finished.
+  std::string received_data_prepayload;
+  ASSERT_FALSE(fake_upstream_connection->waitForData(
+      FakeRawConnection::waitForInexactMatch("foo boo"), nullptr, std::chrono::milliseconds(10)));
+
+  tcp_client->close();
+  ASSERT_TRUE(fake_upstream_connection->waitForDisconnect());
+}
+
+// Test websocket upgrade per-try timeout
+TEST_P(WebsocketIntegrationTest, WebSocketUpgradePerTryTimeout) {
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues(
+      {{"envoy.reloadable_features.websocket_enable_timeout_on_upgrade_response", "true"}});
+
+  config_helper_.addConfigModifier(setRouteUsingWebsocket());
+  config_helper_.addConfigModifier(
+      [&](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+              hcm) -> void {
+        auto* route_config = hcm.mutable_route_config();
+        auto* virtual_host = route_config->mutable_virtual_hosts(0);
+        auto* route = virtual_host->mutable_routes(0)->mutable_route();
+        route->mutable_retry_policy()->mutable_per_try_timeout()->set_nanos(
+            200 * 1000 * 1000); // 200ms per-try timeout
+      });
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto encoder_decoder = codec_client_->startRequest(upgradeRequestHeaders());
+  request_encoder_ = &encoder_decoder.first;
+  response_ = std::move(encoder_decoder.second);
+  test_server_->waitForCounterGe("http.config_test.downstream_cx_upgrades_total", 1);
+
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForHeadersComplete());
+
+  test_server_->waitForCounterGe("cluster.cluster_0.upstream_rq_per_try_timeout", 1);
+  ASSERT_TRUE(response_->waitForEndStream());
+  EXPECT_EQ("504", response_->headers().getStatusValue());
+
+  codec_client_->close();
+  ASSERT_TRUE(waitForUpstreamDisconnectOrReset());
+}
+
+// Test websocket upgrade route timeout
+TEST_P(WebsocketIntegrationTest, WebSocketUpgradeRouteTimeout) {
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues(
+      {{"envoy.reloadable_features.websocket_enable_timeout_on_upgrade_response", "true"}});
+
+  config_helper_.addConfigModifier(setRouteUsingWebsocket());
+  config_helper_.addConfigModifier(
+      [&](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+              hcm) -> void {
+        auto* route_config = hcm.mutable_route_config();
+        auto* virtual_host = route_config->mutable_virtual_hosts(0);
+        auto* route = virtual_host->mutable_routes(0)->mutable_route();
+        route->mutable_timeout()->set_nanos(200 * 1000 * 1000); // 200ms route timeout
+      });
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto encoder_decoder = codec_client_->startRequest(upgradeRequestHeaders());
+  request_encoder_ = &encoder_decoder.first;
+  response_ = std::move(encoder_decoder.second);
+  test_server_->waitForCounterGe("http.config_test.downstream_cx_upgrades_total", 1);
+
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForHeadersComplete());
+
+  test_server_->waitForCounterGe("cluster.cluster_0.upstream_rq_timeout", 1);
+  ASSERT_TRUE(response_->waitForEndStream());
+  EXPECT_EQ("504", response_->headers().getStatusValue());
+
+  codec_client_->close();
+  ASSERT_TRUE(waitForUpstreamDisconnectOrReset());
+}
+
+// Test websocket upgrade route timeout is maintained with retries
+TEST_P(WebsocketIntegrationTest, WebSocketUpgradeRouteTimeoutWithRetries) {
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues(
+      {{"envoy.reloadable_features.websocket_enable_timeout_on_upgrade_response", "true"}});
+
+  config_helper_.addConfigModifier(setRouteUsingWebsocket());
+  config_helper_.addConfigModifier(setRouteRetryOn5xxPolicy());
+  config_helper_.addConfigModifier(
+      [&](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+              hcm) -> void {
+        auto* route_config = hcm.mutable_route_config();
+        auto* virtual_host = route_config->mutable_virtual_hosts(0);
+        auto* route = virtual_host->mutable_routes(0)->mutable_route();
+        route->mutable_timeout()->set_nanos(200 * 1000 * 1000); // 200ms route timeout
+      });
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto encoder_decoder = codec_client_->startRequest(upgradeRequestHeaders());
+  request_encoder_ = &encoder_decoder.first;
+  response_ = std::move(encoder_decoder.second);
+  test_server_->waitForCounterGe("http.config_test.downstream_cx_upgrades_total", 1);
+
+  // First attempt - send 500 to trigger retry
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForHeadersComplete());
+  upstream_request_->encodeHeaders(upgradeFailedResponseHeaders(), false);
+
+  // Wait for the first request to be reset or disconnected
+  ASSERT_TRUE(waitForUpstreamDisconnectOrReset());
+  test_server_->waitForCounterEq("cluster.cluster_0.upstream_rq_retry", 1);
+
+  // Second attempt - wait for new connection or reuse existing one
+  FakeHttpConnectionPtr fake_upstream_connection2;
+  FakeStreamPtr upstream_request2;
+  if (upstreamProtocol() == Http::CodecType::HTTP1) {
+    // HTTP/1 creates a new connection for retry
+    ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection2));
+    ASSERT_TRUE(fake_upstream_connection2->waitForNewStream(*dispatcher_, upstream_request2));
+  } else {
+    // HTTP/2 and HTTP/3 can reuse the existing connection
+    ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request2));
+  }
+  ASSERT_TRUE(upstream_request2->waitForHeadersComplete());
+
+  // Route timeout should still fire after retry
+  test_server_->waitForCounterGe("cluster.cluster_0.upstream_rq_timeout", 1);
+  ASSERT_TRUE(response_->waitForEndStream());
+  EXPECT_EQ("504", response_->headers().getStatusValue());
+
+  cleanupUpstreamAndDownstream();
+}
+
+TEST_P(WebsocketIntegrationTest, WebsocketUpgradeWithDisabledSmallBufferFilter) {
+  if (downstreamProtocol() != Http::CodecType::HTTP1 ||
+      upstreamProtocol() != Http::CodecType::HTTP1) {
+    return;
+  }
+
+  const std::string WebsocketUpgradeWithDisabledSmallBufferConfig = R"EOF(
+    name: typed-per-filter-config-for-ws
+    virtual_hosts:
+    - name: app-ws
+      domains:
+      - "*"
+      routes:
+      - match:
+          prefix: "/websocket/test"
+        route:
+          cluster: cluster_0
+          upgrade_configs:
+          - upgrade_type: websocket
+        typed_per_filter_config:
+          buffer:
+            "@type": type.googleapis.com/envoy.config.route.v3.FilterConfig
+            disabled: true
+)EOF";
+
+  const std::string TinyBufferFilter = R"EOF(
+    name: buffer
+    typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.http.buffer.v3.Buffer
+        max_request_bytes : 1
+)EOF";
+
+  config_helper_.prependFilter(TinyBufferFilter);
+  config_helper_.addConfigModifier(
+      [&](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+              hcm) -> void {
+        auto route_config = hcm.mutable_route_config();
+        TestUtility::loadFromYaml(WebsocketUpgradeWithDisabledSmallBufferConfig, *route_config);
+      });
+  initialize();
+
+  performUpgrade(upgradeRequestHeaders(), upgradeResponseHeaders());
+  sendBidirectionalData();
+
+  // Send some final data from the client, and disconnect.
+  codec_client_->sendData(*request_encoder_, "bye!", false);
+  codec_client_->close();
+
+  // Verify the final data was received and that the connection is torn down.
+  ASSERT_TRUE(upstream_request_->waitForData(*dispatcher_, "hellobye!"));
+  ASSERT_TRUE(waitForUpstreamDisconnectOrReset());
+}
 } // namespace Envoy

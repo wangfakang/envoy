@@ -24,6 +24,13 @@ public:
    * @return The buckets for the histogram. Each value is an upper bound of a bucket.
    */
   virtual ConstSupportedBuckets& buckets(absl::string_view stat_name) const PURE;
+
+  /**
+   * Number of bins to pre-allocate per each thread instance (times 2 for active/passive
+   * version of the histogram).
+   * @return An optional override for the number of bins.
+   */
+  virtual absl::optional<uint32_t> bins(absl::string_view stat_name) const PURE;
 };
 
 using HistogramSettingsConstPtr = std::unique_ptr<const HistogramSettings>;
@@ -86,6 +93,12 @@ public:
    * Returns sum of all values during the period.
    */
   virtual double sampleSum() const PURE;
+
+  /**
+   * Returns the count of values which are out of the boundaries of the histogram bins.
+   * I.e., the count of values in the (bound_of_last_bucket, +inf) bucket.
+   */
+  virtual uint64_t outOfBoundCount() const PURE;
 };
 
 /**

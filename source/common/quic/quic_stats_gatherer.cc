@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include "envoy/formatter/http_formatter_context.h"
+
 namespace Envoy {
 namespace Quic {
 
@@ -9,6 +11,9 @@ void QuicStatsGatherer::OnPacketAcked(int acked_bytes,
                                       quic::QuicTime::Delta /* delta_largest_observed */) {
   bytes_outstanding_ -= acked_bytes;
   if (bytes_outstanding_ == 0 && fin_sent_ && !logging_done_) {
+    if (time_source_ != nullptr) {
+      last_downstream_ack_timestamp_ = time_source_->monotonicTime();
+    }
     maybeDoDeferredLog();
   }
 }
@@ -19,21 +24,32 @@ void QuicStatsGatherer::OnPacketRetransmitted(int retransmitted_bytes) {
 }
 
 void QuicStatsGatherer::maybeDoDeferredLog(bool record_ack_timing) {
-  logging_done_ = true;
+  if (!fix_defer_logging_miss_for_half_closed_stream_) {
+    logging_done_ = true;
+  }
   if (stream_info_ == nullptr) {
     return;
   }
+  if (fix_defer_logging_miss_for_half_closed_stream_) {
+    logging_done_ = true;
+  }
   if (time_source_ != nullptr && record_ack_timing) {
     stream_info_->downstreamTiming().onLastDownstreamAckReceived(*time_source_);
+  } else if (fix_defer_logging_miss_for_half_closed_stream_ &&
+             last_downstream_ack_timestamp_.has_value()) {
+    stream_info_->downstreamTiming().last_downstream_ack_received_ = last_downstream_ack_timestamp_;
   }
   stream_info_->addBytesRetransmitted(retransmitted_bytes_);
   stream_info_->addPacketsRetransmitted(retransmitted_packets_);
-  const Http::RequestHeaderMap* request_headers = request_header_map_.get();
-  const Http::ResponseHeaderMap* response_headers = response_header_map_.get();
-  const Http::ResponseTrailerMap* response_trailers = response_trailer_map_.get();
+
+  const Formatter::HttpFormatterContext log_context{request_header_map_.get(),
+                                                    response_header_map_.get(),
+                                                    response_trailer_map_.get(),
+                                                    {},
+                                                    AccessLog::AccessLogType::DownstreamEnd};
+
   for (const AccessLog::InstanceSharedPtr& log_handler : access_log_handlers_) {
-    log_handler->log(request_headers, response_headers, response_trailers, *stream_info_,
-                     AccessLog::AccessLogType::DownstreamEnd);
+    log_handler->log(log_context, *stream_info_);
   }
 }
 

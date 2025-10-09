@@ -34,7 +34,7 @@ TEST(MatchingData, DestinationIPInput) {
 
   {
     socket.connection_info_provider_->setLocalAddress(
-        std::make_shared<Network::Address::PipeInstance>("/pipe/path"));
+        *Network::Address::PipeInstance::create("/pipe/path"));
     const auto result = input.get(data);
     EXPECT_EQ(result.data_availability_,
               Matcher::DataInputGetResult::DataAvailability::AllDataAvailable);
@@ -51,7 +51,8 @@ TEST(MatchingData, HttpDestinationIPInput) {
   auto host = "example.com";
   connection_info_provider->setRequestedServerName(host);
   StreamInfo::StreamInfoImpl stream_info(
-      Http::Protocol::Http2, Event::GlobalTimeSystem().timeSystem(), connection_info_provider);
+      Http::Protocol::Http2, Event::GlobalTimeSystem().timeSystem(), connection_info_provider,
+      StreamInfo::FilterState::LifeSpan::FilterChain);
   Http::Matching::HttpMatchingDataImpl data(stream_info);
   {
     DestinationIPInput<Http::HttpMatchingData> input;
@@ -125,7 +126,7 @@ TEST(MatchingData, DestinationPortInput) {
 
   {
     socket.connection_info_provider_->setLocalAddress(
-        std::make_shared<Network::Address::PipeInstance>("/pipe/path"));
+        *Network::Address::PipeInstance::create("/pipe/path"));
     const auto result = input.get(data);
     EXPECT_EQ(result.data_availability_,
               Matcher::DataInputGetResult::DataAvailability::AllDataAvailable);
@@ -151,7 +152,7 @@ TEST(MatchingData, SourceIPInput) {
 
   {
     socket.connection_info_provider_->setRemoteAddress(
-        std::make_shared<Network::Address::PipeInstance>("/pipe/path"));
+        *Network::Address::PipeInstance::create("/pipe/path"));
     const auto result = input.get(data);
     EXPECT_EQ(result.data_availability_,
               Matcher::DataInputGetResult::DataAvailability::AllDataAvailable);
@@ -177,7 +178,7 @@ TEST(MatchingData, SourcePortInput) {
 
   {
     socket.connection_info_provider_->setRemoteAddress(
-        std::make_shared<Network::Address::PipeInstance>("/pipe/path"));
+        *Network::Address::PipeInstance::create("/pipe/path"));
     const auto result = input.get(data);
     EXPECT_EQ(result.data_availability_,
               Matcher::DataInputGetResult::DataAvailability::AllDataAvailable);
@@ -203,7 +204,7 @@ TEST(MatchingData, DirectSourceIPInput) {
 
   {
     socket.connection_info_provider_->setDirectRemoteAddressForTest(
-        std::make_shared<Network::Address::PipeInstance>("/pipe/path"));
+        *Network::Address::PipeInstance::create("/pipe/path"));
     const auto result = input.get(data);
     EXPECT_EQ(result.data_availability_,
               Matcher::DataInputGetResult::DataAvailability::AllDataAvailable);
@@ -323,11 +324,7 @@ TEST(MatchingData, ApplicationProtocolInput) {
 
 TEST(MatchingData, FilterStateInput) {
   std::string key = "filter_state_key";
-
-  envoy::extensions::matching::common_inputs::network::v3::FilterStateInput input_config;
-  input_config.set_key(key);
-
-  FilterStateInput input(input_config);
+  FilterStateInput<MatchingData> input(key);
 
   MockConnectionSocket socket;
   StreamInfo::FilterStateImpl filter_state(StreamInfo::FilterState::LifeSpan::Connection);
@@ -368,7 +365,7 @@ TEST(MatchingData, FilterStateInput) {
 TEST(UdpMatchingData, UdpDestinationIPInput) {
   DestinationIPInput<UdpMatchingData> input;
   const Address::Ipv4Instance ip("127.0.0.1", 8080);
-  const Address::PipeInstance pipe("/pipe/path");
+  const auto pipe = *Address::PipeInstance::create("/pipe/path");
 
   {
     UdpMatchingDataImpl data(ip, ip);
@@ -379,7 +376,7 @@ TEST(UdpMatchingData, UdpDestinationIPInput) {
   }
 
   {
-    UdpMatchingDataImpl data(pipe, ip);
+    UdpMatchingDataImpl data(*pipe, ip);
     const auto result = input.get(data);
     EXPECT_EQ(result.data_availability_,
               Matcher::DataInputGetResult::DataAvailability::AllDataAvailable);
@@ -390,7 +387,7 @@ TEST(UdpMatchingData, UdpDestinationIPInput) {
 TEST(UdpMatchingData, UdpDestinationPortInput) {
   DestinationPortInput<UdpMatchingData> input;
   const Address::Ipv4Instance ip("127.0.0.1", 8080);
-  const Address::PipeInstance pipe("/pipe/path");
+  const auto pipe = *Address::PipeInstance::create("/pipe/path");
 
   {
     UdpMatchingDataImpl data(ip, ip);
@@ -401,7 +398,7 @@ TEST(UdpMatchingData, UdpDestinationPortInput) {
   }
 
   {
-    UdpMatchingDataImpl data(pipe, ip);
+    UdpMatchingDataImpl data(*pipe, ip);
     const auto result = input.get(data);
     EXPECT_EQ(result.data_availability_,
               Matcher::DataInputGetResult::DataAvailability::AllDataAvailable);
@@ -412,7 +409,7 @@ TEST(UdpMatchingData, UdpDestinationPortInput) {
 TEST(UdpMatchingData, UdpSourceIPInput) {
   SourceIPInput<UdpMatchingData> input;
   const Address::Ipv4Instance ip("127.0.0.1", 8080);
-  const Address::PipeInstance pipe("/pipe/path");
+  const auto pipe = *Address::PipeInstance::create("/pipe/path");
 
   {
     UdpMatchingDataImpl data(ip, ip);
@@ -423,7 +420,7 @@ TEST(UdpMatchingData, UdpSourceIPInput) {
   }
 
   {
-    UdpMatchingDataImpl data(ip, pipe);
+    UdpMatchingDataImpl data(ip, *pipe);
     const auto result = input.get(data);
     EXPECT_EQ(result.data_availability_,
               Matcher::DataInputGetResult::DataAvailability::AllDataAvailable);
@@ -434,7 +431,7 @@ TEST(UdpMatchingData, UdpSourceIPInput) {
 TEST(UdpMatchingData, UdpSourcePortInput) {
   SourcePortInput<UdpMatchingData> input;
   const Address::Ipv4Instance ip("127.0.0.1", 8080);
-  const Address::PipeInstance pipe("/pipe/path");
+  const auto pipe = *Address::PipeInstance::create("/pipe/path");
 
   {
     UdpMatchingDataImpl data(ip, ip);
@@ -445,7 +442,115 @@ TEST(UdpMatchingData, UdpSourcePortInput) {
   }
 
   {
-    UdpMatchingDataImpl data(ip, pipe);
+    UdpMatchingDataImpl data(ip, *pipe);
+    const auto result = input.get(data);
+    EXPECT_EQ(result.data_availability_,
+              Matcher::DataInputGetResult::DataAvailability::AllDataAvailable);
+    EXPECT_TRUE(absl::holds_alternative<absl::monostate>(result.data_));
+  }
+}
+
+TEST(MatchingData, NetworkNamespaceInput) {
+  NetworkNamespaceInput<MatchingData> input;
+  MockConnectionSocket socket;
+  StreamInfo::FilterStateImpl filter_state(StreamInfo::FilterState::LifeSpan::Connection);
+  envoy::config::core::v3::Metadata metadata;
+  MatchingDataImpl data(socket, filter_state, metadata);
+
+  // Test with no network namespace (default case).
+  {
+    socket.connection_info_provider_->setLocalAddress(
+        std::make_shared<Network::Address::Ipv4Instance>("127.0.0.1", 8080));
+    const auto result = input.get(data);
+    EXPECT_EQ(result.data_availability_,
+              Matcher::DataInputGetResult::DataAvailability::AllDataAvailable);
+    EXPECT_TRUE(absl::holds_alternative<absl::monostate>(result.data_));
+  }
+
+  // Test with network namespace.
+  {
+    socket.connection_info_provider_->setLocalAddress(
+        std::make_shared<Network::Address::Ipv4Instance>(
+            "127.0.0.1", 8080, nullptr, absl::make_optional(std::string("/var/run/netns/ns1"))));
+    const auto result = input.get(data);
+    EXPECT_EQ(result.data_availability_,
+              Matcher::DataInputGetResult::DataAvailability::AllDataAvailable);
+    EXPECT_EQ(absl::get<std::string>(result.data_), "/var/run/netns/ns1");
+  }
+
+  // Test with empty network namespace.
+  {
+    socket.connection_info_provider_->setLocalAddress(
+        std::make_shared<Network::Address::Ipv4Instance>("127.0.0.1", 8080, nullptr,
+                                                         absl::make_optional(std::string(""))));
+    const auto result = input.get(data);
+    EXPECT_EQ(result.data_availability_,
+              Matcher::DataInputGetResult::DataAvailability::AllDataAvailable);
+    EXPECT_TRUE(absl::holds_alternative<absl::monostate>(result.data_));
+  }
+
+  // Test with IPv6 address and network namespace.
+  {
+    socket.connection_info_provider_->setLocalAddress(
+        std::make_shared<Network::Address::Ipv6Instance>(
+            "::1", 8080, nullptr, true, absl::make_optional(std::string("/var/run/netns/ns2"))));
+    const auto result = input.get(data);
+    EXPECT_EQ(result.data_availability_,
+              Matcher::DataInputGetResult::DataAvailability::AllDataAvailable);
+    EXPECT_EQ(absl::get<std::string>(result.data_), "/var/run/netns/ns2");
+  }
+
+  // Test with pipe address. This should return monostate since pipes don't have network namespaces.
+  {
+    socket.connection_info_provider_->setLocalAddress(
+        *Network::Address::PipeInstance::create("/pipe/path"));
+    const auto result = input.get(data);
+    EXPECT_EQ(result.data_availability_,
+              Matcher::DataInputGetResult::DataAvailability::AllDataAvailable);
+    EXPECT_TRUE(absl::holds_alternative<absl::monostate>(result.data_));
+  }
+}
+
+TEST(MatchingData, HttpNetworkNamespaceInput) {
+  auto connection_info_provider = std::make_shared<Network::ConnectionInfoSetterImpl>(
+      std::make_shared<Address::Ipv4Instance>(
+          "127.0.0.1", 8080, nullptr, absl::make_optional(std::string("/var/run/netns/http_ns"))),
+      std::make_shared<Address::Ipv4Instance>("10.0.0.1", 9090));
+
+  StreamInfo::StreamInfoImpl stream_info(
+      Http::Protocol::Http2, Event::GlobalTimeSystem().timeSystem(), connection_info_provider,
+      StreamInfo::FilterState::LifeSpan::FilterChain);
+  Http::Matching::HttpMatchingDataImpl data(stream_info);
+
+  NetworkNamespaceInput<Http::HttpMatchingData> input;
+  const auto result = input.get(data);
+  EXPECT_EQ(result.data_availability_,
+            Matcher::DataInputGetResult::DataAvailability::AllDataAvailable);
+  EXPECT_EQ(absl::get<std::string>(result.data_), "/var/run/netns/http_ns");
+}
+
+TEST(UdpMatchingData, UdpNetworkNamespaceInput) {
+  NetworkNamespaceInput<UdpMatchingData> input;
+
+  // Test with network namespace.
+  {
+    const Address::Ipv4Instance local_ip("127.0.0.1", 8080, nullptr,
+                                         absl::make_optional(std::string("/var/run/netns/udp_ns")));
+    const Address::Ipv4Instance remote_ip("10.0.0.1", 9090);
+    UdpMatchingDataImpl data(local_ip, remote_ip);
+
+    const auto result = input.get(data);
+    EXPECT_EQ(result.data_availability_,
+              Matcher::DataInputGetResult::DataAvailability::AllDataAvailable);
+    EXPECT_EQ(absl::get<std::string>(result.data_), "/var/run/netns/udp_ns");
+  }
+
+  // Test without network namespace.
+  {
+    const Address::Ipv4Instance local_ip("127.0.0.1", 8080);
+    const Address::Ipv4Instance remote_ip("10.0.0.1", 9090);
+    UdpMatchingDataImpl data(local_ip, remote_ip);
+
     const auto result = input.get(data);
     EXPECT_EQ(result.data_availability_,
               Matcher::DataInputGetResult::DataAvailability::AllDataAvailable);

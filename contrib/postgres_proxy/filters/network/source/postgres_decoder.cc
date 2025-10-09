@@ -76,7 +76,7 @@ void DecoderImpl::initialize() {
   BE_known_msgs['D'] = MessageProcessor{"DataRow", BODY_FORMAT(Array<VarByteN>), {}};
   BE_known_msgs['I'] = MessageProcessor{"EmptyQueryResponse", NO_BODY, {}};
   BE_known_msgs['E'] = MessageProcessor{
-      "ErrorResponse", BODY_FORMAT(Byte1, String), {&DecoderImpl::decodeBackendErrorResponse}};
+      "ErrorResponse", BODY_FORMAT(ZeroTCodes<String>), {&DecoderImpl::decodeBackendErrorResponse}};
   BE_known_msgs['V'] = MessageProcessor{"FunctionCallResponse", BODY_FORMAT(VarByteN), {}};
   BE_known_msgs['v'] = MessageProcessor{"NegotiateProtocolVersion", BODY_FORMAT(ByteN), {}};
   BE_known_msgs['n'] = MessageProcessor{"NoData", NO_BODY, {}};
@@ -268,6 +268,8 @@ Decoder::Result DecoderImpl::onDataInit(Buffer::Instance& data, bool) {
       // Stay in InitState. After switch to SSL, another init packet will be sent.
     }
   } else {
+    callbacks_->verifyDownstreamSSL();
+
     ENVOY_LOG(debug, "Detected version {}.{} of Postgres", code >> 16, code & 0x0000FFFF);
     if (callbacks_->shouldEncryptUpstream()) {
       // Copy the received initial request.
@@ -440,7 +442,8 @@ Decoder::Result DecoderImpl::onDataInNegotiating(Buffer::Instance& data, bool fr
 
   // This should be reply from the server indicating if it accepted
   // request to use SSL. It is only one character long packet, where
-  // 'S' means use SSL, 'E' means do not use.
+  // 'S' means use SSL, 'N' means do not use.
+  // See details in https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-SSL
 
   // Indicate to the filter, the response and give the initial
   // packet temporarily buffered to be sent upstream.
@@ -451,7 +454,7 @@ Decoder::Result DecoderImpl::onDataInNegotiating(Buffer::Instance& data, bool fr
     if (c == 'S') {
       upstreamSSL = true;
     } else {
-      if (c != 'E') {
+      if (c != 'N') {
         state_ = State::OutOfSyncState;
       }
     }
@@ -461,7 +464,9 @@ Decoder::Result DecoderImpl::onDataInNegotiating(Buffer::Instance& data, bool fr
 
   data.drain(data.length());
 
-  callbacks_->encryptUpstream(upstreamSSL, temp_storage_);
+  if (callbacks_->encryptUpstream(upstreamSSL, temp_storage_)) {
+    state_ = State::InSyncState;
+  }
 
   return Decoder::Result::Stopped;
 }

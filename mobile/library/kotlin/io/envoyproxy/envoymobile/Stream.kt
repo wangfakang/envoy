@@ -17,10 +17,16 @@ open class Stream(
    *
    * @param headers Headers to send over the stream.
    * @param endStream Whether this is a headers-only request.
+   * @param idempotent indicates that the request is idempotent. When idempotent is set to true
+   *   Envoy Mobile will retry on HTTP/3 post-handshake failures. By default, it is set to false.
    * @return This stream, for chaining syntax.
    */
-  open fun sendHeaders(headers: RequestHeaders, endStream: Boolean): Stream {
-    underlyingStream.sendHeaders(headers.caseSensitiveHeaders(), endStream)
+  open fun sendHeaders(
+    headers: RequestHeaders,
+    endStream: Boolean,
+    idempotent: Boolean = false
+  ): Stream {
+    underlyingStream.sendHeaders(headers.caseSensitiveHeaders(), endStream, idempotent)
     return this
   }
 
@@ -37,11 +43,11 @@ open class Stream(
 
   /**
    * For sending data to an associated stream. By default, the length sent is the
-   * **[ByteBuffer.capacity]**. However, the length will rather be **[ByteBuffer.position]**
-   * if the Stream was configured to do so - see **[StreamPrototype.useByteBufferPosition]**.
+   * **[ByteBuffer.capacity]**. However, the length will rather be **[ByteBuffer.position]** if the
+   * Stream was configured to do so - see **[StreamPrototype.useByteBufferPosition]**.
    *
-   * Note: the provided ByteBuffer won't be mutated in any case. On the other hand, until the
-   *       stream is closed, any further mutations may lead to an unpredictable outcome.
+   * Note: the provided ByteBuffer won't be mutated in any case. On the other hand, until the stream
+   * is closed, any further mutations may lead to an unpredictable outcome.
    *
    * @param data Data to send over the stream.
    * @return This stream, for chaining syntax.
@@ -63,11 +69,11 @@ open class Stream(
 
   /**
    * Close the stream with a data frame. By default, the length sent is the
-   * **[ByteBuffer.capacity]**. However, the length will rather be **[ByteBuffer.position]**
-   * if the Stream was configured to do so - see **[StreamPrototype.useByteBufferPosition]**.
+   * **[ByteBuffer.capacity]**. However, the length will rather be **[ByteBuffer.position]** if the
+   * Stream was configured to do so - see **[StreamPrototype.useByteBufferPosition]**.
    *
-   * Note: the provided ByteBuffer won't be mutated in any case. On the other hand, until the
-   *       stream is closed, any further mutations may lead to an unpredictable outcome.
+   * Note: the provided ByteBuffer won't be mutated in any case. On the other hand, until the stream
+   * is closed, any further mutations may lead to an unpredictable outcome.
    *
    * @param data Data with which to close the stream.
    */
@@ -76,9 +82,7 @@ open class Stream(
     underlyingStream.sendData(data, length, true)
   }
 
-  /**
-   * Cancel the stream.
-   */
+  /** Cancel the stream. */
   open fun cancel() {
     underlyingStream.cancel()
   }

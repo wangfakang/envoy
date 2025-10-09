@@ -26,7 +26,7 @@ TEST(HealthCheckEventFileSinkFactory, createHealthCheckEventSink) {
 
   envoy::extensions::health_check::event_sinks::file::v3::HealthCheckEventFileSink config;
   config.set_event_log_path("test_path");
-  Envoy::ProtobufWkt::Any typed_config;
+  Envoy::Protobuf::Any typed_config;
   typed_config.PackFrom(config);
 
   NiceMock<Server::Configuration::MockHealthCheckerFactoryContext> context;
@@ -71,11 +71,13 @@ TEST(HealthCheckEventFileSink, logTest) {
                             event);
 
   file_sink.log(event);
-  EXPECT_EQ(file_log_data, "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
-                           "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"resolver_name\":\"\","
-                           "\"ipv4_compat\":false,\"port_value\":443}},\"cluster_name\":\"fake_"
-                           "cluster\",\"eject_unhealthy_event\":{\"failure_type\":\"ACTIVE\"},"
-                           "\"timestamp\":\"2009-02-13T23:31:31.234Z\"}\n");
+  EXPECT_EQ(
+      file_log_data.value(),
+      "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
+      "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"port_value\":443,\"resolver_name\":\"\","
+      "\"ipv4_compat\":false,\"network_namespace_filepath\":\"\"}},\"cluster_name\":\"fake_"
+      "cluster\",\"eject_unhealthy_event\":{\"failure_type\":\"ACTIVE\"},"
+      "\"timestamp\":\"2009-02-13T23:31:31.234Z\"}\n");
 
   envoy::data::core::v3::HealthCheckEvent add_event;
   TestUtility::loadFromYaml(R"EOF(
@@ -95,11 +97,13 @@ TEST(HealthCheckEventFileSink, logTest) {
                             add_event);
 
   file_sink.log(add_event);
-  EXPECT_EQ(file_log_data, "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
-                           "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"resolver_name\":\"\","
-                           "\"ipv4_compat\":false,\"port_value\":443}},\"cluster_name\":\"fake_"
-                           "cluster\",\"add_healthy_event\":{\"first_check\":false},\"timestamp\":"
-                           "\"2009-02-13T23:31:31.234Z\"}\n");
+  EXPECT_EQ(
+      file_log_data.value(),
+      "{\"health_checker_type\":\"HTTP\",\"host\":{\"socket_address\":{"
+      "\"protocol\":\"TCP\",\"address\":\"10.0.0.1\",\"port_value\":443,\"resolver_name\":\"\","
+      "\"ipv4_compat\":false,\"network_namespace_filepath\":\"\"}},\"cluster_name\":\"fake_"
+      "cluster\",\"add_healthy_event\":{\"first_check\":false},\"timestamp\":"
+      "\"2009-02-13T23:31:31.234Z\"}\n");
 }
 
 } // namespace Upstream

@@ -72,7 +72,42 @@ enum class ConnectionCloseType {
            // raise ConnectionEvent::LocalClose
   FlushWriteAndDelay, // Flush pending write data and delay raising a ConnectionEvent::LocalClose
                       // until the delayed_close_timeout expires
-  Abort // Do not write/flush any pending data and immediately raise ConnectionEvent::LocalClose
+  Abort, // Do not write/flush any pending data and immediately raise ConnectionEvent::LocalClose
+  AbortReset // Do not write/flush any pending data and immediately raise
+             // ConnectionEvent::LocalClose. Envoy will try to close the connection with RST flag.
+};
+
+/**
+ * Type of connection close which is detected from the socket.
+ */
+enum class DetectedCloseType {
+  Normal,      // The normal socket close from Envoy's connection perspective.
+  LocalReset,  // The local reset initiated from Envoy.
+  RemoteReset, // The peer reset detected by the connection.
+};
+
+/**
+ * Combines connection event and close type for connection close operations
+ */
+struct ConnectionCloseAction {
+  ConnectionEvent event_;
+  bool close_socket_;
+  ConnectionCloseType type_;
+
+  ConnectionCloseAction(ConnectionEvent event_type = ConnectionEvent::Connected,
+                        bool close_socket = false,
+                        ConnectionCloseType close_type = ConnectionCloseType::NoFlush)
+      : event_(event_type), close_socket_(close_socket), type_(close_type) {}
+
+  bool operator==(const ConnectionCloseAction& other) const {
+    return event_ == other.event_ && type_ == other.type_ && close_socket_ == other.close_socket_;
+  }
+
+  bool operator!=(const ConnectionCloseAction& other) const { return !(*this == other); }
+
+  bool closeSocket() const { return close_socket_; }
+  bool isLocalClose() const { return event_ == ConnectionEvent::LocalClose; }
+  bool isRemoteClose() const { return event_ == ConnectionEvent::RemoteClose; }
 };
 
 /**
@@ -83,6 +118,13 @@ class Connection : public Event::DeferredDeletable,
                    public ScopeTrackedObject {
 public:
   enum class State { Open, Closing, Closed };
+
+  enum class ReadDisableStatus {
+    NoTransition,
+    StillReadDisabled,
+    TransitionedToReadEnabled,
+    TransitionedToReadDisabled
+  };
 
   /**
    * Callback function for when bytes have been sent by a connection.
@@ -147,9 +189,14 @@ public:
   virtual void close(ConnectionCloseType type, absl::string_view details) PURE;
 
   /**
+   * @return the detected close type from socket.
+   */
+  virtual DetectedCloseType detectedCloseType() const PURE;
+
+  /**
    * @return Event::Dispatcher& the dispatcher backing this connection.
    */
-  virtual Event::Dispatcher& dispatcher() PURE;
+  virtual Event::Dispatcher& dispatcher() const PURE;
 
   /**
    * @return uint64_t the unique local ID of this connection.
@@ -179,6 +226,7 @@ public:
    * enabled again if there is data still in the input buffer it will be re-dispatched through
    * the filter chain.
    * @param disable supplies TRUE is reads should be disabled, FALSE if they should be enabled.
+   * @return status enum indicating the outcome of calling readDisable on the underlying socket.
    *
    * Note that this function reference counts calls. For example
    * readDisable(true);  // Disables data
@@ -186,7 +234,7 @@ public:
    * readDisable(false);  // Notes the connection is blocked by one source
    * readDisable(false);  // Marks the connection as unblocked, so resumes reading.
    */
-  virtual void readDisable(bool disable) PURE;
+  virtual ReadDisableStatus readDisable(bool disable) PURE;
 
   /**
    * Set if Envoy should detect TCP connection close when readDisable(true) is called.
@@ -263,7 +311,7 @@ public:
   virtual bool connecting() const PURE;
 
   /**
-   * Write data to the connection. Will iterate through downstream filters with the buffer if any
+   * Write data to the connection. Will iterate through network filters with the buffer if any
    * are installed.
    * @param data Supplies the data to write to the connection.
    * @param end_stream If true, this indicates that this is the last write to the connection. If
@@ -295,10 +343,21 @@ public:
   virtual bool aboveHighWatermark() const PURE;
 
   /**
+   * @return const ConnectionSocketPtr& reference to the socket from current connection.
+   */
+  virtual const ConnectionSocketPtr& getSocket() const PURE;
+
+  /**
    * Get the socket options set on this connection.
    */
   virtual const ConnectionSocket::OptionsSharedPtr& socketOptions() const PURE;
 
+  /**
+   * Set a socket option on the underlying socket(s) of this connection.
+   * @param option The socket option to set.
+   * @return boolean telling if the socket option was set successfully.
+   */
+  virtual bool setSocketOption(Network::SocketOptionName name, absl::Span<uint8_t> value) PURE;
   /**
    * The StreamInfo object associated with this connection. This is typically
    * used for logging purposes. Individual filters may add specific information

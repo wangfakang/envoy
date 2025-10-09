@@ -1,99 +1,109 @@
 package test.kotlin.integration.proxying
 
-import android.content.Intent
 import android.content.Context
+import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Proxy
 import android.net.ProxyInfo
 import androidx.test.core.app.ApplicationProvider
-
-import io.envoyproxy.envoymobile.LogLevel
-import io.envoyproxy.envoymobile.Custom
-import io.envoyproxy.envoymobile.Engine
+import com.google.common.truth.Truth.assertThat
 import io.envoyproxy.envoymobile.AndroidEngineBuilder
+import io.envoyproxy.envoymobile.LogLevel
 import io.envoyproxy.envoymobile.RequestHeadersBuilder
 import io.envoyproxy.envoymobile.RequestMethod
-import io.envoyproxy.envoymobile.ResponseHeaders
-import io.envoyproxy.envoymobile.StreamIntel
+import io.envoyproxy.envoymobile.engine.EnvoyConfiguration
 import io.envoyproxy.envoymobile.engine.JniLibrary
-
+import io.envoyproxy.envoymobile.engine.testing.HttpProxyTestServerFactory
+import io.envoyproxy.envoymobile.engine.testing.HttpTestServerFactory
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-
-import org.assertj.core.api.Assertions.assertThat
+import org.junit.After
+import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
-import org.mockito.Mock
-import org.mockito.Mockito
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows
 
+// Starts a local HTTP mock server with HttpTestServerFactory.start(). Then a request is sent
+// through the following flow:
+//
 //                                                ┌──────────────────┐
-//                                                │   Proxy Engine   │
+//                                                │   Envoy Proxy    │
 //                                                │ ┌──────────────┐ │
 // ┌─────────────────────────┐                  ┌─┼─►listener_proxy│ │
-// │https://api.lyft.com/ping│  ┌──────────────┬┘ │ └──────┬───────┘ │ ┌────────────┐
-// │         Request         ├──►Android Engine│  │        │         │ │api.lyft.com│
-// └─────────────────────────┘  └──────────────┘  │ ┌──────▼──────┐  │ └──────▲─────┘
+// │https://localhost:{port} │  ┌──────────────┬┘ │ └──────┬───────┘ │ ┌──────────────────┐
+// │         Request         ├──►Android Engine│  │        │         │ │ Local mock server│
+// └─────────────────────────┘  └──────────────┘  │ ┌──────▼──────┐  │ └──────▲───────────┘
 //                                                │ │cluster_proxy│  │        │
 //                                                │ └─────────────┴──┼────────┘
 //                                                │                  │
 //                                                └──────────────────┘
 @RunWith(RobolectricTestRunner::class)
-class PerformHTTPSRequestBadHostname {
+class ProxyInfoIntentPerformHTTPSRequestBadHostnameTest {
   init {
     JniLibrary.loadTestLibrary()
   }
 
+  private lateinit var httpProxyTestServer: HttpProxyTestServerFactory.HttpProxyTestServer
+  private lateinit var httpTestServer: HttpTestServerFactory.HttpTestServer
+
+  @Before
+  fun setUp() {
+    httpProxyTestServer =
+      HttpProxyTestServerFactory.start(HttpProxyTestServerFactory.Type.HTTPS_PROXY)
+    httpTestServer = HttpTestServerFactory.start(HttpTestServerFactory.Type.HTTP1_WITH_TLS)
+  }
+
+  @After
+  fun tearDown() {
+    httpProxyTestServer.shutdown()
+    httpTestServer.shutdown()
+  }
+
   @Test
   fun `attempts an HTTPs request through a proxy using an async DNS resolution that fails`() {
-    val port = (10001..11000).random()
-
-    val context = Mockito.spy(ApplicationProvider.getApplicationContext<Context>())
-    val connectivityManager: ConnectivityManager = Mockito.mock(ConnectivityManager::class.java)
-    Mockito.doReturn(connectivityManager).`when`(context).getSystemService(Context.CONNECTIVITY_SERVICE)
-    Mockito.`when`(connectivityManager.getDefaultProxy()).thenReturn(ProxyInfo.buildDirectProxy("loopback", port))
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val connectivityManager =
+      context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    connectivityManager.bindProcessToNetwork(connectivityManager.activeNetwork)
+    Shadows.shadowOf(connectivityManager)
+      .setProxyForNetwork(
+        connectivityManager.activeNetwork,
+        ProxyInfo.buildDirectProxy("bad.hostname", httpProxyTestServer.port)
+      )
 
     val onEngineRunningLatch = CountDownLatch(1)
-    val onProxyEngineRunningLatch = CountDownLatch(1)
     val onErrorLatch = CountDownLatch(1)
 
-    val proxyEngineBuilder = Proxy(context, port).https()
-    val proxyEngine = proxyEngineBuilder
-      .addLogLevel(LogLevel.DEBUG)
-      .addDNSQueryTimeoutSeconds(2)
-      .setOnEngineRunning { onProxyEngineRunningLatch.countDown() }
-      .build()
-
-    onProxyEngineRunningLatch.await(10, TimeUnit.SECONDS)
-    assertThat(onProxyEngineRunningLatch.count).isEqualTo(0)
-
-    context.sendStickyBroadcast(Intent(Proxy.PROXY_CHANGE_ACTION))
+    context.sendBroadcast(Intent(Proxy.PROXY_CHANGE_ACTION))
 
     val builder = AndroidEngineBuilder(context)
-    val engine = builder
-      .addLogLevel(LogLevel.DEBUG)
-      .enableProxying(true)
-      .setOnEngineRunning { onEngineRunningLatch.countDown() }
-      .build()
+    val engine =
+      builder
+        .setLogLevel(LogLevel.DEBUG)
+        .setLogger { _, msg -> print(msg) }
+        .enableProxying(true)
+        .setOnEngineRunning { onEngineRunningLatch.countDown() }
+        .setTrustChainVerification(EnvoyConfiguration.TrustChainVerification.ACCEPT_UNTRUSTED)
+        .build()
 
     onEngineRunningLatch.await(10, TimeUnit.SECONDS)
     assertThat(onEngineRunningLatch.count).isEqualTo(0)
 
-    val requestHeaders = RequestHeadersBuilder(
-      method = RequestMethod.GET,
-      scheme = "https",
-      authority = "api.lyft.com",
-      path = "/ping"
-    )
-      .build()
+    val requestHeaders =
+      RequestHeadersBuilder(
+          method = RequestMethod.GET,
+          scheme = "https",
+          authority = httpTestServer.address,
+          path = "/"
+        )
+        .build()
 
     engine
       .streamClient()
       .newStreamPrototype()
-      .setOnError { _, _ ->
-        onErrorLatch.countDown()
-      }
+      .setOnError { _, _ -> onErrorLatch.countDown() }
       .start(Executors.newSingleThreadExecutor())
       .sendHeaders(requestHeaders, true)
 
@@ -101,6 +111,5 @@ class PerformHTTPSRequestBadHostname {
     assertThat(onErrorLatch.count).isEqualTo(0)
 
     engine.terminate()
-    proxyEngine.terminate()
   }
 }

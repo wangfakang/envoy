@@ -55,7 +55,7 @@ IntegrationTcpClient::IntegrationTcpClient(
       }));
 
   connection_ = dispatcher.createClientConnection(
-      Network::Utility::resolveUrl(fmt::format(
+      *Network::Utility::resolveUrl(fmt::format(
           "tcp://{}:{}",
           destination_address.empty() ? Network::Test::getLoopbackAddressUrlString(version)
                                       : destination_address,
@@ -73,6 +73,10 @@ IntegrationTcpClient::IntegrationTcpClient(
 }
 
 void IntegrationTcpClient::close() { connection_->close(Network::ConnectionCloseType::NoFlush); }
+
+void IntegrationTcpClient::close(Network::ConnectionCloseType close_type) {
+  connection_->close(close_type);
+}
 
 void IntegrationTcpClient::waitForData(const std::string& data, bool exact_match) {
   auto found = payload_reader_->data().find(data);
@@ -94,6 +98,9 @@ AssertionResult IntegrationTcpClient::waitForData(size_t length,
 }
 
 void IntegrationTcpClient::waitForDisconnect(bool ignore_spurious_events) {
+  if (disconnected_) {
+    return;
+  }
   Event::TimerPtr timeout_timer =
       connection_->dispatcher().createTimer([this]() -> void { connection_->dispatcher().exit(); });
   timeout_timer->enableTimer(TestUtility::DefaultTimeout);
@@ -171,6 +178,20 @@ void IntegrationTcpClient::ConnectionCallbacks::onEvent(Network::ConnectionEvent
   if (event == Network::ConnectionEvent::RemoteClose) {
     parent_.disconnected_ = true;
     parent_.connection_->dispatcher().exit();
+  }
+}
+
+bool IntegrationTcpClient::waitForTcpResponse(testing::Matcher<absl::string_view> matcher,
+                                              std::chrono::milliseconds timeout) {
+  auto len = data().size();
+  while (true) {
+    if (testing::Matches(matcher)(data())) {
+      return true;
+    }
+    if (waitForData(len + 1, timeout) != testing::AssertionSuccess()) {
+      return false;
+    }
+    len = data().size();
   }
 }
 

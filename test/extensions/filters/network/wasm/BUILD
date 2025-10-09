@@ -18,12 +18,14 @@ envoy_package()
 
 envoy_extension_cc_test(
     name = "config_test",
-    size = "enormous",
+    size = "large",
     srcs = ["config_test.cc"],
     data = envoy_select_wasm_cpp_tests([
         "//test/extensions/filters/network/wasm/test_data:test_cpp.wasm",
     ]),
     extension_names = ["envoy.filters.network.wasm"],
+    rbe_pool = "4core",
+    tags = ["skip_on_windows"],
     deps = [
         "//source/common/common:base64_lib",
         "//source/common/common:hex_lib",
@@ -40,7 +42,7 @@ envoy_extension_cc_test(
 
 envoy_extension_cc_test(
     name = "wasm_filter_test",
-    size = "enormous",
+    size = "large",
     srcs = ["wasm_filter_test.cc"],
     data = envoy_select_wasm_cpp_tests([
         "//test/extensions/filters/network/wasm/test_data:test_cpp.wasm",
@@ -51,6 +53,8 @@ envoy_extension_cc_test(
         "//test/extensions/filters/network/wasm/test_data:resume_call_rust.wasm",
     ]),
     extension_names = ["envoy.filters.network.wasm"],
+    rbe_pool = "4core",
+    tags = ["skip_on_windows"],
     deps = [
         "//source/extensions/filters/network/wasm:wasm_filter_lib",
         "//test/extensions/common/wasm:wasm_runtime",

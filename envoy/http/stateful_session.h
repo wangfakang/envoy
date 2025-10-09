@@ -31,10 +31,11 @@ public:
   /**
    * Called when a request is completed to update the session state.
    *
-   * @param host the upstream host that was finally selected.
+   * @param host_address the upstream host that was finally selected.
    * @param headers the response headers.
+   * @return bool true if the selected host differs from the previously stored session host.
    */
-  virtual void onUpdate(const Upstream::HostDescription& host, ResponseHeaderMap& headers) PURE;
+  virtual bool onUpdate(absl::string_view host_address, ResponseHeaderMap& headers) PURE;
 };
 
 using SessionStatePtr = std::unique_ptr<SessionState>;
@@ -51,7 +52,7 @@ public:
    *
    * @param headers request headers.
    */
-  virtual SessionStatePtr create(const RequestHeaderMap& headers) const PURE;
+  virtual SessionStatePtr create(RequestHeaderMap& headers) const PURE;
 };
 
 using SessionStateFactorySharedPtr = std::shared_ptr<SessionStateFactory>;
@@ -67,11 +68,13 @@ public:
    * Creates a particular session state factory implementation.
    *
    * @param config supplies the configuration for the session state factory extension.
+   * @param context supplies the factory context. Please don't store the reference to
+   * the context as it is only valid during the call.
    * @return SessionStateFactorySharedPtr the session state factory.
    */
   virtual SessionStateFactorySharedPtr
   createSessionStateFactory(const Protobuf::Message& config,
-                            Server::Configuration::CommonFactoryContext& context) PURE;
+                            Server::Configuration::GenericFactoryContext& context) PURE;
 
   std::string category() const override { return "envoy.http.stateful_session"; }
 };

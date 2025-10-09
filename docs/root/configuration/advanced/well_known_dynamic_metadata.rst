@@ -31,6 +31,8 @@ The following Envoy filters can be configured to consume dynamic metadata emitte
 * :ref:`External Authorization Filter via the metadata context namespaces
   <envoy_v3_api_field_extensions.filters.http.ext_authz.v3.ExtAuthz.metadata_context_namespaces>`
 * :ref:`RateLimit Filter limit override <config_http_filters_rate_limit_override_dynamic_metadata>`
+* :ref:`Original destination listener filter <config_listener_filters_original_dst>`
+* :ref:`TLS Inspector listener filter <config_listener_filters_tls_inspector_dynamic_metadata>`
 
 .. _shared_dynamic_metadata:
 

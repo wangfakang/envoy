@@ -13,6 +13,7 @@
 #include "source/common/quic/envoy_quic_simulated_watermark_buffer.h"
 #include "source/common/quic/quic_network_connection.h"
 #include "source/common/quic/quic_ssl_connection_info.h"
+#include "source/common/quic/quic_stat_names.h"
 #include "source/common/quic/send_buffer_monitor.h"
 #include "source/common/stream_info/stream_info_impl.h"
 
@@ -35,7 +36,8 @@ public:
                                   const quic::QuicConnectionId& connection_id,
                                   Event::Dispatcher& dispatcher, uint32_t send_buffer_limit,
                                   std::shared_ptr<QuicSslConnectionInfo>&& info,
-                                  std::unique_ptr<StreamInfo::StreamInfo>&& stream_info);
+                                  std::unique_ptr<StreamInfo::StreamInfo>&& stream_info,
+                                  QuicStatNames& quic_stat_names, Stats::Scope& stats_scope);
   // Network::FilterManager
   // Overridden to delegate calls to filter_manager_.
   void addWriteFilter(Network::WriteFilterSharedPtr filter) override;
@@ -59,13 +61,24 @@ public:
     }
     close(type);
   }
-  Event::Dispatcher& dispatcher() override { return dispatcher_; }
+
+  void closeConnection(Network::ConnectionCloseAction) override {
+    IS_ENVOY_BUG("unexpected call to closeConnection for QUIC");
+  }
+
+  Network::DetectedCloseType detectedCloseType() const override {
+    return Network::DetectedCloseType::Normal;
+  }
+  Event::Dispatcher& dispatcher() const override { return dispatcher_; }
   std::string nextProtocol() const override { return EMPTY_STRING; }
   // No-op. TCP_NODELAY doesn't apply to UDP.
   void noDelay(bool /*enable*/) override {}
   // Neither readDisable nor detectEarlyCloseWhenReadDisabled are supported for QUIC.
   // Crash in debug mode if they are called.
-  void readDisable(bool /*disable*/) override { IS_ENVOY_BUG("Unexpected call to readDisable"); }
+  ReadDisableStatus readDisable(bool /*disable*/) override {
+    IS_ENVOY_BUG("Unexpected call to readDisable");
+    return ReadDisableStatus::NoTransition;
+  }
   void detectEarlyCloseWhenReadDisabled(bool /*value*/) override {
     IS_ENVOY_BUG("Unexpected call to detectEarlyCloseWhenReadDisabled");
   }
@@ -133,6 +146,7 @@ public:
   void configureInitialCongestionWindow(uint64_t bandwidth_bits_per_sec,
                                         std::chrono::microseconds rtt) override;
   absl::optional<uint64_t> congestionWindowInBytes() const override;
+  const Network::ConnectionSocketPtr& getSocket() const override { PANIC("not implemented"); }
 
   // Network::FilterManagerConnection
   void rawWrite(Buffer::Instance& data, bool end_stream) override;
@@ -164,12 +178,19 @@ public:
     max_headers_count_ = max_headers_count;
   }
 
+  void incrementSentQuicResetStreamErrorStats(quic::QuicResetStreamError error, bool from_self,
+                                              bool is_upstream);
+
+  bool setSocketOption(Envoy::Network::SocketOptionName, absl::Span<uint8_t>) override;
+
 protected:
   // Propagate connection close to network_connection_callbacks_.
   void onConnectionCloseEvent(const quic::QuicConnectionCloseFrame& frame,
                               quic::ConnectionCloseSource source,
                               const quic::ParsedQuicVersion& version);
 
+  // Apply delay close policy if there is any.
+  void maybeApplyDelayedClose();
   void closeConnectionImmediately() override;
 
   virtual bool hasDataToWrite() PURE;
@@ -188,6 +209,8 @@ protected:
   OptRef<const envoy::config::core::v3::Http3ProtocolOptions> http3_options_;
   bool initialized_{false};
   std::shared_ptr<QuicSslConnectionInfo> quic_ssl_info_;
+  QuicStatNames& quic_stat_names_;
+  Stats::Scope& stats_scope_;
 
 private:
   friend class Envoy::TestPauseFilterForQuic;
@@ -198,10 +221,10 @@ private:
   // Called when aggregated buffered bytes across all the streams declines to low watermark.
   void onSendBufferLowWatermark();
 
-  // Currently ConnectionManagerImpl is the one and only filter. If more network
-  // filters are added, ConnectionManagerImpl should always be the last one.
-  // Its onRead() is only called once to trigger ReadFilter::onNewConnection()
-  // and the rest incoming data bypasses these filters.
+  // ConnectionManagerImpl should always be the last filter. Its onRead() is only called once to
+  // trigger ReadFilter::onNewConnection() and the rest incoming data bypasses these filters.
+  // It has the same life time as this connection, so do all the filters. If the connection gets
+  // defer-deleted, they will be defer-deleted together.
   std::unique_ptr<Network::FilterManagerImpl> filter_manager_;
 
   std::unique_ptr<StreamInfo::StreamInfo> stream_info_;

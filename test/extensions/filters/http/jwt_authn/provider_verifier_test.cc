@@ -22,11 +22,11 @@ namespace HttpFilters {
 namespace JwtAuthn {
 namespace {
 
-ProtobufWkt::Struct getExpectedPayload(const std::string& name) {
-  ProtobufWkt::Struct expected_payload;
+Protobuf::Struct getExpectedPayload(const std::string& name) {
+  Protobuf::Struct expected_payload;
   TestUtility::loadFromJson(ExpectedPayloadJSON, expected_payload);
 
-  ProtobufWkt::Struct struct_obj;
+  Protobuf::Struct struct_obj;
   *(*struct_obj.mutable_fields())[name].mutable_struct_value() = expected_payload;
   return struct_obj;
 }
@@ -34,12 +34,13 @@ ProtobufWkt::Struct getExpectedPayload(const std::string& name) {
 class ProviderVerifierTest : public testing::Test {
 public:
   ProviderVerifierTest() {
-    mock_factory_ctx_.cluster_manager_.initializeThreadLocalClusters({"pubkey_cluster"});
+    mock_factory_ctx_.server_factory_context_.cluster_manager_.initializeThreadLocalClusters(
+        {"pubkey_cluster"});
   }
 
   void createVerifier() {
     filter_config_ = std::make_unique<FilterConfigImpl>(proto_config_, "", mock_factory_ctx_);
-    verifier_ = Verifier::create(proto_config_.rules(0).requires(), proto_config_.providers(),
+    verifier_ = Verifier::create(proto_config_.rules(0).requires_(), proto_config_.providers(),
                                  *filter_config_);
   }
 
@@ -57,12 +58,11 @@ TEST_F(ProviderVerifierTest, TestOkJWT) {
   (*proto_config_.mutable_providers())[std::string(ProviderName)].set_payload_in_metadata(
       "my_payload");
   createVerifier();
-  MockUpstream mock_pubkey(mock_factory_ctx_.cluster_manager_, PublicKey);
+  MockUpstream mock_pubkey(mock_factory_ctx_.server_factory_context_.cluster_manager_, PublicKey);
 
-  EXPECT_CALL(mock_cb_, setExtractedData(_))
-      .WillOnce(Invoke([](const ProtobufWkt::Struct& payload) {
-        EXPECT_TRUE(TestUtility::protoEqual(payload, getExpectedPayload("my_payload")));
-      }));
+  EXPECT_CALL(mock_cb_, setExtractedData(_)).WillOnce(Invoke([](const Protobuf::Struct& payload) {
+    EXPECT_TRUE(TestUtility::protoEqual(payload, getExpectedPayload("my_payload")));
+  }));
 
   EXPECT_CALL(mock_cb_, onComplete(Status::Ok));
 
@@ -88,16 +88,15 @@ TEST_F(ProviderVerifierTest, TestOkJWTWithExtractedHeaderAndPayload) {
   (*proto_config_.mutable_providers())[std::string(ProviderName)].set_header_in_metadata(
       "my_header");
   createVerifier();
-  MockUpstream mock_pubkey(mock_factory_ctx_.cluster_manager_, PublicKey);
+  MockUpstream mock_pubkey(mock_factory_ctx_.server_factory_context_.cluster_manager_, PublicKey);
 
-  EXPECT_CALL(mock_cb_, setExtractedData(_))
-      .WillOnce(Invoke([](const ProtobufWkt::Struct& payload) {
-        // The expected payload is a merged struct of the extracted (from the JWT) payload and
-        // header data with "my_payload" and "my_header" as the keys.
-        ProtobufWkt::Struct expected_payload;
-        MessageUtil::loadFromJson(ExpectedPayloadAndHeaderJSON, expected_payload);
-        EXPECT_TRUE(TestUtility::protoEqual(payload, expected_payload));
-      }));
+  EXPECT_CALL(mock_cb_, setExtractedData(_)).WillOnce(Invoke([](const Protobuf::Struct& payload) {
+    // The expected payload is a merged struct of the extracted (from the JWT) payload and
+    // header data with "my_payload" and "my_header" as the keys.
+    Protobuf::Struct expected_payload;
+    MessageUtil::loadFromJson(ExpectedPayloadAndHeaderJSON, expected_payload);
+    EXPECT_TRUE(TestUtility::protoEqual(payload, expected_payload));
+  }));
 
   EXPECT_CALL(mock_cb_, onComplete(Status::Ok));
 
@@ -110,17 +109,39 @@ TEST_F(ProviderVerifierTest, TestOkJWTWithExtractedHeaderAndPayload) {
   EXPECT_EQ(ExpectedPayloadValue, headers.get_("sec-istio-auth-userinfo"));
 }
 
+// Test to set dynamic metadata with the status of a failed JWT verification.
+TEST_F(ProviderVerifierTest, TestExpiredJWTWithFailedStatusInMetadata) {
+  TestUtility::loadFromYaml(ExampleConfig, proto_config_);
+  (*proto_config_.mutable_providers())[std::string(ProviderName)].set_failed_status_in_metadata(
+      "my_payload");
+  createVerifier();
+  MockUpstream mock_pubkey(mock_factory_ctx_.server_factory_context_.cluster_manager_, PublicKey);
+
+  EXPECT_CALL(mock_cb_, setExtractedData(_)).WillOnce(Invoke([](const Protobuf::Struct& payload) {
+    Protobuf::Struct expected_payload;
+    MessageUtil::loadFromJson(ExpectedJWTExpiredStatusJSON, expected_payload);
+
+    EXPECT_TRUE(TestUtility::protoEqual(payload, expected_payload));
+  }));
+
+  EXPECT_CALL(mock_cb_, onComplete(Status::JwtExpired));
+
+  auto headers =
+      Http::TestRequestHeaderMapImpl{{"Authorization", "Bearer " + std::string(ExpiredToken)}};
+  context_ = Verifier::createContext(headers, parent_span_, &mock_cb_);
+  verifier_->verify(context_);
+}
+
 TEST_F(ProviderVerifierTest, TestSpanPassedDown) {
   TestUtility::loadFromYaml(ExampleConfig, proto_config_);
   (*proto_config_.mutable_providers())[std::string(ProviderName)].set_payload_in_metadata(
       "my_payload");
   createVerifier();
-  MockUpstream mock_pubkey(mock_factory_ctx_.cluster_manager_, PublicKey);
+  MockUpstream mock_pubkey(mock_factory_ctx_.server_factory_context_.cluster_manager_, PublicKey);
 
-  EXPECT_CALL(mock_cb_, setExtractedData(_))
-      .WillOnce(Invoke([](const ProtobufWkt::Struct& payload) {
-        EXPECT_TRUE(TestUtility::protoEqual(payload, getExpectedPayload("my_payload")));
-      }));
+  EXPECT_CALL(mock_cb_, setExtractedData(_)).WillOnce(Invoke([](const Protobuf::Struct& payload) {
+    EXPECT_TRUE(TestUtility::protoEqual(payload, getExpectedPayload("my_payload")));
+  }));
 
   EXPECT_CALL(mock_cb_, onComplete(Status::Ok));
 
@@ -128,7 +149,8 @@ TEST_F(ProviderVerifierTest, TestSpanPassedDown) {
                      .setTimeout(std::chrono::milliseconds(5 * 1000))
                      .setParentSpan(parent_span_)
                      .setChildSpanName("JWT Remote PubKey Fetch");
-  EXPECT_CALL(mock_factory_ctx_.cluster_manager_.thread_local_cluster_.async_client_,
+  EXPECT_CALL(mock_factory_ctx_.server_factory_context_.cluster_manager_.thread_local_cluster_
+                  .async_client_,
               send_(_, _, Eq(options)));
 
   auto headers = Http::TestRequestHeaderMapImpl{
@@ -166,7 +188,7 @@ providers:
     - https://example_service2/
     remote_jwks:
       http_uri:
-        uri: https://pubkey_server/pubkey_path
+        uri: https://pubkey-server/pubkey-path
         cluster: pubkey_cluster
     forward_payload_header: example-auth-userinfo
     claim_to_headers:
@@ -208,11 +230,11 @@ rules:
 TEST_F(ProviderVerifierTest, TestRequiresProviderWithAudiences) {
   TestUtility::loadFromYaml(ExampleConfig, proto_config_);
   auto* provider_and_audiences =
-      proto_config_.mutable_rules(0)->mutable_requires()->mutable_provider_and_audiences();
+      proto_config_.mutable_rules(0)->mutable_requires_()->mutable_provider_and_audiences();
   provider_and_audiences->set_provider_name("example_provider");
   provider_and_audiences->add_audiences("invalid_service");
   createVerifier();
-  MockUpstream mock_pubkey(mock_factory_ctx_.cluster_manager_, PublicKey);
+  MockUpstream mock_pubkey(mock_factory_ctx_.server_factory_context_.cluster_manager_, PublicKey);
 
   EXPECT_CALL(mock_cb_, onComplete(_))
       .WillOnce(
@@ -230,7 +252,7 @@ TEST_F(ProviderVerifierTest, TestRequiresProviderWithAudiences) {
 // This test verifies that requirement referencing nonexistent provider will throw exception
 TEST_F(ProviderVerifierTest, TestRequiresNonexistentProvider) {
   TestUtility::loadFromYaml(ExampleConfig, proto_config_);
-  proto_config_.mutable_rules(0)->mutable_requires()->set_provider_name("nosuchprovider");
+  proto_config_.mutable_rules(0)->mutable_requires_()->set_provider_name("nosuchprovider");
 
   EXPECT_THROW(FilterConfigImpl(proto_config_, "", mock_factory_ctx_), EnvoyException);
 }
@@ -245,7 +267,7 @@ INSTANTIATE_TEST_SUITE_P(ProviderVerifiersJwtCache, ProviderVerifiersJwtCacheTes
 // This test verifies that two JWT requirements with different audiences behave the same with
 // jwt_cache and without. The first requirement is checking audiences specified in the provider
 // which is "example_service". The second requirement is type "provider_and_audiences" and its
-// specified audiences is "other_service". The audience in the JWT token is "example_service". The
+// specified audiences is "other_service". The audience in the JWT is "example_service". The
 // first requirement should work and the second one should fail.
 TEST_P(ProviderVerifiersJwtCacheTest, TestRequirementsWithAudiences) {
   TestUtility::loadFromYaml(ExampleConfig, proto_config_);
@@ -264,7 +286,7 @@ TEST_P(ProviderVerifiersJwtCacheTest, TestRequirementsWithAudiences) {
   VerifierConstPtr verifier2 =
       Verifier::create(require2, proto_config_.providers(), *filter_config_);
 
-  MockUpstream mock_pubkey(mock_factory_ctx_.cluster_manager_, PublicKey);
+  MockUpstream mock_pubkey(mock_factory_ctx_.server_factory_context_.cluster_manager_, PublicKey);
 
   {
     // First call, audience matched, so it is good.

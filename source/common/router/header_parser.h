@@ -5,12 +5,12 @@
 
 #include "envoy/access_log/access_log.h"
 #include "envoy/config/core/v3/base.pb.h"
+#include "envoy/formatter/substitution_formatter_base.h"
 #include "envoy/http/header_evaluator.h"
 #include "envoy/http/header_map.h"
 
 #include "source/common/http/header_map_impl.h"
 #include "source/common/protobuf/protobuf.h"
-#include "source/common/router/header_formatter.h"
 
 namespace Envoy {
 namespace Router {
@@ -23,14 +23,33 @@ using HeaderValueOption = envoy::config::core::v3::HeaderValueOption;
 using HeaderValue = envoy::config::core::v3::HeaderValue;
 
 struct HeadersToAddEntry {
-  HeadersToAddEntry(const HeaderValue& header_value, HeaderAppendAction append_action);
-  HeadersToAddEntry(const HeaderValueOption& header_value_option);
+  static absl::StatusOr<std::unique_ptr<HeadersToAddEntry>>
+  create(const HeaderValue& header_value, HeaderAppendAction append_action) {
+    absl::Status creation_status = absl::OkStatus();
+    auto ret = std::unique_ptr<HeadersToAddEntry>(
+        new HeadersToAddEntry(header_value, append_action, creation_status));
+    RETURN_IF_NOT_OK(creation_status);
+    return ret;
+  }
+  static absl::StatusOr<std::unique_ptr<HeadersToAddEntry>>
+  create(const HeaderValueOption& header_value_option) {
+    absl::Status creation_status = absl::OkStatus();
+    auto ret = std::unique_ptr<HeadersToAddEntry>(
+        new HeadersToAddEntry(header_value_option, creation_status));
+    RETURN_IF_NOT_OK(creation_status);
+    return ret;
+  }
 
   std::string original_value_;
+  Formatter::FormatterPtr formatter_;
+  HeaderAppendAction append_action_;
+  // Keep small members (bools and enums) at the end of class, to reduce alignment overhead.
   bool add_if_empty_ = false;
 
-  HttpHeaderFormatterPtr formatter_;
-  HeaderAppendAction append_action_;
+protected:
+  HeadersToAddEntry(const HeaderValue& header_value, HeaderAppendAction append_action,
+                    absl::Status& creation_status);
+  HeadersToAddEntry(const HeaderValueOption& header_value_option, absl::Status& creation_status);
 };
 
 /**
@@ -44,7 +63,7 @@ public:
    * @param headers_to_add defines the headers to add during calls to evaluateHeaders
    * @return HeaderParserPtr a configured HeaderParserPtr
    */
-  static HeaderParserPtr
+  static absl::StatusOr<HeaderParserPtr>
   configure(const Protobuf::RepeatedPtrField<HeaderValueOption>& headers_to_add);
 
   /*
@@ -53,7 +72,7 @@ public:
    * header or to only add this header if it's absent.
    * @return HeaderParserPtr a configured HeaderParserPtr.
    */
-  static HeaderParserPtr
+  static absl::StatusOr<HeaderParserPtr>
   configure(const Protobuf::RepeatedPtrField<envoy::config::core::v3::HeaderValue>& headers_to_add,
             HeaderAppendAction append_action);
 
@@ -62,7 +81,7 @@ public:
    * @param headers_to_remove defines headers to remove during calls to evaluateHeaders
    * @return HeaderParserPtr a configured HeaderParserPtr
    */
-  static HeaderParserPtr
+  static absl::StatusOr<HeaderParserPtr>
   configure(const Protobuf::RepeatedPtrField<HeaderValueOption>& headers_to_add,
             const Protobuf::RepeatedPtrField<std::string>& headers_to_remove);
 
@@ -71,11 +90,10 @@ public:
     return *instance;
   }
 
-  void evaluateHeaders(Http::HeaderMap& headers, const Http::RequestHeaderMap& request_headers,
-                       const Http::ResponseHeaderMap& response_headers,
+  void evaluateHeaders(Http::HeaderMap& headers, const Formatter::HttpFormatterContext& context,
                        const StreamInfo::StreamInfo& stream_info) const override;
-  void evaluateHeaders(Http::HeaderMap& headers, const Http::RequestHeaderMap& request_headers,
-                       const Http::ResponseHeaderMap& response_headers,
+
+  void evaluateHeaders(Http::HeaderMap& headers, const Formatter::HttpFormatterContext& context,
                        const StreamInfo::StreamInfo* stream_info) const;
 
   /**
@@ -84,20 +102,13 @@ public:
    * empty.
    */
   void evaluateHeaders(Http::HeaderMap& headers, const StreamInfo::StreamInfo& stream_info) const {
-    evaluateHeaders(headers,
-                    stream_info.getRequestHeaders() != nullptr
-                        ? *stream_info.getRequestHeaders()
-                        : *Http::StaticEmptyHeaders::get().request_headers,
-                    *Http::StaticEmptyHeaders::get().response_headers.get(), stream_info);
+    evaluateHeaders(headers, {stream_info.getRequestHeaders()}, &stream_info);
   }
   void evaluateHeaders(Http::HeaderMap& headers, const StreamInfo::StreamInfo* stream_info) const {
     evaluateHeaders(headers,
-                    stream_info == nullptr
-                        ? *Http::StaticEmptyHeaders::get().request_headers
-                        : (stream_info->getRequestHeaders() != nullptr
-                               ? *stream_info->getRequestHeaders()
-                               : *Http::StaticEmptyHeaders::get().request_headers),
-                    *Http::StaticEmptyHeaders::get().response_headers.get(), stream_info);
+                    Formatter::HttpFormatterContext{
+                        stream_info == nullptr ? nullptr : stream_info->getRequestHeaders()},
+                    stream_info);
   }
 
   /*
@@ -117,7 +128,7 @@ protected:
   HeaderParser() = default;
 
 private:
-  std::vector<std::pair<Http::LowerCaseString, HeadersToAddEntry>> headers_to_add_;
+  std::vector<std::pair<Http::LowerCaseString, std::unique_ptr<HeadersToAddEntry>>> headers_to_add_;
   std::vector<Http::LowerCaseString> headers_to_remove_;
 };
 

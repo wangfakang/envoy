@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "envoy/common/optref.h"
 #include "envoy/common/platform.h"
 #include "envoy/common/pure.h"
 #include "envoy/config/core/v3/base.pb.h"
@@ -40,7 +41,7 @@ private:
 // ENVOY_MAKE_SOCKET_OPTION_NAME is a helper macro to generate a
 // SocketOptionName with a descriptive string name.
 #define ENVOY_MAKE_SOCKET_OPTION_NAME(level, option)                                               \
-  Network::SocketOptionName(level, option, #level "/" #option)
+  ::Envoy::Network::SocketOptionName(level, option, #level "/" #option)
 
 // Moved from source/common/network/socket_option_impl.h to avoid dependency loops.
 #ifdef IP_TRANSPARENT
@@ -65,6 +66,18 @@ private:
 #define ENVOY_SOCKET_IPV6_FREEBIND ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IPV6, IPV6_FREEBIND)
 #else
 #define ENVOY_SOCKET_IPV6_FREEBIND Network::SocketOptionName()
+#endif
+
+#ifdef IP_RECVTOS
+#define ENVOY_SOCKET_IP_RECVTOS ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IP, IP_RECVTOS)
+#else
+#define ENVOY_SOCKET_IP_RECVTOS Network::SocketOptionName()
+#endif
+
+#ifdef IPV6_RECVTCLASS
+#define ENVOY_SOCKET_IPV6_RECVTCLASS ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IPV6, IPV6_RECVTCLASS)
+#else
+#define ENVOY_SOCKET_IPV6_RECVTCLASS Network::SocketOptionName()
 #endif
 
 #ifdef SO_KEEPALIVE
@@ -149,6 +162,13 @@ static_assert(IP_RECVDSTADDR == IP_SENDSRCADDR);
 #define ENVOY_IP_PKTINFO IP_PKTINFO
 #endif
 
+#ifdef IP_BIND_ADDRESS_NO_PORT
+#define ENVOY_SOCKET_IP_BIND_ADDRESS_NO_PORT                                                       \
+  ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT)
+#else
+#define ENVOY_SOCKET_IP_BIND_ADDRESS_NO_PORT Network::SocketOptionName()
+#endif
+
 #define ENVOY_SELF_IP_ADDR ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IP, ENVOY_IP_PKTINFO)
 
 // Both Linux and FreeBSD use IPV6_RECVPKTINFO for both sending source address and
@@ -161,6 +181,30 @@ static_assert(IP_RECVDSTADDR == IP_SENDSRCADDR);
 #else
 #define ENVOY_ATTACH_REUSEPORT_CBPF Network::SocketOptionName()
 #endif
+
+#if !defined(ANDROID) && defined(__APPLE__)
+// Only include TargetConditionals after testing ANDROID as some Android builds
+// on the Mac have this header available and it's not needed unless the target
+// is really an Apple platform.
+#include <TargetConditionals.h>
+#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
+// MAC_OS
+#define ENVOY_IP_DONTFRAG ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IP, IP_DONTFRAG)
+#define ENVOY_IPV6_DONTFRAG ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IPV6, IPV6_DONTFRAG)
+#endif
+#endif
+
+#if !defined(ENVOY_IP_DONTFRAG) && defined(IP_PMTUDISC_DO)
+#define ENVOY_IP_MTU_DISCOVER ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IP, IP_MTU_DISCOVER)
+#define ENVOY_IP_MTU_DISCOVER_VALUE IP_PMTUDISC_DO
+#define ENVOY_IPV6_MTU_DISCOVER ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IPV6, IPV6_MTU_DISCOVER)
+#define ENVOY_IPV6_MTU_DISCOVER_VALUE IPV6_PMTUDISC_DO
+#endif
+
+class FilterChainInfo;
+class ListenerInfo;
+
+using FilterChainInfoConstSharedPtr = std::shared_ptr<const FilterChainInfo>;
 
 /**
  * Interfaces for providing a socket's various addresses. This is split into a getters interface
@@ -175,6 +219,12 @@ public:
    * @return the local address of the socket.
    */
   virtual const Address::InstanceConstSharedPtr& localAddress() const PURE;
+
+  /**
+   * @return the direct local address of the socket. This is the listener address and it can not be
+   * modified by listener filters.
+   */
+  virtual const Address::InstanceConstSharedPtr& directLocalAddress() const PURE;
 
   /**
    * @return true if the local address has been restored to a value that is different from the
@@ -229,9 +279,24 @@ public:
   virtual absl::string_view ja3Hash() const PURE;
 
   /**
+   * @return ja4 fingerprint hash of the downstream connection, if any.
+   */
+  virtual absl::string_view ja4Hash() const PURE;
+
+  /**
    * @return roundTripTime of the connection
    */
   virtual const absl::optional<std::chrono::milliseconds>& roundTripTime() const PURE;
+
+  /**
+   * @return the filter chain info provider backing this socket.
+   */
+  virtual OptRef<const FilterChainInfo> filterChainInfo() const PURE;
+
+  /**
+   * @return the listener info backing this socket.
+   */
+  virtual OptRef<const ListenerInfo> listenerInfo() const PURE;
 };
 
 class ConnectionInfoSetter : public ConnectionInfoProvider {
@@ -295,9 +360,24 @@ public:
   virtual void setJA3Hash(const absl::string_view ja3_hash) PURE;
 
   /**
+   * @param JA4 fingerprint.
+   */
+  virtual void setJA4Hash(const absl::string_view ja4_hash) PURE;
+
+  /**
    * @param  milliseconds of round trip time of previous connection
    */
   virtual void setRoundTripTime(std::chrono::milliseconds round_trip_time) PURE;
+
+  /**
+   * @param filter_chain_info the filter chain info provider backing this socket.
+   */
+  virtual void setFilterChainInfo(FilterChainInfoConstSharedPtr filter_chain_info) PURE;
+
+  /**
+   * @param listener_info the listener info provider backing this socket.
+   */
+  virtual void setListenerInfo(std::shared_ptr<const ListenerInfo> listener_info) PURE;
 };
 
 using ConnectionInfoSetterSharedPtr = std::shared_ptr<ConnectionInfoSetter>;
@@ -504,6 +584,13 @@ public:
    * @return the socket options stored earlier with addOption() and addOptions() calls, if any.
    */
   virtual const OptionsSharedPtr& options() const PURE;
+
+  /**
+   * @return a ParentDrainedCallbackRegistrar for UDP listen sockets during hot restart.
+   */
+  virtual OptRef<class ParentDrainedCallbackRegistrar> parentDrainedCallbackRegistrar() const {
+    return absl::nullopt;
+  }
 };
 
 using SocketPtr = std::unique_ptr<Socket>;

@@ -7,6 +7,7 @@
 #include "envoy/config/listener/v3/listener_components.pb.h"
 #include "envoy/config/route/v3/route_components.pb.h"
 #include "envoy/extensions/access_loggers/file/v3/file.pb.h"
+#include "envoy/extensions/filters/http/upstream_codec/v3/upstream_codec.pb.h"
 #include "envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.pb.h"
 #include "envoy/extensions/transport_sockets/quic/v3/quic_transport.pb.h"
 #include "envoy/extensions/transport_sockets/tls/v3/cert.pb.h"
@@ -21,11 +22,13 @@
 #include "test/config/integration/certs/client2cert_hash.h"
 #include "test/config/integration/certs/client_ecdsacert_hash.h"
 #include "test/config/integration/certs/clientcert_hash.h"
+#include "test/integration/async_round_robin.pb.h"
 #include "test/test_common/environment.h"
 #include "test/test_common/network_utility.h"
 #include "test/test_common/resources.h"
 #include "test/test_common/utility.h"
 
+#include "absl/strings/match.h"
 #include "absl/strings/str_replace.h"
 #include "gtest/gtest.h"
 
@@ -58,7 +61,6 @@ admin:
       port_value: 0
 dynamic_resources:
   lds_config:
-    resource_api_version: V3
     path_config_source:
       path: {}
 static_resources:
@@ -211,8 +213,9 @@ typed_config:
 )EOF";
 }
 
-std::string ConfigHelper::tlsInspectorFilter(bool enable_ja3_fingerprinting) {
-  if (!enable_ja3_fingerprinting) {
+std::string ConfigHelper::tlsInspectorFilter(bool enable_ja3_fingerprinting,
+                                             bool enable_ja4_fingerprinting) {
+  if (!enable_ja3_fingerprinting && !enable_ja4_fingerprinting) {
     return R"EOF(
 name: "envoy.filters.listener.tls_inspector"
 typed_config:
@@ -225,6 +228,7 @@ name: "envoy.filters.listener.tls_inspector"
 typed_config:
   "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
   enable_ja3_fingerprinting: true
+  enable_ja4_fingerprinting: true
 )EOF";
 }
 
@@ -338,29 +342,6 @@ typed_config:
 )EOF";
 }
 
-std::string ConfigHelper::defaultSquashFilter() {
-  return R"EOF(
-name: squash
-typed_config:
-  "@type": type.googleapis.com/envoy.extensions.filters.http.squash.v3.Squash
-  cluster: squash
-  attachment_template:
-    spec:
-      attachment:
-        env: "{{ SQUASH_ENV_TEST }}"
-      match_request: true
-  attachment_timeout:
-    seconds: 1
-    nanos: 0
-  attachment_poll_period:
-    seconds: 2
-    nanos: 0
-  request_timeout:
-    seconds: 1
-    nanos: 0
-)EOF";
-}
-
 std::string ConfigHelper::clustersNoListenerBootstrap(const std::string& api_type) {
   return fmt::format(
       R"EOF(
@@ -376,10 +357,8 @@ admin:
       port_value: 0
 dynamic_resources:
   cds_config:
-    resource_api_version: V3
     api_config_source:
       api_type: {}
-      transport_api_version: V3
       grpc_services:
         envoy_grpc:
           cluster_name: my_cds_cluster
@@ -451,13 +430,10 @@ std::string ConfigHelper::adsBootstrap(const std::string& api_type) {
   return fmt::format(R"EOF(
 dynamic_resources:
   lds_config:
-    resource_api_version: V3
     ads: {{}}
   cds_config:
-    resource_api_version: V3
     ads: {{}}
   ads_config:
-    transport_api_version: V3
     api_type: {0}
     set_node_on_first_message_only: true
 static_resources:
@@ -664,7 +640,6 @@ envoy::config::listener::v3::Listener ConfigHelper::buildListener(const std::str
             rds:
               route_config_name: {}
               config_source:
-                resource_api_version: V3
                 ads: {{}}
             http_filters:
             - name: envoy.filters.http.router
@@ -676,7 +651,8 @@ envoy::config::listener::v3::Listener ConfigHelper::buildListener(const std::str
 }
 
 envoy::config::route::v3::RouteConfiguration
-ConfigHelper::buildRouteConfig(const std::string& name, const std::string& cluster) {
+ConfigHelper::buildRouteConfig(const std::string& name, const std::string& cluster,
+                               bool header_mutations) {
   API_NO_BOOST(envoy::config::route::v3::RouteConfiguration) route;
 #ifdef ENVOY_ENABLE_YAML
   TestUtility::loadFromYaml(fmt::format(R"EOF(
@@ -690,10 +666,31 @@ ConfigHelper::buildRouteConfig(const std::string& name, const std::string& clust
     )EOF",
                                         name, cluster),
                             route);
+
+  if (header_mutations) {
+    auto* route_entry = route.mutable_virtual_hosts(0)->mutable_routes(0);
+    auto* header1 = route_entry->add_request_headers_to_add();
+    *header1->mutable_header()->mutable_key() = "test-metadata";
+    *header1->mutable_header()->mutable_value() = "%METADATA(ROUTE:com.test.my_filter)%";
+
+    auto* header2 = route_entry->add_response_headers_to_add();
+    *header2->mutable_header()->mutable_key() = "test-cel";
+    *header2->mutable_header()->mutable_value() = "%CEL(request.headers['some-header'])%";
+
+    auto* header3 = route_entry->add_response_headers_to_add();
+    *header3->mutable_header()->mutable_key() = "test-other-command";
+    *header3->mutable_header()->mutable_value() = "%START_TIME%";
+
+    auto* header4 = route_entry->add_response_headers_to_add();
+    *header4->mutable_header()->mutable_key() = "test-plain";
+    *header4->mutable_header()->mutable_value() = "plain";
+  }
+
   return route;
 #else
   UNREFERENCED_PARAMETER(name);
   UNREFERENCED_PARAMETER(cluster);
+  UNREFERENCED_PARAMETER(header_mutations);
   PANIC("YAML support compiled out");
 #endif
 }
@@ -776,7 +773,7 @@ ConfigHelper::ConfigHelper(const Network::Address::IpVersion version,
   }
 }
 
-void ConfigHelper::addListenerTypedMetadata(absl::string_view key, ProtobufWkt::Any& packed_value) {
+void ConfigHelper::addListenerTypedMetadata(absl::string_view key, Protobuf::Any& packed_value) {
   RELEASE_ASSERT(!finalized_, "");
   auto* static_resources = bootstrap_.mutable_static_resources();
   ASSERT_TRUE(static_resources->listeners_size() > 0);
@@ -789,7 +786,7 @@ void ConfigHelper::addClusterFilterMetadata(absl::string_view metadata_yaml,
                                             absl::string_view cluster_name) {
 #ifdef ENVOY_ENABLE_YAML
   RELEASE_ASSERT(!finalized_, "");
-  ProtobufWkt::Struct cluster_metadata;
+  Protobuf::Struct cluster_metadata;
   TestUtility::loadFromYaml(std::string(metadata_yaml), cluster_metadata);
 
   auto* static_resources = bootstrap_.mutable_static_resources();
@@ -799,7 +796,7 @@ void ConfigHelper::addClusterFilterMetadata(absl::string_view metadata_yaml,
       continue;
     }
     for (const auto& kvp : cluster_metadata.fields()) {
-      ASSERT_TRUE(kvp.second.kind_case() == ProtobufWkt::Value::KindCase::kStructValue);
+      ASSERT_TRUE(kvp.second.kind_case() == Protobuf::Value::KindCase::kStructValue);
       cluster->mutable_metadata()->mutable_filter_metadata()->insert(
           {kvp.first, kvp.second.struct_value()});
     }
@@ -832,9 +829,10 @@ void ConfigHelper::setConnectConfig(
     match->mutable_connect_matcher();
   }
 
+  auto* upgrade = route->mutable_route()->add_upgrade_configs();
+  upgrade->set_upgrade_type("CONNECT");
+
   if (terminate_connect) {
-    auto* upgrade = route->mutable_route()->add_upgrade_configs();
-    upgrade->set_upgrade_type("CONNECT");
     auto* config = upgrade->mutable_connect_config();
     if (allow_post) {
       config->set_allow_post(true);
@@ -852,6 +850,30 @@ void ConfigHelper::setConnectConfig(
   }
 }
 
+void ConfigHelper::setConnectUdpConfig(
+    envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager& hcm,
+    bool terminate_connect, bool http3) {
+  auto* route_config = hcm.mutable_route_config();
+  ASSERT_EQ(1, route_config->virtual_hosts_size());
+  auto* route = route_config->mutable_virtual_hosts(0)->mutable_routes(0);
+  auto* match = route->mutable_match();
+  match->Clear();
+  match->mutable_connect_matcher();
+
+  auto* upgrade = route->mutable_route()->add_upgrade_configs();
+  upgrade->set_upgrade_type("connect-udp");
+
+  if (terminate_connect) {
+    upgrade->mutable_connect_config();
+  }
+
+  hcm.add_upgrade_configs()->set_upgrade_type("connect-udp");
+  hcm.mutable_http2_protocol_options()->set_allow_connect(true);
+  if (http3) {
+    hcm.mutable_http3_protocol_options()->set_allow_extended_connect(true);
+  }
+}
+
 void ConfigHelper::applyConfigModifiers() {
   for (const auto& config_modifier : config_modifiers_) {
     config_modifier(bootstrap_);
@@ -862,9 +884,11 @@ void ConfigHelper::applyConfigModifiers() {
 void ConfigHelper::configureUpstreamTls(
     bool use_alpn, bool http3,
     absl::optional<envoy::config::core::v3::AlternateProtocolsCacheOptions>
-        alternate_protocol_cache_config) {
-  addConfigModifier([use_alpn, http3, alternate_protocol_cache_config](
-                        envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+        alternate_protocol_cache_config,
+    std::function<void(envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext&)>
+        configure_tls_context) {
+  addConfigModifier([use_alpn, http3, alternate_protocol_cache_config,
+                     configure_tls_context](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
     auto* cluster = bootstrap.mutable_static_resources()->mutable_clusters(0);
 
     ConfigHelper::HttpProtocolOptions protocol_options;
@@ -913,6 +937,9 @@ void ConfigHelper::configureUpstreamTls(
         TestEnvironment::runfilesPath("test/config/integration/certs/upstreamcacert.pem"));
     // The test certs are for *.lyft.com, so make sure SNI matches.
     tls_context.set_sni("foo.lyft.com");
+    if (configure_tls_context != nullptr) {
+      configure_tls_context(tls_context);
+    }
     if (http3) {
       envoy::extensions::transport_sockets::quic::v3::QuicUpstreamTransport quic_context;
       quic_context.mutable_upstream_tls_context()->CopyFrom(tls_context);
@@ -964,6 +991,15 @@ void ConfigHelper::setHttp2(envoy::config::cluster::v3::Cluster& cluster) {
   setProtocolOptions(cluster, protocol_options);
 }
 
+void ConfigHelper::setHttp2WithMaxConcurrentStreams(envoy::config::cluster::v3::Cluster& cluster,
+                                                    uint32_t max_concurrent_streams) {
+  HttpProtocolOptions protocol_options;
+  auto* http2_options =
+      protocol_options.mutable_explicit_http_config()->mutable_http2_protocol_options();
+  http2_options->mutable_max_concurrent_streams()->set_value(max_concurrent_streams);
+  setProtocolOptions(cluster, protocol_options);
+}
+
 void ConfigHelper::finalize(const std::vector<uint32_t>& ports) {
   RELEASE_ASSERT(!finalized_, "");
 
@@ -982,7 +1018,30 @@ void ConfigHelper::finalize(const std::vector<uint32_t>& ports) {
 #endif
   }
 
+  // Make sure we don't setAsyncLb() when we intend to use a non-default LB algorithm.
+  for (int i = 0; i < bootstrap_.mutable_static_resources()->clusters_size(); ++i) {
+    auto* cluster = bootstrap_.mutable_static_resources()->mutable_clusters(i);
+    if (cluster->has_load_balancing_policy() &&
+        cluster->load_balancing_policy().policies(0).typed_extension_config().name() ==
+            "envoy.load_balancing_policies.async_round_robin") {
+      ASSERT_EQ(::envoy::config::cluster::v3::Cluster::ROUND_ROBIN, cluster->lb_policy());
+    }
+  }
+
   finalized_ = true;
+}
+
+void ConfigHelper::setAsyncLb(bool hang) {
+  for (int i = 0; i < bootstrap_.mutable_static_resources()->clusters_size(); ++i) {
+    auto* cluster = bootstrap_.mutable_static_resources()->mutable_clusters(i);
+
+    auto* policy = cluster->mutable_load_balancing_policy()->mutable_policies()->Add();
+    policy->mutable_typed_extension_config()->set_name(
+        "envoy.load_balancing_policies.async_round_robin");
+    test::integration::lb::AsyncRoundRobin lb_config;
+    lb_config.set_hang(hang);
+    policy->mutable_typed_extension_config()->mutable_typed_config()->PackFrom(lb_config);
+  }
 }
 
 void ConfigHelper::setPorts(const std::vector<uint32_t>& ports, bool override_port_zero) {
@@ -997,7 +1056,8 @@ void ConfigHelper::setPorts(const std::vector<uint32_t>& ports, bool override_po
       eds_hosts = true;
     } else if (cluster->type() == envoy::config::cluster::v3::Cluster::ORIGINAL_DST) {
       original_dst_cluster = true;
-    } else if (cluster->has_cluster_type()) {
+    } else if (cluster->has_cluster_type() &&
+               !absl::StartsWith(cluster->cluster_type().name(), "envoy.cluster.")) {
       custom_cluster = true;
     } else {
       // Assign ports to statically defined load_assignment hosts.
@@ -1151,7 +1211,7 @@ void ConfigHelper::disableDelayClose() {
              hcm) { hcm.mutable_delayed_close_timeout()->set_nanos(0); });
 }
 
-void ConfigHelper::setDownstreamMaxRequestsPerConnection(uint64_t max_requests_per_connection) {
+void ConfigHelper::setDownstreamMaxRequestsPerConnection(uint32_t max_requests_per_connection) {
   addConfigModifier(
       [max_requests_per_connection](
           envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
@@ -1222,7 +1282,10 @@ void ConfigHelper::prependFilter(const std::string& config, bool downstream) {
               ["envoy.extensions.upstreams.http.v3.HttpProtocolOptions"]);
     }
     if (old_protocol_options.http_filters().empty()) {
-      old_protocol_options.add_http_filters()->set_name("envoy.filters.http.upstream_codec");
+      auto* codec_filter = old_protocol_options.add_http_filters();
+      codec_filter->set_name("envoy.filters.http.upstream_codec");
+      codec_filter->mutable_typed_config()->PackFrom(
+          envoy::extensions::filters::http::upstream_codec::v3::UpstreamCodec::default_instance());
     }
     auto* filter_list_back = old_protocol_options.add_http_filters();
 #ifdef ENVOY_ENABLE_YAML
@@ -1283,16 +1346,17 @@ void ConfigHelper::addSslConfig(const ServerSslOptions& options) {
   auto* filter_chain =
       bootstrap_.mutable_static_resources()->mutable_listeners(0)->mutable_filter_chains(0);
   envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext tls_context;
-  initializeTls(options, *tls_context.mutable_common_tls_context());
+  initializeTls(options, *tls_context.mutable_common_tls_context(), false);
   if (options.ocsp_staple_required_) {
     tls_context.set_ocsp_staple_policy(
         envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext::MUST_STAPLE);
   }
+  tls_context.set_prefer_client_ciphers(options.prefer_client_ciphers_);
   filter_chain->mutable_transport_socket()->set_name("envoy.transport_sockets.tls");
   filter_chain->mutable_transport_socket()->mutable_typed_config()->PackFrom(tls_context);
 }
 
-void ConfigHelper::addQuicDownstreamTransportSocketConfig(bool enable_early_data) {
+void ConfigHelper::addQuicDownstreamTransportSocketConfig() {
   for (auto& listener : *bootstrap_.mutable_static_resources()->mutable_listeners()) {
     if (listener.udp_listener_config().has_quic_options()) {
       // Disable SO_REUSEPORT, because it undesirably allows parallel test jobs to use the same
@@ -1302,10 +1366,11 @@ void ConfigHelper::addQuicDownstreamTransportSocketConfig(bool enable_early_data
   }
   configDownstreamTransportSocketWithTls(
       bootstrap_,
-      [](envoy::extensions::transport_sockets::tls::v3::CommonTlsContext& common_tls_context) {
-        initializeTls(ServerSslOptions().setRsaCert(true).setTlsV13(true), common_tls_context);
+      [&](envoy::extensions::transport_sockets::tls::v3::CommonTlsContext& common_tls_context) {
+        initializeTls(ServerSslOptions().setRsaCert(true).setTlsV13(true), common_tls_context,
+                      true);
       },
-      enable_early_data);
+      true);
 }
 
 bool ConfigHelper::setAccessLog(
@@ -1420,9 +1485,14 @@ void ConfigHelper::initializeTlsKeyLog(
 
 void ConfigHelper::initializeTls(
     const ServerSslOptions& options,
-    envoy::extensions::transport_sockets::tls::v3::CommonTlsContext& common_tls_context) {
-  common_tls_context.add_alpn_protocols(Http::Utility::AlpnNames::get().Http2);
-  common_tls_context.add_alpn_protocols(Http::Utility::AlpnNames::get().Http11);
+    envoy::extensions::transport_sockets::tls::v3::CommonTlsContext& common_tls_context,
+    bool http3) {
+  if (!http3) {
+    // If it's HTTP/3, leave it empty as QUIC will derive the supported ALPNs from QUIC version by
+    // default.
+    common_tls_context.add_alpn_protocols(Http::Utility::AlpnNames::get().Http2);
+    common_tls_context.add_alpn_protocols(Http::Utility::AlpnNames::get().Http11);
+  }
 
   auto* validation_context = common_tls_context.mutable_validation_context();
   if (options.custom_validator_config_) {
@@ -1466,6 +1536,12 @@ void ConfigHelper::initializeTls(
   common_tls_context.mutable_tls_params()->set_tls_maximum_protocol_version(
       options.tlsv1_3_ ? envoy::extensions::transport_sockets::tls::v3::TlsParameters::TLSv1_3
                        : envoy::extensions::transport_sockets::tls::v3::TlsParameters::TLSv1_2);
+  for (const auto& curve : options.curves_) {
+    common_tls_context.mutable_tls_params()->add_ecdh_curves(curve);
+  }
+  for (const auto& cipher : options.ciphers_) {
+    common_tls_context.mutable_tls_params()->add_cipher_suites(cipher);
+  }
   if (options.rsa_cert_) {
     auto* tls_certificate = common_tls_context.add_tls_certificates();
     tls_certificate->mutable_certificate_chain()->set_filename(
@@ -1479,18 +1555,29 @@ void ConfigHelper::initializeTls(
   }
   if (options.ecdsa_cert_) {
     auto* tls_certificate = common_tls_context.add_tls_certificates();
-    tls_certificate->mutable_certificate_chain()->set_filename(
-        TestEnvironment::runfilesPath("test/config/integration/certs/server_ecdsacert.pem"));
-    tls_certificate->mutable_private_key()->set_filename(
-        TestEnvironment::runfilesPath("test/config/integration/certs/server_ecdsakey.pem"));
+    tls_certificate->mutable_certificate_chain()->set_filename(TestEnvironment::runfilesPath(
+        "test/config/integration/certs/" + options.ecdsa_cert_name_ + "cert.pem"));
+    tls_certificate->mutable_private_key()->set_filename(TestEnvironment::runfilesPath(
+        "test/config/integration/certs/" + options.ecdsa_cert_name_ + "key.pem"));
     if (options.ecdsa_cert_ocsp_staple_) {
       tls_certificate->mutable_ocsp_staple()->set_filename(TestEnvironment::runfilesPath(
-          "test/config/integration/certs/server_ecdsa_ocsp_resp.der"));
+          "test/config/integration/certs/" + options.ecdsa_cert_name_ + "_ocsp_resp.der"));
     }
   }
+
   if (!options.san_matchers_.empty()) {
     *validation_context->mutable_match_typed_subject_alt_names() = {options.san_matchers_.begin(),
                                                                     options.san_matchers_.end()};
+  }
+  if (!options.tls_cert_selector_yaml_.empty()) {
+    auto* cert_selector = common_tls_context.mutable_custom_tls_certificate_selector();
+#ifdef ENVOY_ENABLE_YAML
+    TestUtility::loadFromYaml(TestEnvironment::substitute(options.tls_cert_selector_yaml_),
+                              *cert_selector);
+#else
+    UNREFERENCED_PARAMETER(cert_selector);
+    PANIC("YAML support compiled out");
+#endif
   }
   initializeTlsKeyLog(common_tls_context, options);
 }
@@ -1515,6 +1602,21 @@ envoy::config::listener::v3::Filter* ConfigHelper::getFilterFromListener(const s
   for (ssize_t i = 0; i < filter_chain->filters_size(); i++) {
     if (filter_chain->mutable_filters(i)->name() == name) {
       return filter_chain->mutable_filters(i);
+    }
+  }
+  return nullptr;
+}
+
+envoy::config::listener::v3::ListenerFilter*
+ConfigHelper::getListenerFilterFromListener(const std::string& name) {
+  RELEASE_ASSERT(!finalized_, "");
+  if (bootstrap_.mutable_static_resources()->listeners_size() == 0) {
+    return nullptr;
+  }
+  auto* listener = bootstrap_.mutable_static_resources()->mutable_listeners(0);
+  for (ssize_t i = 0; i < listener->listener_filters_size(); i++) {
+    if (listener->mutable_listener_filters(i)->name() == name) {
+      return listener->mutable_listener_filters(i);
     }
   }
   return nullptr;
@@ -1584,6 +1686,14 @@ void ConfigHelper::storeHttpConnectionManager(
       "http", hcm);
 }
 
+bool ConfigHelper::loadUdpProxyFilter(UdpProxyConfig& udp_proxy) {
+  return loadListenerFilter<UdpProxyConfig>("udp_proxy", udp_proxy);
+}
+
+void ConfigHelper::storeUdpProxyFilter(const UdpProxyConfig& udp_proxy) {
+  return storeListenerFilter<UdpProxyConfig>("udp_proxy", udp_proxy);
+}
+
 void ConfigHelper::addConfigModifier(ConfigModifierFunction function) {
   RELEASE_ASSERT(!finalized_, "");
   config_modifiers_.push_back(std::move(function));
@@ -1601,13 +1711,24 @@ void ConfigHelper::addConfigModifier(HttpModifierFunction function) {
   });
 }
 
+void ConfigHelper::addConfigModifier(UdpProxyModifierFunction function) {
+  addConfigModifier([function, this](envoy::config::bootstrap::v3::Bootstrap&) -> void {
+    UdpProxyConfig udp_proxy_config;
+    if (!loadUdpProxyFilter(udp_proxy_config)) {
+      return;
+    }
+    function(udp_proxy_config);
+    storeUdpProxyFilter(udp_proxy_config);
+  });
+}
+
 void ConfigHelper::setLds(absl::string_view version_info) {
   applyConfigModifiers();
 
   envoy::service::discovery::v3::DiscoveryResponse lds;
   lds.set_version_info(std::string(version_info));
   for (auto& listener : bootstrap_.static_resources().listeners()) {
-    ProtobufWkt::Any* resource = lds.add_resources();
+    Protobuf::Any* resource = lds.add_resources();
     resource->PackFrom(listener);
   }
 
@@ -1654,6 +1775,62 @@ void ConfigHelper::setUpstreamOutboundFramesLimits(uint32_t max_all_frames,
       });
 }
 
+void ConfigHelper::setDownstreamHttp2MaxConcurrentStreams(uint32_t max_streams) {
+  auto filter = getFilterFromListener("http");
+  if (filter) {
+    envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager
+        hcm_config;
+    loadHttpConnectionManager(hcm_config);
+    if (hcm_config.codec_type() == envoy::extensions::filters::network::http_connection_manager::
+                                       v3::HttpConnectionManager::HTTP2) {
+      auto* options = hcm_config.mutable_http2_protocol_options();
+      options->mutable_max_concurrent_streams()->set_value(max_streams);
+      storeHttpConnectionManager(hcm_config);
+    }
+  }
+}
+
+void ConfigHelper::setUpstreamHttp2MaxConcurrentStreams(uint32_t max_streams) {
+  addConfigModifier([max_streams](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+    ConfigHelper::HttpProtocolOptions protocol_options;
+    auto* http_protocol_options =
+        protocol_options.mutable_explicit_http_config()->mutable_http2_protocol_options();
+    http_protocol_options->mutable_max_concurrent_streams()->set_value(max_streams);
+    ConfigHelper::setProtocolOptions(*bootstrap.mutable_static_resources()->mutable_clusters(0),
+                                     protocol_options);
+  });
+}
+
+void ConfigHelper::setDownstreamHttp2WindowSize(uint32_t stream_window,
+                                                uint32_t connection_window) {
+  auto filter = getFilterFromListener("http");
+  if (filter) {
+    envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager
+        hcm_config;
+    loadHttpConnectionManager(hcm_config);
+    if (hcm_config.codec_type() == envoy::extensions::filters::network::http_connection_manager::
+                                       v3::HttpConnectionManager::HTTP2) {
+      auto* options = hcm_config.mutable_http2_protocol_options();
+      options->mutable_initial_stream_window_size()->set_value(stream_window);
+      options->mutable_initial_connection_window_size()->set_value(connection_window);
+      storeHttpConnectionManager(hcm_config);
+    }
+  }
+}
+
+void ConfigHelper::setUpstreamHttp2WindowSize(uint32_t stream_window, uint32_t connection_window) {
+  addConfigModifier([stream_window,
+                     connection_window](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+    ConfigHelper::HttpProtocolOptions protocol_options;
+    auto* http_protocol_options =
+        protocol_options.mutable_explicit_http_config()->mutable_http2_protocol_options();
+    http_protocol_options->mutable_initial_stream_window_size()->set_value(stream_window);
+    http_protocol_options->mutable_initial_connection_window_size()->set_value(connection_window);
+    ConfigHelper::setProtocolOptions(*bootstrap.mutable_static_resources()->mutable_clusters(0),
+                                     protocol_options);
+  });
+}
+
 void ConfigHelper::setLocalReply(
     const envoy::extensions::filters::network::http_connection_manager::v3::LocalReplyConfig&
         config) {
@@ -1672,7 +1849,7 @@ void ConfigHelper::adjustUpstreamTimeoutForTsan(
   auto* timeout = route->mutable_timeout();
   // QUIC stream processing is slow under TSAN. Use larger timeout to prevent
   // response_timeout.
-  timeout->set_seconds(TSAN_TIMEOUT_FACTOR * timeout_ms / 1000);
+  timeout->set_seconds(TIMEOUT_FACTOR * timeout_ms / 1000);
 }
 
 envoy::config::core::v3::Http3ProtocolOptions ConfigHelper::http2ToHttp3ProtocolOptions(
@@ -1702,14 +1879,14 @@ void CdsHelper::setCds(const std::vector<envoy::config::cluster::v3::Cluster>& c
   // Write to file the DiscoveryResponse and trigger inotify watch.
   envoy::service::discovery::v3::DiscoveryResponse cds_response;
   cds_response.set_version_info(std::to_string(cds_version_++));
-  cds_response.set_type_url(Config::TypeUrl::get().Cluster);
+  cds_response.set_type_url(Config::TestTypeUrl::get().Cluster);
   for (const auto& cluster : clusters) {
     cds_response.add_resources()->PackFrom(cluster);
   }
   // Past the initial write, need move semantics to trigger inotify move event that the
   // FilesystemSubscriptionImpl is subscribed to.
-  std::string path =
-      TestEnvironment::writeStringToFileForTest("cds.update.pb_text", cds_response.DebugString());
+  std::string path = TestEnvironment::writeStringToFileForTest(
+      "cds.update.pb_text", MessageUtil::toTextProto(cds_response));
   TestEnvironment::renameFile(path, cds_path_);
 }
 
@@ -1724,14 +1901,14 @@ void EdsHelper::setEds(const std::vector<envoy::config::endpoint::v3::ClusterLoa
   // Write to file the DiscoveryResponse and trigger inotify watch.
   envoy::service::discovery::v3::DiscoveryResponse eds_response;
   eds_response.set_version_info(std::to_string(eds_version_++));
-  eds_response.set_type_url(Config::TypeUrl::get().ClusterLoadAssignment);
+  eds_response.set_type_url(Config::TestTypeUrl::get().ClusterLoadAssignment);
   for (const auto& cluster_load_assignment : cluster_load_assignments) {
     eds_response.add_resources()->PackFrom(cluster_load_assignment);
   }
   // Past the initial write, need move semantics to trigger inotify move event that the
   // FilesystemSubscriptionImpl is subscribed to.
-  std::string path =
-      TestEnvironment::writeStringToFileForTest("eds.update.pb_text", eds_response.DebugString());
+  std::string path = TestEnvironment::writeStringToFileForTest(
+      "eds.update.pb_text", MessageUtil::toTextProto(eds_response));
   TestEnvironment::renameFile(path, eds_path_);
 }
 

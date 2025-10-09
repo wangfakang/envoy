@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Generates request and response fixtures for integration tests.
 
@@ -108,7 +108,7 @@ else
     SERVICE_FLAGS+=("--unix")
     "${DRIVER_DIR}/server" "${SERVICE_FLAGS[@]}" &
     SERVER_PID="$!"
-    while [[ ! -a "${SOCKET}" ]]; do
+    while [[ ! -e "${SOCKET}" ]]; do
         sleep 0.1
 
         if ! kill -0 "${SERVER_PID}"; then

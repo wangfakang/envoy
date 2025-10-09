@@ -108,7 +108,7 @@ public:
     if (downstream_protocol_ == Http::CodecType::HTTP1) {
       ASSERT_TRUE(codec_client_->waitForDisconnect());
     } else {
-      ASSERT_TRUE(response.waitForReset());
+      ASSERT_TRUE(response.waitForAnyTermination());
       codec_client_->close();
     }
     if (!stat_name.empty()) {
@@ -116,9 +116,7 @@ public:
     }
   }
 
-  // TODO(htuch): This might require scaling for TSAN/ASAN/Valgrind/etc. Bump if
-  // this is the cause of flakes.
-  static constexpr uint64_t IdleTimeoutMs = 300 * TSAN_TIMEOUT_FACTOR;
+  static constexpr uint64_t IdleTimeoutMs = 300 * TIMEOUT_FACTOR;
   static constexpr uint64_t RequestTimeoutMs = 200;
   bool enable_global_idle_timeout_{false};
   bool enable_per_stream_idle_timeout_{false};
@@ -258,6 +256,19 @@ TEST_P(IdleTimeoutIntegrationTest, PerStreamIdleTimeoutAfterDownstreamHeaders) {
   EXPECT_EQ("bar", response->headers().get(foo)[0]->value().getStringView());
   EXPECT_EQ("stream timeout", response->body());
 
+  EXPECT_THAT(waitForAccessLog(access_log_name_), HasSubstr("stream_idle_timeout"));
+}
+
+TEST_P(IdleTimeoutIntegrationTest, PerStreamIdleTimeoutDuringHostSelection) {
+  enable_per_stream_idle_timeout_ = true;
+  config_helper_.setAsyncLb(true); // Set the lb to hang during host selection.
+
+  initialize();
+
+  codec_client_ = makeHttpConnection(makeClientConnection(lookupPort("http")));
+  auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+
+  ASSERT_TRUE(response->waitForEndStream());
   EXPECT_THAT(waitForAccessLog(access_log_name_), HasSubstr("stream_idle_timeout"));
 }
 

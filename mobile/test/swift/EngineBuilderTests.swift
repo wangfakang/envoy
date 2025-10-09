@@ -3,21 +3,18 @@ import EnvoyEngine
 import Foundation
 import XCTest
 
-// swiftlint:disable type_body_length
-
 private struct TestFilter: Filter {}
 
 final class EngineBuilderTests: XCTestCase {
   override func tearDown() {
     super.tearDown()
     MockEnvoyEngine.onRunWithConfig = nil
-    MockEnvoyEngine.onRunWithYAML = nil
   }
 
-  func testSetRuntimeGuard() {
+  func testAddRuntimeGuard() {
     let bootstrapDebugDescription = EngineBuilder()
-      .setRuntimeGuard("test_feature_false", true)
-      .setRuntimeGuard("test_feature_true", false)
+      .addRuntimeGuard("test_feature_false", true)
+      .addRuntimeGuard("test_feature_true", false)
       .bootstrapDebugDescription()
     XCTAssertTrue(
       bootstrapDebugDescription.contains(#""test_feature_false" value { bool_value: true }"#)
@@ -40,19 +37,6 @@ final class EngineBuilderTests: XCTestCase {
     XCTAssertEqual(builder.monitoringMode, .reachability)
   }
 
-  func testCustomConfigYAMLUsesSpecifiedYAMLWhenRunningEnvoy() {
-    let expectation = self.expectation(description: "Run called with expected data")
-    MockEnvoyEngine.onRunWithYAML = { yaml, _, _ in
-      XCTAssertEqual("foobar", yaml)
-      expectation.fulfill()
-    }
-
-    _ = EngineBuilder(yaml: "foobar")
-      .addEngineType(MockEnvoyEngine.self)
-      .build()
-    self.waitForExpectations(timeout: 0.01)
-  }
-
   func testAddingLogLevelAddsLogLevelWhenRunningEnvoy() {
     let expectation = self.expectation(description: "Run called with expected data")
     MockEnvoyEngine.onRunWithConfig = { _, logLevel in
@@ -62,39 +46,10 @@ final class EngineBuilderTests: XCTestCase {
 
     _ = EngineBuilder()
       .addEngineType(MockEnvoyEngine.self)
-      .addLogLevel(.trace)
+      .setLogLevel(.trace)
       .build()
     self.waitForExpectations(timeout: 0.01)
   }
-
-  func testAdminInterfaceIsDisabledByDefault() {
-    let expectation = self.expectation(description: "Run called with disabled admin interface")
-    MockEnvoyEngine.onRunWithConfig = { config, _ in
-      XCTAssertFalse(config.adminInterfaceEnabled)
-      expectation.fulfill()
-    }
-
-    _ = EngineBuilder()
-      .addEngineType(MockEnvoyEngine.self)
-      .build()
-    self.waitForExpectations(timeout: 0.01)
-  }
-
-#if ENVOY_ADMIN_FUNCTIONALITY
-  func testEnablingAdminInterfaceAddsToConfigurationWhenRunningEnvoy() {
-    let expectation = self.expectation(description: "Run called with enabled admin interface")
-    MockEnvoyEngine.onRunWithConfig = { config, _ in
-      XCTAssertTrue(config.adminInterfaceEnabled)
-      expectation.fulfill()
-    }
-
-    _ = EngineBuilder()
-      .addEngineType(MockEnvoyEngine.self)
-      .enableAdminInterface()
-      .build()
-    self.waitForExpectations(timeout: 0.01)
-  }
-#endif
 
   func testEnablingInterfaceBindingAddsToConfigurationWhenRunningEnvoy() {
     let expectation = self.expectation(description: "Run called with enabled interface binding")
@@ -120,34 +75,6 @@ final class EngineBuilderTests: XCTestCase {
     _ = EngineBuilder()
       .addEngineType(MockEnvoyEngine.self)
       .enforceTrustChainVerification(true)
-      .build()
-    self.waitForExpectations(timeout: 0.01)
-  }
-
-  func testForceIPv6AddsToConfigurationWhenRunningEnvoy() {
-    let expectation = self.expectation(description: "Run called with force IPv6")
-    MockEnvoyEngine.onRunWithConfig = { config, _ in
-      XCTAssertTrue(config.forceIPv6)
-      expectation.fulfill()
-    }
-
-    _ = EngineBuilder()
-      .addEngineType(MockEnvoyEngine.self)
-      .forceIPv6(true)
-      .build()
-    self.waitForExpectations(timeout: 0.01)
-  }
-
-  func testAddinggrpcStatsDomainAddsToConfigurationWhenRunningEnvoy() {
-    let expectation = self.expectation(description: "Run called with expected data")
-    MockEnvoyEngine.onRunWithConfig = { config, _ in
-      XCTAssertEqual("stats.envoyproxy.io", config.grpcStatsDomain)
-      expectation.fulfill()
-    }
-
-    _ = EngineBuilder()
-      .addEngineType(MockEnvoyEngine.self)
-      .addGrpcStatsDomain("stats.envoyproxy.io")
       .build()
     self.waitForExpectations(timeout: 0.01)
   }
@@ -279,20 +206,6 @@ final class EngineBuilderTests: XCTestCase {
     self.waitForExpectations(timeout: 0.01)
   }
 
-  func testAddingStatsFlushSecondsAddsToConfigurationWhenRunningEnvoy() {
-    let expectation = self.expectation(description: "Run called with expected data")
-    MockEnvoyEngine.onRunWithConfig = { config, _ in
-      XCTAssertEqual(42, config.statsFlushSeconds)
-      expectation.fulfill()
-    }
-
-    _ = EngineBuilder()
-      .addEngineType(MockEnvoyEngine.self)
-      .addStatsFlushSeconds(42)
-      .build()
-    self.waitForExpectations(timeout: 0.01)
-  }
-
   func testAddingStreamIdleTimeoutSecondsAddsToConfigurationWhenRunningEnvoy() {
     let expectation = self.expectation(description: "Run called with expected data")
     MockEnvoyEngine.onRunWithConfig = { config, _ in
@@ -384,69 +297,6 @@ final class EngineBuilderTests: XCTestCase {
       .build()
     self.waitForExpectations(timeout: 0.01)
   }
-
-#if ENVOY_GOOGLE_GRPC
-  func testAddingRtdsAndAdsConfigurationWhenRunningEnvoy() {
-    let bootstrapDebugDescription = EngineBuilder()
-      .addEngineType(MockEnvoyEngine.self)
-      .addRTDSLayer(name: "rtds_layer_name", timeoutSeconds: 14325)
-      .setAggregatedDiscoveryService(address: "FAKE_SWIFT_ADDRESS", port: 0)
-      .bootstrapDebugDescription()
-    XCTAssertTrue(bootstrapDebugDescription.contains("rtds_layer_name"))
-    XCTAssertTrue(bootstrapDebugDescription.contains("initial_fetch_timeout { seconds: 14325 }"))
-    XCTAssertTrue(bootstrapDebugDescription.contains("FAKE_SWIFT_ADDRESS"))
-  }
-
-  func testAddingCdsAndAdsConfigurationWhenRunningEnvoy() {
-    let bootstrapDebugDescription = EngineBuilder()
-      .addEngineType(MockEnvoyEngine.self)
-      .addCDSLayer(resourcesLocator: "FAKE_CDS_LOCATOR", timeoutSeconds: 2543)
-      .setAggregatedDiscoveryService(address: "FAKE_SWIFT_ADDRESS", port: 0)
-      .bootstrapDebugDescription()
-    XCTAssertTrue(bootstrapDebugDescription.contains("FAKE_CDS_LOCATOR"))
-    XCTAssertTrue(bootstrapDebugDescription.contains("initial_fetch_timeout { seconds: 2543 }"))
-    XCTAssertTrue(bootstrapDebugDescription.contains("FAKE_SWIFT_ADDRESS"))
-  }
-
-  func testAddingDefaultCdsConfigurationWhenRunningEnvoy() {
-    let bootstrapDebugDescription = EngineBuilder()
-      .addEngineType(MockEnvoyEngine.self)
-      .addCDSLayer()
-      .setAggregatedDiscoveryService(address: "FAKE_SWIFT_ADDRESS", port: 0)
-      .bootstrapDebugDescription()
-    XCTAssertTrue(bootstrapDebugDescription.contains("cds_config {"))
-    XCTAssertTrue(bootstrapDebugDescription.contains("initial_fetch_timeout { seconds: 5 }"))
-  }
-
-  func testXDSDefaultValues() {
-    // rtds, ads, node_id, node_locality
-    let bootstrapDebugDescription = EngineBuilder()
-      .addEngineType(MockEnvoyEngine.self)
-      .bootstrapDebugDescription()
-    XCTAssertFalse(bootstrapDebugDescription.contains("rtds_layer {"))
-    XCTAssertFalse(bootstrapDebugDescription.contains("cds_config {"))
-    XCTAssertFalse(bootstrapDebugDescription.contains("ads_config {"))
-    XCTAssertTrue(bootstrapDebugDescription.contains(#"id: "envoy-mobile""#))
-    XCTAssertFalse(bootstrapDebugDescription.contains("locality {"))
-  }
-
-  func testCustomNodeID() {
-    let bootstrapDebugDescription = EngineBuilder()
-      .addEngineType(MockEnvoyEngine.self)
-      .setNodeID("SWIFT_TEST_NODE_ID")
-      .bootstrapDebugDescription()
-    XCTAssertTrue(bootstrapDebugDescription.contains(#"id: "SWIFT_TEST_NODE_ID""#))
-  }
-
-  func testCustomNodeLocality() {
-    let bootstrapDebugDescription = EngineBuilder()
-      .setNodeLocality(region: "SWIFT_REGION", zone: "SWIFT_ZONE", subZone: "SWIFT_SUB")
-      .bootstrapDebugDescription()
-    XCTAssertTrue(bootstrapDebugDescription.contains(#"region: "SWIFT_REGION""#))
-    XCTAssertTrue(bootstrapDebugDescription.contains(#"zone: "SWIFT_ZONE""#))
-    XCTAssertTrue(bootstrapDebugDescription.contains(#"sub_zone: "SWIFT_SUB""#))
-  }
-#endif
 
   func testAddingKeyValueStoreToConfigurationWhenRunningEnvoy() {
     let expectation = self.expectation(description: "Run called with expected data")

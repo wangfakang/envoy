@@ -1,9 +1,14 @@
 #include "mocks.h"
 
+using testing::_;
+
 namespace Envoy {
 namespace Ssl {
 
-MockContextManager::MockContextManager() = default;
+MockContextManager::MockContextManager() {
+  ON_CALL(*this, createSslClientContext(_, _)).WillByDefault(testing::Return(nullptr));
+  ON_CALL(*this, createSslServerContext(_, _, _, _)).WillByDefault(testing::Return(nullptr));
+}
 MockContextManager::~MockContextManager() = default;
 
 MockConnectionInfo::MockConnectionInfo() = default;
@@ -24,10 +29,24 @@ MockClientContextConfig::MockClientContextConfig() {
   ON_CALL(*this, tlsKeyLogLocal()).WillByDefault(testing::ReturnRef(iplist_));
   ON_CALL(*this, tlsKeyLogRemote()).WillByDefault(testing::ReturnRef(iplist_));
   ON_CALL(*this, tlsKeyLogPath()).WillByDefault(testing::ReturnRef(path_));
+  ON_CALL(*this, compliancePolicy()).WillByDefault(testing::Return(absl::nullopt));
 }
 MockClientContextConfig::~MockClientContextConfig() = default;
 
-MockServerContextConfig::MockServerContextConfig() = default;
+MockServerContextConfig::MockServerContextConfig() {
+  capabilities_.provides_ciphers_and_curves = true;
+  capabilities_.provides_sigalgs = true;
+
+  ON_CALL(*this, cipherSuites()).WillByDefault(testing::ReturnRef(ciphers_));
+  ON_CALL(*this, capabilities()).WillByDefault(testing::Return(capabilities_));
+  ON_CALL(*this, alpnProtocols()).WillByDefault(testing::ReturnRef(alpn_));
+  ON_CALL(*this, signatureAlgorithms()).WillByDefault(testing::ReturnRef(sigalgs_));
+  ON_CALL(*this, sessionTicketKeys()).WillByDefault(testing::ReturnRef(ticket_keys_));
+  ON_CALL(*this, tlsKeyLogLocal()).WillByDefault(testing::ReturnRef(iplist_));
+  ON_CALL(*this, tlsKeyLogRemote()).WillByDefault(testing::ReturnRef(iplist_));
+  ON_CALL(*this, tlsKeyLogPath()).WillByDefault(testing::ReturnRef(path_));
+  ON_CALL(*this, compliancePolicy()).WillByDefault(testing::Return(absl::nullopt));
+}
 MockServerContextConfig::~MockServerContextConfig() = default;
 
 MockPrivateKeyMethodManager::MockPrivateKeyMethodManager() = default;

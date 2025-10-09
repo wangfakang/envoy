@@ -20,11 +20,11 @@ public:
   HeaderMutationFactoryConfig() : DualFactoryBase("envoy.filters.http.header_mutation") {}
 
 private:
-  Http::FilterFactoryCb
+  absl::StatusOr<Http::FilterFactoryCb>
   createFilterFactoryFromProtoTyped(const ProtoConfig& proto_config,
                                     const std::string& stats_prefix, DualInfo info,
                                     Server::Configuration::ServerFactoryContext& context) override;
-  Router::RouteSpecificFilterConfigConstSharedPtr
+  absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
   createRouteSpecificFilterConfigTyped(const PerRouteProtoConfig& proto_config,
                                        Server::Configuration::ServerFactoryContext&,
                                        ProtobufMessage::ValidationVisitor&) override;

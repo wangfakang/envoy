@@ -29,14 +29,14 @@ HeaderValueExtractorImpl::HeaderValueExtractorImpl(
       ScopedRoutes::ScopeKeyBuilder::FragmentBuilder::HeaderValueExtractor::kIndex) {
     if (header_value_extractor_config_.index() != 0 &&
         header_value_extractor_config_.element_separator().empty()) {
-      throw ProtoValidationException("Index > 0 for empty string element separator.",
-                                     header_value_extractor_config_);
+      ProtoExceptionUtil::throwProtoValidationException(
+          "Index > 0 for empty string element separator.", config_);
     }
   }
   if (header_value_extractor_config_.extract_type_case() ==
       ScopedRoutes::ScopeKeyBuilder::FragmentBuilder::HeaderValueExtractor::EXTRACT_TYPE_NOT_SET) {
-    throw ProtoValidationException("HeaderValueExtractor extract_type not set.",
-                                   header_value_extractor_config_);
+    ProtoExceptionUtil::throwProtoValidationException("HeaderValueExtractor extract_type not set.",
+                                                      config_);
   }
 }
 
@@ -77,10 +77,10 @@ HeaderValueExtractorImpl::computeFragment(const Http::HeaderMap& headers) const 
   return nullptr;
 }
 
-ScopedRouteInfo::ScopedRouteInfo(envoy::config::route::v3::ScopedRouteConfiguration config_proto,
+ScopedRouteInfo::ScopedRouteInfo(envoy::config::route::v3::ScopedRouteConfiguration&& config_proto,
                                  ConfigConstSharedPtr route_config)
-    : config_proto_(config_proto), route_config_(route_config),
-      config_hash_(MessageUtil::hash(config_proto)) {
+    : config_proto_(std::move(config_proto)), route_config_(route_config),
+      config_hash_(MessageUtil::hash(config_proto_)) {
   // TODO(stevenzzzz): Maybe worth a KeyBuilder abstraction when there are more than one type of
   // Fragment.
   for (const auto& fragment : config_proto_.key().fragments()) {

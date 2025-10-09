@@ -13,10 +13,10 @@
 #include "absl/strings/match.h"
 #include "gtest/gtest.h"
 
+using absl::Status;
+using absl::StatusCode;
+using Envoy::Protobuf::Empty;
 using Envoy::Protobuf::TextFormat;
-using Envoy::ProtobufUtil::Status;
-using Envoy::ProtobufUtil::StatusCode;
-using Envoy::ProtobufWkt::Empty;
 
 namespace Envoy {
 namespace {
@@ -24,26 +24,11 @@ namespace {
 // A magic header value which marks header as not expected.
 constexpr char UnexpectedHeaderValue[] = "Unexpected header value";
 
-std::string ipAndDeferredProcessingParamsToString(
-    const ::testing::TestParamInfo<std::tuple<Network::Address::IpVersion, bool>>& p) {
-  return fmt::format("{}_{}", TestUtility::ipVersionToString(std::get<0>(p.param)),
-                     std::get<1>(p.param) ? "WithDeferredProcessing" : "NoDeferredProcessing");
-}
-
-// TODO(kbaichoo): Remove parameterizing by deferred processing when the feature
-// is enabled by default. The parameterization is to avoid bit rot since it's
-// off by default.
 class GrpcJsonTranscoderIntegrationTest
-    : public testing::TestWithParam<std::tuple<Network::Address::IpVersion, bool>>,
+    : public testing::TestWithParam<Network::Address::IpVersion>,
       public HttpIntegrationTest {
 public:
-  GrpcJsonTranscoderIntegrationTest()
-      : HttpIntegrationTest(Http::CodecType::HTTP1, std::get<0>(GetParam())) {
-    // Parameterize with defer processing to prevent bit rot as filter made
-    // assumptions of data flow, prior relying on eager processing.
-    config_helper_.addRuntimeOverride(Runtime::defer_processing_backedup_streams,
-                                      deferredProcessing() ? "true" : "false");
-  }
+  GrpcJsonTranscoderIntegrationTest() : HttpIntegrationTest(Http::CodecType::HTTP1, GetParam()) {}
 
   void SetUp() override {
     setUpstreamProtocol(Http::CodecType::HTTP2);
@@ -97,7 +82,8 @@ typed_config:
       ASSERT_TRUE(upstream_request_->waitForEndStream(*dispatcher_));
 
       std::string dump;
-      for (char ch : upstream_request_->body().toString()) {
+      Buffer::OwnedImpl request_body = upstream_request_->body();
+      for (char ch : request_body.toString()) {
         dump += std::to_string(int(ch));
         dump += " ";
       }
@@ -105,7 +91,7 @@ typed_config:
       if (!expected_grpc_request_messages.empty()) {
         Grpc::Decoder grpc_decoder;
         std::vector<Grpc::Frame> frames;
-        ASSERT_TRUE(grpc_decoder.decode(upstream_request_->body(), frames)) << dump;
+        ASSERT_TRUE(grpc_decoder.decode(request_body, frames).ok()) << dump;
         EXPECT_EQ(expected_grpc_request_messages.size(), frames.size());
 
         for (size_t i = 0; i < expected_grpc_request_messages.size(); ++i) {
@@ -121,7 +107,7 @@ typed_config:
       }
 
       if (!expected_upstream_request_body.empty()) {
-        EXPECT_EQ(expected_upstream_request_body, upstream_request_->body().toString());
+        EXPECT_EQ(expected_upstream_request_body, request_body.toString());
       }
 
       Http::TestResponseHeaderMapImpl response_headers;
@@ -129,7 +115,7 @@ typed_config:
       response_headers.setContentType("application/grpc");
       if (grpc_response_messages.empty() && !always_send_trailers) {
         response_headers.setGrpcStatus(static_cast<uint64_t>(grpc_status.code()));
-        response_headers.setGrpcMessage(grpc_status.message().as_string());
+        response_headers.setGrpcMessage(grpc_status.message());
         upstream_request_->encodeHeaders(response_headers, true);
       } else {
         response_headers.addCopy(Http::LowerCaseString("trailer"), "Grpc-Status");
@@ -143,7 +129,7 @@ typed_config:
         }
         Http::TestResponseTrailerMapImpl response_trailers;
         response_trailers.setGrpcStatus(static_cast<uint64_t>(grpc_status.code()));
-        response_trailers.setGrpcMessage(grpc_status.message().as_string());
+        response_trailers.setGrpcMessage(grpc_status.message());
         upstream_request_->encodeTrailers(response_trailers);
       }
       EXPECT_TRUE(upstream_request_->complete());
@@ -234,13 +220,11 @@ typed_config:
                              ->Mutable(0)
                              ->mutable_typed_per_filter_config();
 
-          (*config)["envoy.filters.http.grpc_json_transcoder"].PackFrom(per_route_config);
+          (*config)["grpc_json_transcoder"].PackFrom(per_route_config);
         };
 
     config_helper_.addConfigModifier(modifier);
   }
-
-  bool deferredProcessing() const { return std::get<1>(GetParam()); }
 };
 
 class GrpcJsonTranscoderIntegrationTestWithSizeLimit : public GrpcJsonTranscoderIntegrationTest {
@@ -275,22 +259,114 @@ protected:
   uint32_t maxBodySize() const override { return 35; }
 };
 
-INSTANTIATE_TEST_SUITE_P(
-    IpVersionsDeferredProcessing, GrpcJsonTranscoderIntegrationTest,
-    testing::Combine(testing::ValuesIn(TestEnvironment::getIpVersionsForTest()), testing::Bool()),
-    ipAndDeferredProcessingParamsToString);
-INSTANTIATE_TEST_SUITE_P(
-    IpVersionsDeferredProcessing, GrpcJsonTranscoderIntegrationTestWithSizeLimit1024,
-    testing::Combine(testing::ValuesIn(TestEnvironment::getIpVersionsForTest()), testing::Bool()),
-    ipAndDeferredProcessingParamsToString);
-INSTANTIATE_TEST_SUITE_P(
-    IpVersionsDeferredProcessing, GrpcJsonTranscoderIntegrationTestWithSizeLimit1,
-    testing::Combine(testing::ValuesIn(TestEnvironment::getIpVersionsForTest()), testing::Bool()),
-    ipAndDeferredProcessingParamsToString);
-INSTANTIATE_TEST_SUITE_P(
-    IpVersionsDeferredProcessing, GrpcJsonTranscoderIntegrationTestWithSizeLimit35,
-    testing::Combine(testing::ValuesIn(TestEnvironment::getIpVersionsForTest()), testing::Bool()),
-    ipAndDeferredProcessingParamsToString);
+INSTANTIATE_TEST_SUITE_P(IpVersions, GrpcJsonTranscoderIntegrationTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
+                         TestUtility::ipTestParamsToString);
+INSTANTIATE_TEST_SUITE_P(IpVersions, GrpcJsonTranscoderIntegrationTestWithSizeLimit1024,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
+                         TestUtility::ipTestParamsToString);
+INSTANTIATE_TEST_SUITE_P(IpVersions, GrpcJsonTranscoderIntegrationTestWithSizeLimit1,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
+                         TestUtility::ipTestParamsToString);
+INSTANTIATE_TEST_SUITE_P(IpVersions, GrpcJsonTranscoderIntegrationTestWithSizeLimit35,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
+                         TestUtility::ipTestParamsToString);
+
+TEST_P(GrpcJsonTranscoderIntegrationTest, EmptyMessageStreamedHttpBodyPost) {
+  HttpIntegrationTest::initialize();
+  // Can't use testTranscoding for this case because we want to send an empty data,
+  // as distinct from not sending data. The difference being
+  // decodeHeaders(end_stream=false), decodeData(emptyBuffer, end_stream=true)
+  // vs. decodeHeaders(end_stream=true)
+  Http::TestRequestHeaderMapImpl request_headers{{":method", "POST"},
+                                                 {":path", "/streamBody"},
+                                                 {":authority", "host"},
+                                                 {"content-type", "application/json"}};
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  IntegrationStreamDecoderPtr response;
+  auto encoder_decoder = codec_client_->startRequest(request_headers);
+  request_encoder_ = &encoder_decoder.first;
+  response = std::move(encoder_decoder.second);
+  Buffer::OwnedImpl body; // Empty body.
+  codec_client_->sendData(*request_encoder_, body, true);
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForEndStream(*dispatcher_));
+  std::string dump;
+  Buffer::OwnedImpl request_body = upstream_request_->body();
+  for (char ch : request_body.toString()) {
+    dump += std::to_string(int(ch));
+    dump += " ";
+  }
+  Grpc::Decoder grpc_decoder;
+  std::vector<Grpc::Frame> frames;
+  ASSERT_TRUE(grpc_decoder.decode(request_body, frames).ok()) << dump;
+  ASSERT_EQ(1, frames.size());
+  bookstore::EchoBodyRequest actual_message;
+  ASSERT_TRUE(actual_message.ParseFromString(frames[0].data_->toString()));
+  bookstore::EchoBodyRequest expected_message;
+  expected_message.mutable_nested()->mutable_content()->set_content_type("application/json");
+  EXPECT_THAT(actual_message, ProtoEq(expected_message));
+  EXPECT_EQ("", request_body.toString());
+
+  Http::TestResponseHeaderMapImpl response_headers;
+  response_headers.setStatus(200);
+  response_headers.setContentType("application/grpc");
+  response_headers.addCopy(Http::LowerCaseString("trailer"), "Grpc-Status");
+  response_headers.addCopy(Http::LowerCaseString("trailer"), "Grpc-Message");
+  upstream_request_->encodeHeaders(response_headers, false);
+  {
+    Protobuf::Empty response_message;
+    auto buffer = Grpc::Common::serializeToGrpcFrame(response_message);
+    upstream_request_->encodeData(*buffer, false);
+  }
+  Http::TestResponseTrailerMapImpl response_trailers;
+  absl::Status grpc_status;
+  response_trailers.setGrpcStatus(static_cast<uint64_t>(grpc_status.code()));
+  response_trailers.setGrpcMessage(grpc_status.message());
+  upstream_request_->encodeTrailers(response_trailers);
+  EXPECT_TRUE(upstream_request_->complete());
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_TRUE(response->complete());
+  // No need to validate the response details in this test, as the purpose
+  // of the test is to validate that an empty-bodied request is delivered
+  // to the upstream as a grpc frame.
+  codec_client_->close();
+  if (fake_upstream_connection_) {
+    ASSERT_TRUE(fake_upstream_connection_->close());
+    ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
+  }
+}
+
+TEST_P(GrpcJsonTranscoderIntegrationTest, EmptyMessageStreamedGrpcPostShouldRespondBadRequest) {
+  HttpIntegrationTest::initialize();
+  // Can't use testTranscoding for this case because we want to send an empty data,
+  // as distinct from not sending data. The difference being
+  // decodeHeaders(end_stream=false), decodeData(emptyBuffer, end_stream=true)
+  // vs. decodeHeaders(end_stream=true)
+  Http::TestRequestHeaderMapImpl request_headers{{":method", "POST"},
+                                                 {":path", "/bulk/shelves"},
+                                                 {":authority", "host"},
+                                                 {"content-type", "application/json"}};
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  IntegrationStreamDecoderPtr response;
+  auto encoder_decoder = codec_client_->startRequest(request_headers);
+  request_encoder_ = &encoder_decoder.first;
+  response = std::move(encoder_decoder.second);
+  Buffer::OwnedImpl body; // Empty body.
+  codec_client_->sendData(*request_encoder_, body, true);
+  // We should get a response without making an upstream connection,
+  // for this case.
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_TRUE(response->complete());
+  // The response body currently contains the unhelpful message
+  // "Expected an array instead of an object", presumably from the
+  // json parser. We won't validate that here because it doesn't seem
+  // particularly desirable that that's the response body.
+  // A 400 Bad Request is a good thing to verify though.
+  EXPECT_THAT(response->headers(), ContainsHeader(":status", "400"));
+  codec_client_->close();
+}
 
 TEST_P(GrpcJsonTranscoderIntegrationTest, UnaryPost) {
   HttpIntegrationTest::initialize();
@@ -351,9 +427,6 @@ TEST_P(GrpcJsonTranscoderIntegrationTest, QueryParamsDecodedName) {
       },
       R"({"id":"20","theme":"Children"})");
 
-#ifndef ENVOY_ENABLE_UHV
-  // TODO(#23291) - UHV validate JSON-encoded gRPC query parameters
-  // json_name = "search[decoded]", "search[decoded]" should work
   testTranscoding<bookstore::CreateShelfRequest, bookstore::Shelf>(
       Http::TestRequestHeaderMapImpl{{":method", "POST"},
                                      {":path", "/shelf?shelf.search[decoded]=Google"},
@@ -365,7 +438,6 @@ TEST_P(GrpcJsonTranscoderIntegrationTest, QueryParamsDecodedName) {
           {"content-type", "application/json"},
       },
       R"({"id":"20","theme":"Children"})");
-#endif
 
   // json_name = "search%5Bencoded%5D", "search[encode]" should fail.
   // It is tested in test case "DecodedQueryParameterWithEncodedJsonName"
@@ -533,7 +605,6 @@ TEST_P(GrpcJsonTranscoderIntegrationTest, TestEnumValueCaseMatch) {
 // After enable the "case_insensitive_enum_parsing" flag,
 // JSON enum value string can be in any case.
 TEST_P(GrpcJsonTranscoderIntegrationTest, TestEnumValueIgnoreCase) {
-
   // Enable case_insensitive_enum_parsing flag
   constexpr absl::string_view filter =
       R"EOF(
@@ -691,7 +762,7 @@ TEST_P(GrpcJsonTranscoderIntegrationTest, StreamGetHttpBodyMultipleFramesInData)
   Http::TestResponseTrailerMapImpl response_trailers;
   auto grpc_status = Status();
   response_trailers.setGrpcStatus(static_cast<uint64_t>(grpc_status.code()));
-  response_trailers.setGrpcMessage(grpc_status.message().as_string());
+  response_trailers.setGrpcMessage(grpc_status.message());
   upstream_request_->encodeTrailers(response_trailers);
   EXPECT_TRUE(upstream_request_->complete());
 
@@ -733,7 +804,7 @@ TEST_P(GrpcJsonTranscoderIntegrationTest, StreamGetHttpBodyFragmented) {
   Http::TestResponseTrailerMapImpl response_trailers;
   auto grpc_status = Status();
   response_trailers.setGrpcStatus(static_cast<uint64_t>(grpc_status.code()));
-  response_trailers.setGrpcMessage(grpc_status.message().as_string());
+  response_trailers.setGrpcMessage(grpc_status.message());
   upstream_request_->encodeTrailers(response_trailers);
   EXPECT_TRUE(upstream_request_->complete());
 
@@ -1084,7 +1155,7 @@ std::string createDeepJson(int level, bool valid) {
 }
 
 std::string jsonStrToPbStrucStr(std::string json) {
-  Envoy::ProtobufWkt::Struct message;
+  Envoy::Protobuf::Struct message;
   std::string structStr;
   TestUtility::loadFromJson(json, message);
   TextFormat::PrintToString(message, &structStr);
@@ -1131,12 +1202,12 @@ TEST_P(GrpcJsonTranscoderIntegrationTest, DeepStruct) {
 }
 
 std::string createLargeJson(int level) {
-  std::shared_ptr<ProtobufWkt::Value> cur = std::make_shared<ProtobufWkt::Value>();
+  std::shared_ptr<Protobuf::Value> cur = std::make_shared<Protobuf::Value>();
   for (int i = 0; i < level - 1; ++i) {
-    std::shared_ptr<ProtobufWkt::Value> next = std::make_shared<ProtobufWkt::Value>();
-    ProtobufWkt::Value val = ProtobufWkt::Value();
-    ProtobufWkt::Value left = ProtobufWkt::Value(*cur);
-    ProtobufWkt::Value right = ProtobufWkt::Value(*cur);
+    std::shared_ptr<Protobuf::Value> next = std::make_shared<Protobuf::Value>();
+    Protobuf::Value val = Protobuf::Value();
+    Protobuf::Value left = Protobuf::Value(*cur);
+    Protobuf::Value right = Protobuf::Value(*cur);
     val.mutable_list_value()->add_values()->Swap(&left);
     val.mutable_list_value()->add_values()->Swap(&right);
     (*next->mutable_struct_value()->mutable_fields())["k"] = val;
@@ -1558,41 +1629,20 @@ TEST_P(GrpcJsonTranscoderIntegrationTest, ServerStreamingGetExceedsBufferLimit) 
       Http::TestResponseHeaderMapImpl{{":status", "200"}, {"content-type", "application/json"}},
       R"([{"id":"1","author":"Neal Stephenson","title":"Readme"}])");
 
-  if (Runtime::runtimeFeatureEnabled(Runtime::defer_processing_backedup_streams)) {
-    // Over limit: The server streams two response messages. Because this is
-    // larger than the buffer limits, we end up buffering both results in the
-    // codec towards the upstream. When we finally process the buffered data, we
-    // end up resetting the stream as we've over the transcoder limit.
-    testTranscoding<bookstore::ListBooksRequest, bookstore::Book>(
-        Http::TestRequestHeaderMapImpl{
-            {":method", "GET"}, {":path", "/shelves/1/books"}, {":authority", "host"}},
-        "", {"shelf: 1"},
-        {R"(id: 1 author: "Neal Stephenson" title: "Readme")",
-         R"(id: 2 author: "George R.R. Martin" title: "A Game of Thrones")"},
-        Status(),
-        Http::TestResponseHeaderMapImpl{{":status", "200"}, {"content-type", "application/json"}},
-        /*expected_response_body=*/"", false, false, "", true,
-        /*expect_response_complete=*/false);
-
-  } else {
-    // Over limit: The server streams two response messages. Even through the transcoder
-    // handles them independently, portions of the first message are still in the
-    // internal buffers while the second one is processed.
-    //
-    // Because the headers and body is already sent, the stream is closed with
-    // an incomplete response.
-    testTranscoding<bookstore::ListBooksRequest, bookstore::Book>(
-        Http::TestRequestHeaderMapImpl{
-            {":method", "GET"}, {":path", "/shelves/1/books"}, {":authority", "host"}},
-        "", {"shelf: 1"},
-        {R"(id: 1 author: "Neal Stephenson" title: "Readme")",
-         R"(id: 2 author: "George R.R. Martin" title: "A Game of Thrones")"},
-        Status(),
-        Http::TestResponseHeaderMapImpl{{":status", "200"}, {"content-type", "application/json"}},
-        // Incomplete response, not valid JSON.
-        R"([{"id":"1","author":"Neal Stephenson","title":"Readme"})", false, false, "", true,
-        /*expect_response_complete=*/false);
-  }
+  // Over limit: The server streams two response messages. Because this is
+  // larger than the buffer limits, we end up buffering both results in the
+  // codec towards the upstream. When we finally process the buffered data, we
+  // end up resetting the stream as we've over the transcoder limit.
+  testTranscoding<bookstore::ListBooksRequest, bookstore::Book>(
+      Http::TestRequestHeaderMapImpl{
+          {":method", "GET"}, {":path", "/shelves/1/books"}, {":authority", "host"}},
+      "", {"shelf: 1"},
+      {R"(id: 1 author: "Neal Stephenson" title: "Readme")",
+       R"(id: 2 author: "George R.R. Martin" title: "A Game of Thrones")"},
+      Status(),
+      Http::TestResponseHeaderMapImpl{{":status", "200"}, {"content-type", "application/json"}},
+      /*expected_response_body=*/"", false, false, "", true,
+      /*expect_response_complete=*/false);
 }
 
 TEST_P(GrpcJsonTranscoderIntegrationTest, ServerStreamingGetUnderBufferLimit) {
@@ -1667,10 +1717,10 @@ public:
     config_helper_.prependFilter(filter);
   }
 };
-INSTANTIATE_TEST_SUITE_P(
-    IpVersionsDeferredProcessing, OverrideConfigGrpcJsonTranscoderIntegrationTest,
-    testing::Combine(testing::ValuesIn(TestEnvironment::getIpVersionsForTest()), testing::Bool()),
-    ipAndDeferredProcessingParamsToString);
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, OverrideConfigGrpcJsonTranscoderIntegrationTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
+                         TestUtility::ipTestParamsToString);
 
 TEST_P(OverrideConfigGrpcJsonTranscoderIntegrationTest, RouteOverride) {
   // add bookstore per-route override

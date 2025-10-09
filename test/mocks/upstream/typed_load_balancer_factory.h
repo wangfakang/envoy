@@ -11,6 +11,11 @@ namespace Envoy {
 namespace Upstream {
 class MockTypedLoadBalancerFactory : public TypedLoadBalancerFactory {
 public:
+  class EmptyLoadBalancerConfig : public LoadBalancerConfig {
+  public:
+    EmptyLoadBalancerConfig() = default;
+  };
+
   MockTypedLoadBalancerFactory();
   ~MockTypedLoadBalancerFactory() override;
 
@@ -21,15 +26,15 @@ public:
                const PrioritySet& priority_set, Runtime::Loader& runtime,
                Random::RandomGenerator& random, TimeSource& time_source));
 
-  LoadBalancerConfigPtr loadConfig(ProtobufTypes::MessagePtr config,
-                                   ProtobufMessage::ValidationVisitor&) override {
-    return std::make_unique<LoadBalancerConfigWrapper>(std::move(config));
+  absl::StatusOr<LoadBalancerConfigPtr> loadConfig(Server::Configuration::ServerFactoryContext&,
+                                                   const Protobuf::Message&) override {
+    return std::make_unique<EmptyLoadBalancerConfig>();
   }
 
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
     // Using Struct instead of a custom per-filter empty config proto
     // This is only allowed in tests.
-    return ProtobufTypes::MessagePtr{new Envoy::ProtobufWkt::Struct()};
+    return ProtobufTypes::MessagePtr{new Envoy::Protobuf::Struct()};
   }
 };
 } // namespace Upstream

@@ -1,6 +1,4 @@
-load("@bazel_gazelle//:deps.bzl", "go_repository")
-load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive", "http_file", "http_jar")
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive", "http_file")
 
 def envoy_mobile_repositories():
     http_archive(
@@ -14,21 +12,8 @@ def envoy_mobile_repositories():
     swift_repos()
     kotlin_repos()
     android_repos()
-    python_repos()
 
 def upstream_envoy_overrides():
-    # Workaround due to a Detekt version compatibility with protobuf: https://github.com/envoyproxy/envoy-mobile/issues/1869
-    http_archive(
-        name = "com_google_protobuf",
-        patch_args = ["-p1"],
-        patches = [
-            "@envoy_mobile//bazel:protobuf.patch",
-        ],
-        sha256 = "d7371dc2d46fddac1af8cb27c0394554b068768fc79ecaf5be1a1863e8ff3392",
-        strip_prefix = "protobuf-3.16.0",
-        urls = ["https://github.com/protocolbuffers/protobuf/releases/download/v3.16.0/protobuf-all-3.16.0.tar.gz"],
-    )
-
     # Workaround old NDK version breakages https://github.com/envoyproxy/envoy-mobile/issues/934
     http_archive(
         name = "com_github_libevent_libevent",
@@ -39,21 +24,6 @@ def upstream_envoy_overrides():
     )
 
 def swift_repos():
-    http_archive(
-        name = "build_bazel_rules_apple",
-        sha256 = "687644bf48ccf91286f31c4ec26cf6591800b39bee8a630438626fc9bb4042de",
-        strip_prefix = "rules_apple-a0f8748ce89698a599149d984999eaefd834c004",
-        url = "https://github.com/bazelbuild/rules_apple/archive/a0f8748ce89698a599149d984999eaefd834c004.tar.gz",
-    )
-
-    # https://github.com/bazelbuild/rules_swift/pull/922
-    http_archive(
-        name = "build_bazel_rules_swift",
-        sha256 = "422558831da7719658ab0ffb3c994d92ddc6541e3610a751613a324bb5d10ffe",
-        strip_prefix = "rules_swift-e769f8d6a4adae93c244f244480a3ae740f24384",
-        url = "https://github.com/bazelbuild/rules_swift/archive/e769f8d6a4adae93c244f244480a3ae740f24384.tar.gz",
-    )
-
     http_archive(
         name = "DrString",
         build_file_content = """exports_files(["drstring"])""",
@@ -77,30 +47,30 @@ def swift_repos():
 def kotlin_repos():
     http_archive(
         name = "rules_java",
-        sha256 = "19462d64b1586c0d4ea0e87f9325be2514f0eb84e56dbf3245450451b3701581",
-        strip_prefix = "rules_java-43243982abc76390ef64be62379a1353f9011771",
-        # TODO(jpsim): Switch back to bazelbuild repo when https://github.com/bazelbuild/rules_java/issues/64 is fixed
-        url = "https://github.com/jpsim/rules_java/archive/43243982abc76390ef64be62379a1353f9011771.tar.gz",
+        sha256 = "c0ee60f8757f140c157fc2c7af703d819514de6e025ebf70386d38bdd85fce83",
+        url = "https://github.com/bazelbuild/rules_java/releases/download/7.12.3/rules_java-7.12.3.tar.gz",
+        patch_args = ["-p1"],
+        patches = ["@envoy//bazel:rules_java.patch"],
     )
 
     http_archive(
         name = "rules_jvm_external",
-        sha256 = "b17d7388feb9bfa7f2fa09031b32707df529f26c91ab9e5d909eb1676badd9a6",
-        strip_prefix = "rules_jvm_external-4.5",
-        url = "https://github.com/bazelbuild/rules_jvm_external/archive/4.5.zip",
+        sha256 = "3afe5195069bd379373528899c03a3072f568d33bd96fe037bd43b1f590535e7",
+        strip_prefix = "rules_jvm_external-6.6",
+        url = "https://github.com/bazelbuild/rules_jvm_external/releases/download/6.6/rules_jvm_external-6.6.tar.gz",
     )
 
     http_archive(
-        name = "io_bazel_rules_kotlin",
-        sha256 = "f033fa36f51073eae224f18428d9493966e67c27387728b6be2ebbdae43f140e",
-        urls = ["https://github.com/bazelbuild/rules_kotlin/releases/download/v1.7.0-RC-3/rules_kotlin_release.tgz"],
+        name = "rules_kotlin",
+        sha256 = "3b772976fec7bdcda1d84b9d39b176589424c047eb2175bed09aac630e50af43",
+        urls = ["https://github.com/bazelbuild/rules_kotlin/releases/download/v1.9.6/rules_kotlin-v1.9.6.tar.gz"],
     )
 
     http_archive(
         name = "rules_detekt",
-        sha256 = "44912c74dc2e164227b1102ef36227d0e78fdbd7c7359868ae13424eb4f0d5c2",
-        strip_prefix = "bazel_rules_detekt-0.6.0",
-        url = "https://github.com/buildfoundation/bazel_rules_detekt/archive/v0.6.0.tar.gz",
+        sha256 = "91837e301379c105ff4565ca822f6a6b30531f0b2ab6e75bbaf74e64f7d6879c",
+        strip_prefix = "bazel_rules_detekt-0.8.1.2",
+        url = "https://github.com/buildfoundation/bazel_rules_detekt/archive/v0.8.1.2.tar.gz",
     )
 
     http_archive(
@@ -126,23 +96,14 @@ def kotlin_repos():
 
 def android_repos():
     http_archive(
-        name = "build_bazel_rules_android",
+        name = "rules_android",
         urls = ["https://github.com/bazelbuild/rules_android/archive/refs/tags/v0.1.1.zip"],
         sha256 = "cd06d15dd8bb59926e4d65f9003bfc20f9da4b2519985c27e190cddc8b7a7806",
         strip_prefix = "rules_android-0.1.1",
     )
-
-def python_repos():
     http_archive(
-        name = "pybind11_bazel",
-        strip_prefix = "pybind11_bazel-26973c0ff320cb4b39e45bc3e4297b82bc3a6c09",
-        urls = ["https://github.com/pybind/pybind11_bazel/archive/26973c0ff320cb4b39e45bc3e4297b82bc3a6c09.zip"],
-        sha256 = "a5666d950c3344a8b0d3892a88dc6b55c8e0c78764f9294e806d69213c03f19d",
-    )
-    http_archive(
-        name = "pybind11",
-        build_file = "@pybind11_bazel//:pybind11.BUILD",
-        strip_prefix = "pybind11-2.6.1",
-        urls = ["https://github.com/pybind/pybind11/archive/v2.6.1.tar.gz"],
-        sha256 = "cdbe326d357f18b83d10322ba202d69f11b2f49e2d87ade0dc2be0c5c34f8e2a",
+        name = "rules_android_ndk",
+        urls = ["https://github.com/bazelbuild/rules_android_ndk/archive/v0.1.2.tar.gz"],
+        sha256 = "65aedff0cd728bee394f6fb8e65ba39c4c5efb11b29b766356922d4a74c623f5",
+        strip_prefix = "rules_android_ndk-0.1.2",
     )

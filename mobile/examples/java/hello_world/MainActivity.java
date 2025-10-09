@@ -31,19 +31,15 @@ import java.util.Map;
 import java.util.Set;
 
 public class MainActivity extends Activity {
+  private static final String TAG = "MainActivity";
   private static final String REQUEST_HANDLER_THREAD_NAME = "hello_envoy_java";
   private static final String ENVOY_SERVER_HEADER = "server";
   private static final String REQUEST_AUTHORITY = "api.lyft.com";
   private static final String REQUEST_PATH = "/ping";
   private static final String REQUEST_SCHEME_HTTP = "http";
   private static final String REQUEST_SCHEME_HTTPS = "https";
-  private static final Set<String> FILTERED_HEADERS = new HashSet<String>() {
-    {
-      add("server");
-      add("filter-demo");
-      add("x-envoy-upstream-service-time");
-    }
-  };
+  private static final Set<String> FILTERED_HEADERS =
+      Set.of("server", "filter-demo", "x-envoy-upstream-service-time");
 
   private Engine engine;
   private RecyclerView recyclerView;
@@ -58,9 +54,13 @@ public class MainActivity extends Activity {
     setContentView(R.layout.activity_main);
 
     engine = new AndroidEngineBuilder(getApplication())
-                 .addLogLevel(LogLevel.DEBUG)
+                 .setLogLevel(LogLevel.DEBUG)
+                 .setLogger((level, message) -> {
+                   Log.d(TAG, message);
+                   return null;
+                 })
                  .setOnEngineRunning(() -> {
-                   Log.d("MainActivity", "Envoy async internal setup completed");
+                   Log.d(TAG, "Envoy async internal setup completed");
                    return null;
                  })
                  .enablePlatformCertificatesValidation(true)
@@ -118,7 +118,7 @@ public class MainActivity extends Activity {
           }
           String headerText = sb.toString();
 
-          Log.d("MainActivity", message);
+          Log.d(TAG, message);
           if ((scheme == REQUEST_SCHEME_HTTP && status == 301) ||
               (scheme == REQUEST_SCHEME_HTTPS && status == 200)) {
             // The server returns 301 to http request and 200 to https request.
@@ -132,12 +132,12 @@ public class MainActivity extends Activity {
         .setOnError((error, ignored) -> {
           String message = "failed with error after " + error.getAttemptCount() +
                            " attempts: " + error.getMessage() + " for " + scheme + " request";
-          Log.d("MainActivity", message);
+          Log.d(TAG, message);
           recyclerView.post(() -> viewAdapter.add(new Failure(message)));
           return Unit.INSTANCE;
         })
         .start(Executors.newSingleThreadExecutor())
-        .sendHeaders(requestHeaders, true);
+        .sendHeaders(requestHeaders, /* endStream= */ true, /* idempotent= */ false);
 
     clear_text = !clear_text;
   }

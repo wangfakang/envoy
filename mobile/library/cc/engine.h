@@ -2,12 +2,12 @@
 
 #include <functional>
 
+#include "absl/strings/string_view.h"
+#include "library/cc/stream_client.h"
 #include "library/common/types/c_types.h"
-#include "log_level.h"
-#include "pulse_client.h"
-#include "stream_client.h"
 
 namespace Envoy {
+class InternalEngine;
 class BaseClientIntegrationTest;
 
 namespace Platform {
@@ -19,13 +19,20 @@ class Engine : public std::enable_shared_from_this<Engine> {
 public:
   ~Engine();
 
+  std::string dumpStats();
   StreamClientSharedPtr streamClient();
-  PulseClientSharedPtr pulseClient();
+  void onDefaultNetworkChangeEvent(int network);
+  // TODO(abeyad): Remove once migrated to onDefaultNetworkChangeEvent().
+  void onDefaultNetworkChanged(int network);
+  void onDefaultNetworkUnavailable();
+  void onDefaultNetworkAvailable();
+  envoy_status_t setProxySettings(absl::string_view host, const uint16_t port);
 
   envoy_status_t terminate();
+  Envoy::InternalEngine* engine() { return engine_; }
 
 private:
-  Engine(envoy_engine_t engine);
+  Engine(::Envoy::InternalEngine* engine);
 
   // required to access private constructor
   friend class EngineBuilder;
@@ -34,13 +41,9 @@ private:
   // for testing only
   friend class ::Envoy::BaseClientIntegrationTest;
 
-  envoy_engine_t engine_;
+  Envoy::InternalEngine* engine_;
   StreamClientSharedPtr stream_client_;
-  PulseClientSharedPtr pulse_client_;
-  bool terminated_;
 };
-
-using EngineSharedPtr = std::shared_ptr<Engine>;
 
 } // namespace Platform
 } // namespace Envoy

@@ -153,12 +153,12 @@ public:
                                Server::Configuration::FactoryContext& context) override;
 
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
-    return std::make_unique<ProtobufWkt::Struct>();
+    return std::make_unique<Protobuf::Struct>();
   }
 
   std::string name() const override { return name_; }
 
-  ProtobufWkt::Struct config_struct_;
+  Protobuf::Struct config_struct_;
   std::string config_stat_prefix_;
 
 private:
@@ -226,7 +226,7 @@ public:
 
 class MockConnectionManager : public ConnectionManager {
 public:
-  MockConnectionManager(Config& config, Random::RandomGenerator& random_generator,
+  MockConnectionManager(const ConfigSharedPtr& config, Random::RandomGenerator& random_generator,
                         TimeSource& time_system, Server::Configuration::FactoryContext& context,
                         std::shared_ptr<Router::TransactionInfos> transaction_infos)
       : ConnectionManager(config, random_generator, time_system, context, transaction_infos) {}

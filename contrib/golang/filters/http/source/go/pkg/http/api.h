@@ -1,1 +1,1 @@
-../api/api.h
+../../../../../../common/go/api/api.h

@@ -13,24 +13,15 @@ Factory::create(OptRef<const Upstream::LoadBalancerConfig> lb_config,
                 const Upstream::PrioritySet& priority_set, Runtime::Loader& runtime,
                 Random::RandomGenerator& random, TimeSource&) {
 
-  const auto* typed_lb_config =
-      dynamic_cast<const Upstream::LoadBalancerConfigWrapper*>(lb_config.ptr());
-  auto typed_proto_config = typed_lb_config == nullptr
-                                ? OptRef<const RingHashLbProto>{}
-                                : typed_lb_config->typedProtoConfig<RingHashLbProto>();
-
-  // Assume legacy config.
-  if (!typed_proto_config.has_value()) {
-    return std::make_unique<Upstream::RingHashLoadBalancer>(
-        priority_set, cluster_info.lbStats(), cluster_info.statsScope(), runtime, random,
-        cluster_info.lbRingHashConfig(), cluster_info.lbConfig());
-  }
+  const auto typed_lb_config =
+      dynamic_cast<const Upstream::TypedRingHashLbConfig*>(lb_config.ptr());
+  ASSERT(typed_lb_config != nullptr, "Invalid ring hash load balancer config");
 
   return std::make_unique<Upstream::RingHashLoadBalancer>(
       priority_set, cluster_info.lbStats(), cluster_info.statsScope(), runtime, random,
       PROTOBUF_PERCENT_TO_ROUNDED_INTEGER_OR_DEFAULT(cluster_info.lbConfig(),
                                                      healthy_panic_threshold, 100, 50),
-      typed_proto_config.value());
+      typed_lb_config->lb_config_, typed_lb_config->hash_policy_);
 }
 
 /**

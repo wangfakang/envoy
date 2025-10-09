@@ -23,7 +23,7 @@ namespace {
 
 class FuzzerMocks {
 public:
-  FuzzerMocks() : addr_(std::make_shared<Network::Address::PipeInstance>("/test/test.sock")) {
+  FuzzerMocks() : addr_(*Network::Address::PipeInstance::create("/test/test.sock")) {
 
     ON_CALL(decoder_callbacks_, connection())
         .WillByDefault(Return(OptRef<const Network::Connection>{connection_}));
@@ -49,15 +49,21 @@ DEFINE_PROTO_FUZZER(const envoy::extensions::filters::http::golang::GolangFilter
   auto dso_lib = std::make_shared<Dso::MockHttpFilterDsoImpl>();
 
   // hard code the return config_id to 1 since the default 0 is invalid.
-  ON_CALL(*dso_lib.get(), envoyGoFilterNewHttpPluginConfig(_, _, _, _)).WillByDefault(Return(1));
+  ON_CALL(*dso_lib.get(), envoyGoFilterNewHttpPluginConfig(_)).WillByDefault(Return(1));
   ON_CALL(*dso_lib.get(), envoyGoFilterOnHttpHeader(_, _, _, _))
       .WillByDefault(Return(static_cast<uint64_t>(GolangStatus::Continue)));
   ON_CALL(*dso_lib.get(), envoyGoFilterOnHttpData(_, _, _, _))
       .WillByDefault(Return(static_cast<uint64_t>(GolangStatus::Continue)));
+  ON_CALL(*dso_lib.get(), envoyGoFilterOnHttpLog(_, _, _, _, _, _, _, _, _, _, _, _))
+      .WillByDefault(
+          Invoke([&](httpRequest*, int, processState*, processState*, GoUint64, GoUint64, GoUint64,
+                     GoUint64, GoUint64, GoUint64, GoUint64, GoUint64) -> void {}));
+  ON_CALL(*dso_lib.get(), envoyGoFilterOnHttpStreamComplete(_))
+      .WillByDefault(Invoke([&](httpRequest*) -> void {}));
   ON_CALL(*dso_lib.get(), envoyGoFilterOnHttpDestroy(_, _))
       .WillByDefault(Invoke([&](httpRequest* p0, int) -> void {
         // delete the filter->req_, make LeakSanitizer happy.
-        auto req = reinterpret_cast<httpRequestInternal*>(p0);
+        auto req = reinterpret_cast<HttpRequestInternal*>(p0);
         delete req;
       }));
 
@@ -77,7 +83,7 @@ DEFINE_PROTO_FUZZER(const envoy::extensions::filters::http::golang::GolangFilter
   // Prepare filter.
   NiceMock<Server::Configuration::MockFactoryContext> context;
   FilterConfigSharedPtr config = std::make_shared<FilterConfig>(proto_config, dso_lib, "", context);
-  std::unique_ptr<Filter> filter = std::make_unique<Filter>(config, dso_lib);
+  std::unique_ptr<Filter> filter = std::make_unique<Filter>(config, dso_lib, 0);
   filter->setDecoderFilterCallbacks(mocks.decoder_callbacks_);
   filter->setEncoderFilterCallbacks(mocks.encoder_callbacks_);
 

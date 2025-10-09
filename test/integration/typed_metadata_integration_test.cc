@@ -1,3 +1,5 @@
+#include "envoy/access_log/access_log_config.h"
+
 #include "source/common/protobuf/protobuf.h"
 
 #include "test/integration/http_protocol_integration.h"
@@ -21,9 +23,9 @@ INSTANTIATE_TEST_SUITE_P(Protocols, ListenerTypedMetadataIntegrationTest,
 
 TEST_P(ListenerTypedMetadataIntegrationTest, Hello) {
   // Add some typed metadata to the listener.
-  ProtobufWkt::StringValue value;
+  Protobuf::StringValue value;
   value.set_value("hello world");
-  ProtobufWkt::Any packed_value;
+  Protobuf::Any packed_value;
   packed_value.PackFrom(value);
   config_helper_.addListenerTypedMetadata("test.listener.typed.metadata", packed_value);
 
@@ -45,31 +47,28 @@ TEST_P(ListenerTypedMetadataIntegrationTest, Hello) {
 
 class MockAccessLog : public AccessLog::Instance {
 public:
-  MOCK_METHOD(void, log,
-              (const Http::RequestHeaderMap*, const Http::ResponseHeaderMap*,
-               const Http::ResponseTrailerMap*, const StreamInfo::StreamInfo&,
-               AccessLog::AccessLogType));
+  MOCK_METHOD(void, log, (const Formatter::HttpFormatterContext&, const StreamInfo::StreamInfo&));
 };
 
-class TestAccessLogFactory : public Server::Configuration::AccessLogInstanceFactory {
+class TestAccessLogFactory : public AccessLog::AccessLogInstanceFactory {
 public:
-  AccessLog::InstanceSharedPtr createAccessLogInstance(
-      const Protobuf::Message&, AccessLog::FilterPtr&&,
-      Server::Configuration::ListenerAccessLogFactoryContext& context) override {
-    // Check that expected listener metadata is present
-    EXPECT_EQ(1, context.listenerMetadata().typed_filter_metadata().size());
-    const auto iter =
-        context.listenerMetadata().typed_filter_metadata().find("test.listener.typed.metadata");
-    EXPECT_NE(iter, context.listenerMetadata().typed_filter_metadata().end());
-    return std::make_shared<NiceMock<MockAccessLog>>();
-  }
-
   AccessLog::InstanceSharedPtr
   createAccessLogInstance(const Protobuf::Message&, AccessLog::FilterPtr&&,
-                          Server::Configuration::CommonFactoryContext&) override {
-    // This method should never be called in this test
-    ASSERT(false);
-    return nullptr;
+                          Server::Configuration::GenericFactoryContext&,
+                          std::vector<Formatter::CommandParserPtr>&& = {}) override {
+    auto out = std::make_shared<NiceMock<MockAccessLog>>();
+    EXPECT_CALL(*out, log(_, _))
+        .WillRepeatedly(testing::Invoke(
+            [](const Formatter::HttpFormatterContext&, const StreamInfo::StreamInfo& info) -> void {
+              // Check that expected listener metadata is present
+              auto listener_info = info.downstreamAddressProvider().listenerInfo();
+              ASSERT_TRUE(listener_info.has_value());
+              EXPECT_EQ(1, listener_info->metadata().typed_filter_metadata().size());
+              const auto iter = listener_info->metadata().typed_filter_metadata().find(
+                  "test.listener.typed.metadata");
+              EXPECT_NE(iter, listener_info->metadata().typed_filter_metadata().end());
+            }));
+    return out;
   }
 
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
@@ -82,13 +81,12 @@ public:
 // Validate that access logger gets the right context with access to listener metadata
 TEST_P(ListenerTypedMetadataIntegrationTest, ListenerMetadataPlumbingToAccessLog) {
   TestAccessLogFactory factory;
-  Registry::InjectFactory<Server::Configuration::AccessLogInstanceFactory> factory_register(
-      factory);
+  Registry::InjectFactory<AccessLog::AccessLogInstanceFactory> factory_register(factory);
 
   // Add some typed metadata to the listener.
-  ProtobufWkt::StringValue value;
+  Protobuf::StringValue value;
   value.set_value("hello world");
-  ProtobufWkt::Any packed_value;
+  Protobuf::Any packed_value;
   packed_value.PackFrom(value);
   config_helper_.addListenerTypedMetadata("test.listener.typed.metadata", packed_value);
 

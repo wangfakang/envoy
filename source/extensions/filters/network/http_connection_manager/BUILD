@@ -16,8 +16,10 @@ envoy_cc_extension(
     name = "config",
     srcs = ["config.cc"],
     hdrs = ["config.h"],
-    # This is core Envoy config.
-    visibility = ["//visibility:public"],
+    extra_visibility = [
+        "//test/common:__subpackages__",
+        "//test/integration:__subpackages__",
+    ],
     deps = [
         "//envoy/config:config_provider_manager_interface",
         "//envoy/filesystem:filesystem_interface",
@@ -36,6 +38,7 @@ envoy_cc_extension(
         "//source/common/access_log:access_log_lib",
         "//source/common/common:minimal_logger_lib",
         "//source/common/config:utility_lib",
+        "//source/common/config:xds_resource_lib",
         "//source/common/filter:config_discovery_lib",
         "//source/common/http:conn_manager_lib",
         "//source/common/http:default_server_string_lib",
@@ -50,9 +53,7 @@ envoy_cc_extension(
         "//source/common/local_reply:local_reply_lib",
         "//source/common/network:cidr_range_lib",
         "//source/common/protobuf:utility_lib",
-        "//source/common/router:rds_lib",
-        "//source/common/router:scoped_rds_lib",
-        "//source/common/runtime:runtime_lib",
+        "//source/common/router:route_provider_manager_lib",
         "//source/common/tracing:custom_tag_lib",
         "//source/common/tracing:http_tracer_lib",
         "//source/common/tracing:tracer_config_lib",

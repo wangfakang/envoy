@@ -35,7 +35,10 @@ protected:
   Stats::TestUtil::TestStore store_;
   Stats::Scope& scope_{*store_.rootScope()};
   Event::TestRealTimeSystem time_source_;
-  KafkaBrokerFilter testee_{scope_, time_source_, "prefix"};
+  KafkaBrokerFilter testee_{scope_, time_source_,
+                            std::make_shared<BrokerFilterConfig>(
+                                std::string("prefix"), false, std::vector<RewriteRule>{},
+                                absl::flat_hash_set<int16_t>{}, absl::flat_hash_set<int16_t>{})};
 
   Network::FilterStatus consumeRequestFromBuffer() {
     return testee_.onData(RequestB::buffer_, false);

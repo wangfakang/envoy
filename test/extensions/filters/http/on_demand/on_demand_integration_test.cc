@@ -362,9 +362,9 @@ TEST_P(OnDemandVhdsIntegrationTest, VhdsVirtualHostAddUpdateRemove) {
 
   // A spontaneous VHDS DiscoveryResponse adds two virtual hosts
   sendDeltaDiscoveryResponse<envoy::config::route::v3::VirtualHost>(
-      Config::TypeUrl::get().VirtualHost, buildVirtualHost1(), {}, "2", vhds_stream_);
-  EXPECT_TRUE(
-      compareDeltaDiscoveryRequest(Config::TypeUrl::get().VirtualHost, {}, {}, vhds_stream_));
+      Config::TestTypeUrl::get().VirtualHost, buildVirtualHost1(), {}, "2", vhds_stream_.get());
+  EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost, {}, {},
+                                           vhds_stream_.get()));
 
   testRouterHeaderOnlyRequestAndResponse(nullptr, 1, "/one", "vhost.first");
   cleanupUpstreamAndDownstream();
@@ -375,10 +375,10 @@ TEST_P(OnDemandVhdsIntegrationTest, VhdsVirtualHostAddUpdateRemove) {
 
   // A spontaneous VHDS DiscoveryResponse removes newly added virtual hosts
   sendDeltaDiscoveryResponse<envoy::config::route::v3::VirtualHost>(
-      Config::TypeUrl::get().VirtualHost, {}, {"my_route/vhost_1", "my_route/vhost_2"}, "3",
-      vhds_stream_);
-  EXPECT_TRUE(
-      compareDeltaDiscoveryRequest(Config::TypeUrl::get().VirtualHost, {}, {}, vhds_stream_));
+      Config::TestTypeUrl::get().VirtualHost, {}, {"my_route/vhost_1", "my_route/vhost_2"}, "3",
+      vhds_stream_.get());
+  EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost, {}, {},
+                                           vhds_stream_.get()));
 
   // an upstream request to an (now) unknown domain
   codec_client_ = makeHttpConnection(makeClientConnection((lookupPort("http"))));
@@ -388,11 +388,11 @@ TEST_P(OnDemandVhdsIntegrationTest, VhdsVirtualHostAddUpdateRemove) {
                                                  {":authority", "vhost.first"},
                                                  {"x-lyft-user-id", "123"}};
   IntegrationStreamDecoderPtr response = codec_client_->makeHeaderOnlyRequest(request_headers);
-  EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TypeUrl::get().VirtualHost,
+  EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost,
                                            {vhdsRequestResourceName("vhost.first")}, {},
-                                           vhds_stream_));
+                                           vhds_stream_.get()));
   sendDeltaDiscoveryResponse<envoy::config::route::v3::VirtualHost>(
-      Config::TypeUrl::get().VirtualHost, {buildVirtualHost2()}, {}, "4", vhds_stream_,
+      Config::TestTypeUrl::get().VirtualHost, {buildVirtualHost2()}, {}, "4", vhds_stream_.get(),
       {"my_route/vhost.first"});
 
   waitForNextUpstreamRequest(1);
@@ -422,9 +422,9 @@ TEST_P(OnDemandVhdsIntegrationTest, RdsWithVirtualHostsVhdsVirtualHostAddUpdateR
 
   // A spontaneous VHDS DiscoveryResponse adds two virtual hosts
   sendDeltaDiscoveryResponse<envoy::config::route::v3::VirtualHost>(
-      Config::TypeUrl::get().VirtualHost, buildVirtualHost1(), {}, "2", vhds_stream_);
-  EXPECT_TRUE(
-      compareDeltaDiscoveryRequest(Config::TypeUrl::get().VirtualHost, {}, {}, vhds_stream_));
+      Config::TestTypeUrl::get().VirtualHost, buildVirtualHost1(), {}, "2", vhds_stream_.get());
+  EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost, {}, {},
+                                           vhds_stream_.get()));
 
   // verify that rds-based virtual host can be resolved
   testRouterHeaderOnlyRequestAndResponse(nullptr, 1, "/rdsone", "vhost.rds.first");
@@ -439,10 +439,10 @@ TEST_P(OnDemandVhdsIntegrationTest, RdsWithVirtualHostsVhdsVirtualHostAddUpdateR
 
   // A spontaneous VHDS DiscoveryResponse removes virtual hosts added via vhds
   sendDeltaDiscoveryResponse<envoy::config::route::v3::VirtualHost>(
-      Config::TypeUrl::get().VirtualHost, {}, {"my_route/vhost_1", "my_route/vhost_2"}, "3",
-      vhds_stream_);
-  EXPECT_TRUE(
-      compareDeltaDiscoveryRequest(Config::TypeUrl::get().VirtualHost, {}, {}, vhds_stream_));
+      Config::TestTypeUrl::get().VirtualHost, {}, {"my_route/vhost_1", "my_route/vhost_2"}, "3",
+      vhds_stream_.get());
+  EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost, {}, {},
+                                           vhds_stream_.get()));
 
   // verify rds-based virtual host is still present
   testRouterHeaderOnlyRequestAndResponse(nullptr, 1, "/rdsone", "vhost.rds.first");
@@ -456,11 +456,11 @@ TEST_P(OnDemandVhdsIntegrationTest, RdsWithVirtualHostsVhdsVirtualHostAddUpdateR
                                                  {":authority", "vhost.first"},
                                                  {"x-lyft-user-id", "123"}};
   IntegrationStreamDecoderPtr response = codec_client_->makeHeaderOnlyRequest(request_headers);
-  EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TypeUrl::get().VirtualHost,
+  EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost,
                                            {vhdsRequestResourceName("vhost.first")}, {},
-                                           vhds_stream_));
+                                           vhds_stream_.get()));
   sendDeltaDiscoveryResponse<envoy::config::route::v3::VirtualHost>(
-      Config::TypeUrl::get().VirtualHost, {buildVirtualHost2()}, {}, "4", vhds_stream_,
+      Config::TestTypeUrl::get().VirtualHost, {buildVirtualHost2()}, {}, "4", vhds_stream_.get(),
       {"my_route/vhost.first"});
 
   waitForNextUpstreamRequest(1);
@@ -497,8 +497,9 @@ TEST_P(OnDemandVhdsIntegrationTest, VhdsOnDemandUpdateWithResourceNameAsAlias) {
                                                  {":authority", "vhost_1"},
                                                  {"x-lyft-user-id", "123"}};
   IntegrationStreamDecoderPtr response = codec_client_->makeHeaderOnlyRequest(request_headers);
-  EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TypeUrl::get().VirtualHost,
-                                           {vhdsRequestResourceName("vhost_1")}, {}, vhds_stream_));
+  EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost,
+                                           {vhdsRequestResourceName("vhost_1")}, {},
+                                           vhds_stream_.get()));
 
   envoy::service::discovery::v3::DeltaDiscoveryResponse vhds_update =
       createDeltaDiscoveryResponseWithResourceNameUsedAsAlias();
@@ -542,9 +543,9 @@ TEST_P(OnDemandVhdsIntegrationTest, VhdsOnDemandUpdateFailToResolveTheAlias) {
                                                  {":authority", "vhost.third"},
                                                  {"x-lyft-user-id", "123"}};
   IntegrationStreamDecoderPtr response = codec_client_->makeHeaderOnlyRequest(request_headers);
-  EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TypeUrl::get().VirtualHost,
+  EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost,
                                            {vhdsRequestResourceName("vhost.third")}, {},
-                                           vhds_stream_));
+                                           vhds_stream_.get()));
   // Send an empty response back (the management server isn't aware of vhost.third)
   notifyAboutAliasResolutionFailure("4", vhds_stream_, {"my_route/vhost.third"});
 
@@ -581,9 +582,9 @@ TEST_P(OnDemandVhdsIntegrationTest, VhdsOnDemandUpdateFailToResolveOneAliasOutOf
                                                  {":authority", "vhost.third"},
                                                  {"x-lyft-user-id", "123"}};
   IntegrationStreamDecoderPtr response = codec_client_->makeHeaderOnlyRequest(request_headers);
-  EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TypeUrl::get().VirtualHost,
+  EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost,
                                            {vhdsRequestResourceName("vhost.third")}, {},
-                                           vhds_stream_));
+                                           vhds_stream_.get()));
   // Send an empty response back (the management server isn't aware of vhost.third)
   sendDeltaDiscoveryResponseWithUnresolvedAliases({buildVirtualHost2()}, {}, "4", vhds_stream_,
                                                   {"my_route/vhost.first"},
@@ -614,8 +615,9 @@ TEST_P(OnDemandVhdsIntegrationTest, VhdsOnDemandUpdateHttpConnectionCloses) {
   auto encoder_decoder = codec_client_->startRequest(request_headers);
   Http::RequestEncoder& encoder = encoder_decoder.first;
   IntegrationStreamDecoderPtr response = std::move(encoder_decoder.second);
-  EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TypeUrl::get().VirtualHost,
-                                           {vhdsRequestResourceName("vhost_1")}, {}, vhds_stream_));
+  EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost,
+                                           {vhdsRequestResourceName("vhost_1")}, {},
+                                           vhds_stream_.get()));
 
   envoy::service::discovery::v3::DeltaDiscoveryResponse vhds_update =
       createDeltaDiscoveryResponseWithResourceNameUsedAsAlias();
@@ -652,14 +654,14 @@ TEST_P(OnDemandVhdsIntegrationTest, MultipleUpdates) {
                                                    {":authority", "vhost.first"},
                                                    {"x-lyft-user-id", "123"}};
     IntegrationStreamDecoderPtr response = codec_client_->makeHeaderOnlyRequest(request_headers);
-    EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TypeUrl::get().VirtualHost,
+    EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost,
                                              {vhdsRequestResourceName("vhost.first")}, {},
-                                             vhds_stream_));
+                                             vhds_stream_.get()));
     sendDeltaDiscoveryResponse<envoy::config::route::v3::VirtualHost>(
-        Config::TypeUrl::get().VirtualHost, {buildVirtualHost2()}, {}, "4", vhds_stream_,
+        Config::TestTypeUrl::get().VirtualHost, {buildVirtualHost2()}, {}, "4", vhds_stream_.get(),
         {"my_route/vhost.first"});
-    EXPECT_TRUE(
-        compareDeltaDiscoveryRequest(Config::TypeUrl::get().VirtualHost, {}, {}, vhds_stream_));
+    EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost, {}, {},
+                                             vhds_stream_.get()));
 
     waitForNextUpstreamRequest(1);
     // Send response headers, and end_stream if there is no response body.
@@ -680,16 +682,16 @@ TEST_P(OnDemandVhdsIntegrationTest, MultipleUpdates) {
                                                    {":authority", "vhost.second"},
                                                    {"x-lyft-user-id", "123"}};
     IntegrationStreamDecoderPtr response = codec_client_->makeHeaderOnlyRequest(request_headers);
-    EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TypeUrl::get().VirtualHost,
+    EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost,
                                              {vhdsRequestResourceName("vhost.second")}, {},
-                                             vhds_stream_));
+                                             vhds_stream_.get()));
     sendDeltaDiscoveryResponse<envoy::config::route::v3::VirtualHost>(
-        Config::TypeUrl::get().VirtualHost,
+        Config::TestTypeUrl::get().VirtualHost,
         {TestUtility::parseYaml<envoy::config::route::v3::VirtualHost>(
             virtualHostYaml("my_route/vhost_2", "vhost.second"))},
-        {}, "4", vhds_stream_, {"my_route/vhost.second"});
-    EXPECT_TRUE(
-        compareDeltaDiscoveryRequest(Config::TypeUrl::get().VirtualHost, {}, {}, vhds_stream_));
+        {}, "4", vhds_stream_.get(), {"my_route/vhost.second"});
+    EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost, {}, {},
+                                             vhds_stream_.get()));
 
     waitForNextUpstreamRequest(1);
     // Send response headers, and end_stream if there is no response body.
@@ -704,14 +706,14 @@ TEST_P(OnDemandVhdsIntegrationTest, MultipleUpdates) {
   {
     // Attempt to push updates for both vhost.first and vhost.second
     sendDeltaDiscoveryResponse<envoy::config::route::v3::VirtualHost>(
-        Config::TypeUrl::get().VirtualHost,
+        Config::TestTypeUrl::get().VirtualHost,
         {TestUtility::parseYaml<envoy::config::route::v3::VirtualHost>(
              fmt::format(VhostTemplateAfterUpdate, "my_route/vhost_1", "vhost.first")),
          TestUtility::parseYaml<envoy::config::route::v3::VirtualHost>(
              fmt::format(VhostTemplateAfterUpdate, "my_route/vhost_2", "vhost.second"))},
-        {}, "5", vhds_stream_);
-    EXPECT_TRUE(
-        compareDeltaDiscoveryRequest(Config::TypeUrl::get().VirtualHost, {}, {}, vhds_stream_));
+        {}, "5", vhds_stream_.get());
+    EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost, {}, {},
+                                             vhds_stream_.get()));
 
     // verify that both virtual hosts have been updated
     testRouterHeaderOnlyRequestAndResponse(nullptr, 1, "/after_update", "vhost.first");
@@ -737,23 +739,24 @@ TEST_P(OnDemandVhdsIntegrationTest, AttemptAddingDuplicateDomainNames) {
   // A spontaneous VHDS DiscoveryResponse with duplicate domains that results in an error in the
   // ack.
   sendDeltaDiscoveryResponse<envoy::config::route::v3::VirtualHost>(
-      Config::TypeUrl::get().VirtualHost,
+      Config::TestTypeUrl::get().VirtualHost,
       {TestUtility::parseYaml<envoy::config::route::v3::VirtualHost>(
            virtualHostYaml("my_route/vhost_1", "vhost.duplicate")),
        TestUtility::parseYaml<envoy::config::route::v3::VirtualHost>(
            virtualHostYaml("my_route/vhost_2", "vhost.duplicate"))},
-      {}, "2", vhds_stream_);
-  EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TypeUrl::get().VirtualHost, {}, {}, vhds_stream_,
-                                           13, "Only unique values for domains are permitted"));
+      {}, "2", vhds_stream_.get());
+  EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost, {}, {},
+                                           vhds_stream_.get(), 13,
+                                           "Only unique values for domains are permitted"));
 
   // Another update, this time valid, should result in no errors
   sendDeltaDiscoveryResponse<envoy::config::route::v3::VirtualHost>(
-      Config::TypeUrl::get().VirtualHost,
+      Config::TestTypeUrl::get().VirtualHost,
       {TestUtility::parseYaml<envoy::config::route::v3::VirtualHost>(
           virtualHostYaml("my_route/vhost_3", "vhost.third"))},
-      {}, "2", vhds_stream_);
-  EXPECT_TRUE(
-      compareDeltaDiscoveryRequest(Config::TypeUrl::get().VirtualHost, {}, {}, vhds_stream_));
+      {}, "2", vhds_stream_.get());
+  EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost, {}, {},
+                                           vhds_stream_.get()));
 
   cleanupUpstreamAndDownstream();
 }

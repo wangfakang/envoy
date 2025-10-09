@@ -17,7 +17,7 @@ namespace SkyWalking {
 
 using cpp2sky::TracerConfig;
 using cpp2sky::TracingContextFactory;
-using cpp2sky::TracingContextPtr;
+using cpp2sky::TracingContextSharedPtr;
 
 class Driver : public Tracing::Driver, public Logger::Loggable<Logger::Id::tracing> {
 public:
@@ -28,7 +28,7 @@ public:
   Tracing::SpanPtr startSpan(const Tracing::Config& config, Tracing::TraceContext& trace_context,
                              const StreamInfo::StreamInfo& stream_info,
                              const std::string& operation_name,
-                             const Tracing::Decision tracing_decision) override;
+                             Tracing::Decision tracing_decision) override;
 
 private:
   void loadConfig(const envoy::config::trace::v3::ClientConfig& client_config,

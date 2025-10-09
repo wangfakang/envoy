@@ -2,8 +2,10 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "envoy/common/regex.h"
 #include "envoy/config/core/v3/http_uri.pb.h"
@@ -17,6 +19,7 @@
 #include "envoy/http/query_params.h"
 
 #include "source/common/http/exception.h"
+#include "source/common/http/http_option_limits.h"
 #include "source/common/http/status.h"
 
 #include "absl/strings/string_view.h"
@@ -46,81 +49,26 @@ using AlpnNames = ConstSingleton<AlpnNameValues>;
 namespace Http2 {
 namespace Utility {
 
-// Limits and defaults for `envoy::config::core::v3::Http2ProtocolOptions` protos.
-struct OptionsLimits {
-  // disable HPACK compression
-  static const uint32_t MIN_HPACK_TABLE_SIZE = 0;
-  // initial value from HTTP/2 spec, same as NGHTTP2_DEFAULT_HEADER_TABLE_SIZE from nghttp2
-  static const uint32_t DEFAULT_HPACK_TABLE_SIZE = (1 << 12);
-  // no maximum from HTTP/2 spec, use unsigned 32-bit maximum
-  static const uint32_t MAX_HPACK_TABLE_SIZE = std::numeric_limits<uint32_t>::max();
-  // TODO(jwfang): make this 0, the HTTP/2 spec minimum
-  static const uint32_t MIN_MAX_CONCURRENT_STREAMS = 1;
-  // defaults to maximum, same as nghttp2
-  static const uint32_t DEFAULT_MAX_CONCURRENT_STREAMS = (1U << 31) - 1;
-  // no maximum from HTTP/2 spec, total streams is unsigned 32-bit maximum,
-  // one-side (client/server) is half that, and we need to exclude stream 0.
-  // same as NGHTTP2_INITIAL_MAX_CONCURRENT_STREAMS from nghttp2
-  static const uint32_t MAX_MAX_CONCURRENT_STREAMS = (1U << 31) - 1;
-
-  // initial value from HTTP/2 spec, same as NGHTTP2_INITIAL_WINDOW_SIZE from nghttp2
-  // NOTE: we only support increasing window size now, so this is also the minimum
-  // TODO(jwfang): make this 0 to support decrease window size
-  static const uint32_t MIN_INITIAL_STREAM_WINDOW_SIZE = (1 << 16) - 1;
-  // initial value from HTTP/2 spec is 65535, but we want more (256MiB)
-  static const uint32_t DEFAULT_INITIAL_STREAM_WINDOW_SIZE = 256 * 1024 * 1024;
-  // maximum from HTTP/2 spec, same as NGHTTP2_MAX_WINDOW_SIZE from nghttp2
-  static const uint32_t MAX_INITIAL_STREAM_WINDOW_SIZE = (1U << 31) - 1;
-
-  // CONNECTION_WINDOW_SIZE is similar to STREAM_WINDOW_SIZE, but for connection-level window
-  // TODO(jwfang): make this 0 to support decrease window size
-  static const uint32_t MIN_INITIAL_CONNECTION_WINDOW_SIZE = (1 << 16) - 1;
-  // nghttp2's default connection-level window equals to its stream-level,
-  // our default connection-level window also equals to our stream-level
-  static const uint32_t DEFAULT_INITIAL_CONNECTION_WINDOW_SIZE = 256 * 1024 * 1024;
-  static const uint32_t MAX_INITIAL_CONNECTION_WINDOW_SIZE = (1U << 31) - 1;
-
-  // Default limit on the number of outbound frames of all types.
-  static const uint32_t DEFAULT_MAX_OUTBOUND_FRAMES = 10000;
-  // Default limit on the number of outbound frames of types PING, SETTINGS and RST_STREAM.
-  static const uint32_t DEFAULT_MAX_OUTBOUND_CONTROL_FRAMES = 1000;
-  // Default limit on the number of consecutive inbound frames with an empty payload
-  // and no end stream flag.
-  static const uint32_t DEFAULT_MAX_CONSECUTIVE_INBOUND_FRAMES_WITH_EMPTY_PAYLOAD = 1;
-  // Default limit on the number of inbound frames of type PRIORITY (per stream).
-  static const uint32_t DEFAULT_MAX_INBOUND_PRIORITY_FRAMES_PER_STREAM = 100;
-  // Default limit on the number of inbound frames of type WINDOW_UPDATE (per DATA frame sent).
-  static const uint32_t DEFAULT_MAX_INBOUND_WINDOW_UPDATE_FRAMES_PER_DATA_FRAME_SENT = 10;
-};
-
 /**
  * Validates settings/options already set in |options| and initializes any remaining fields with
  * defaults.
  */
-envoy::config::core::v3::Http2ProtocolOptions
+absl::StatusOr<envoy::config::core::v3::Http2ProtocolOptions>
 initializeAndValidateOptions(const envoy::config::core::v3::Http2ProtocolOptions& options);
 
-envoy::config::core::v3::Http2ProtocolOptions
+absl::StatusOr<envoy::config::core::v3::Http2ProtocolOptions>
 initializeAndValidateOptions(const envoy::config::core::v3::Http2ProtocolOptions& options,
                              bool hcm_stream_error_set,
-                             const ProtobufWkt::BoolValue& hcm_stream_error);
+                             const Protobuf::BoolValue& hcm_stream_error);
 } // namespace Utility
 } // namespace Http2
 namespace Http3 {
 namespace Utility {
 
-// Limits and defaults for `envoy::config::core::v3::Http3ProtocolOptions` protos.
-struct OptionsLimits {
-  // The same as kStreamReceiveWindowLimit in QUICHE which is the maximum supported by QUICHE.
-  static const uint32_t DEFAULT_INITIAL_STREAM_WINDOW_SIZE = 16 * 1024 * 1024;
-  // The same as kSessionReceiveWindowLimit in QUICHE which is the maximum supported by QUICHE.
-  static const uint32_t DEFAULT_INITIAL_CONNECTION_WINDOW_SIZE = 24 * 1024 * 1024;
-};
-
 envoy::config::core::v3::Http3ProtocolOptions
 initializeAndValidateOptions(const envoy::config::core::v3::Http3ProtocolOptions& options,
                              bool hcm_stream_error_set,
-                             const ProtobufWkt::BoolValue& hcm_stream_error);
+                             const Protobuf::BoolValue& hcm_stream_error);
 
 } // namespace Utility
 } // namespace Http3
@@ -201,7 +149,13 @@ public:
    *
    * NOTE: the space character is encoded as %20, NOT as the + character
    */
-  static std::string urlEncodeQueryParameter(absl::string_view value);
+  static std::string urlEncode(absl::string_view value);
+
+  /**
+   * Exactly the same as above, but returns false when it finds a character that should be %-encoded
+   * but is not.
+   */
+  static bool queryParameterIsUrlEncoded(absl::string_view value);
 
   /**
    * Decodes string view that represents URL in x-www-form-urlencoded query parameter.
@@ -248,8 +202,10 @@ void appendVia(RequestOrResponseHeaderMap& headers, const std::string& via);
  * @param headers headers where authority should be updated.
  * @param hostname hostname that authority should be updated with.
  * @param append_xfh append the original authority to the x-forwarded-host header.
+ * @param keep_old insert the original authority in the x-envoy-original-host header.
  */
-void updateAuthority(RequestHeaderMap& headers, absl::string_view hostname, bool append_xfh);
+void updateAuthority(RequestHeaderMap& headers, absl::string_view hostname, bool append_xfh,
+                     bool keep_old);
 
 /**
  * Creates an SSL (https) redirect path based on the input host and path headers.
@@ -257,37 +213,6 @@ void updateAuthority(RequestHeaderMap& headers, absl::string_view hostname, bool
  * @return std::string the redirect path.
  */
 std::string createSslRedirectPath(const RequestHeaderMap& headers);
-
-/**
- * Parse a URL into query parameters.
- * @param url supplies the url to parse.
- * @return QueryParams the parsed parameters, if any.
- */
-QueryParams parseQueryString(absl::string_view url);
-
-/**
- * Parse a URL into query parameters.
- * @param url supplies the url to parse.
- * @return QueryParams the parsed and percent-decoded parameters, if any.
- */
-QueryParams parseAndDecodeQueryString(absl::string_view url);
-
-/**
- * Parse a a request body into query parameters.
- * @param body supplies the body to parse.
- * @return QueryParams the parsed parameters, if any.
- */
-QueryParams parseFromBody(absl::string_view body);
-
-/**
- * Parse query parameters from a URL or body.
- * @param data supplies the data to parse.
- * @param start supplies the offset within the data.
- * @param decode_params supplies the flag whether to percent-decode the parsed parameters (both name
- *        and value). Set to false to keep the parameters encoded.
- * @return QueryParams the parsed parameters, if any.
- */
-QueryParams parseParameters(absl::string_view data, size_t start, bool decode_params);
 
 /**
  * Finds the start of the query string in a path
@@ -304,20 +229,6 @@ absl::string_view findQueryStringStart(const HeaderString& path);
  * @return std::string the path without query string.
  */
 std::string stripQueryString(const HeaderString& path);
-
-/**
- * Replace the query string portion of a given path with a new one.
- *
- * e.g. replaceQueryString("/foo?key=1", {key:2}) -> "/foo?key=2"
- *      replaceQueryString("/bar", {hello:there}) -> "/bar?hello=there"
- *
- * @param path the original path that may or may not contain an existing query string
- * @param params the new params whose string representation should be formatted onto
- *               the `path` above
- * @return std::string the new path whose query string has been replaced by `params` and whose path
- *         portion from `path` remains unchanged.
- */
-std::string replaceQueryString(const HeaderString& path, const QueryParams& params);
 
 /**
  * Parse a particular value out of a cookie
@@ -354,7 +265,7 @@ std::string parseSetCookieValue(const HeaderMap& headers, const std::string& key
 
 /**
  * Produce the value for a Set-Cookie header with the given parameters.
- * @param key is the name of the cookie that is being set.
+ * @param name is the name of the cookie that is being set.
  * @param value the value to set the cookie to; this value is trusted.
  * @param path the path for the cookie, or the empty string to not set a path.
  * @param max_age the length of time for which the cookie is valid, or zero
@@ -362,9 +273,16 @@ std::string parseSetCookieValue(const HeaderMap& headers, const std::string& key
  * to create a session cookie.
  * @return std::string a valid Set-Cookie header value string
  */
-std::string makeSetCookieValue(const std::string& key, const std::string& value,
-                               const std::string& path, const std::chrono::seconds max_age,
-                               bool httponly, const Http::CookieAttributeRefVector attributes);
+std::string makeSetCookieValue(absl::string_view name, absl::string_view value,
+                               absl::string_view path, std::chrono::seconds max_age, bool httponly,
+                               absl::Span<const CookieAttribute> attributes);
+
+/**
+ * Remove a particular key value pair from a cookie.
+ * @param headers supplies the headers to remove the cookie pair from.
+ * @param key the key for the particular cookie value to remove.
+ */
+void removeCookieValue(HeaderMap& headers, const std::string& key);
 
 /**
  * Get the response status from the response headers.
@@ -405,6 +323,20 @@ bool isH3UpgradeRequest(const RequestHeaderMap& headers);
  * - Upgrade: websocket
  */
 bool isWebSocketUpgradeRequest(const RequestHeaderMap& headers);
+
+/**
+ * Removes tokens from `Upgrade` header matching one of the matchers. Removes the `Upgrade`
+ * header if result is empty.
+ */
+void removeUpgrade(RequestOrResponseHeaderMap& headers,
+                   const std::vector<Matchers::StringMatcherPtr>& matchers);
+
+/**
+ * Removes `tokens_to_remove` from the `Connection` header, if present and part of a comma separated
+ * set of values. Removes the `Connection` header if it only contains `tokens_to_remove`.
+ */
+void removeConnectionUpgrade(RequestOrResponseHeaderMap& headers,
+                             const StringUtil::CaseUnorderedSet& tokens_to_remove);
 
 struct EncodeFunctions {
   // Function to modify locally generated response headers.
@@ -483,6 +415,26 @@ struct GetLastAddressFromXffInfo {
 };
 
 /**
+ * Checks if the remote address is contained by one of the trusted proxy CIDRs.
+ * @param remote the remote address
+ * @param trusted_cidrs the list of CIDRs which are considered trusted proxies
+ * @return whether the remote address is a trusted proxy
+ */
+bool remoteAddressIsTrustedProxy(const Envoy::Network::Address::Instance& remote,
+                                 absl::Span<const Network::Address::CidrRange> trusted_cidrs);
+
+/**
+ * Retrieves the last address in the x-forwarded-header after removing all trusted proxy addresses.
+ * @param request_headers supplies the request headers
+ * @param trusted_cidrs the list of CIDRs which are considered trusted proxies
+ * @return GetLastAddressFromXffInfo information about the last address in the XFF header.
+ *         @see GetLastAddressFromXffInfo for more information.
+ */
+GetLastAddressFromXffInfo
+getLastNonTrustedAddressFromXFF(const Http::RequestHeaderMap& request_headers,
+                                absl::Span<const Network::Address::CidrRange> trusted_cidrs);
+
+/**
  * Retrieves the last IPv4/IPv6 address in the x-forwarded-for header.
  * @param request_headers supplies the request headers.
  * @param num_to_skip specifies the number of addresses at the end of the XFF header
@@ -519,9 +471,22 @@ std::string buildOriginalUri(const Http::RequestHeaderMap& request_headers,
                              absl::optional<uint32_t> max_path_length);
 
 /**
+ * Extract scheme, host and path from a URI. The host may contain a port.
+ * This function doesn't validate if the URI is valid. It only parses the URI with following
+ * format: scheme://host/path.
+ * If parts of the URI are missing, the corresponding output string may be empty.
+ * @param the input URI string
+ * @param the output scheme string
+ * @param the output host string.
+ * @param the output path string.
+ */
+void extractSchemeHostPathFromUri(const absl::string_view& uri, absl::string_view& scheme,
+                                  absl::string_view& host, absl::string_view& path);
+/**
  * Extract host and path from a URI. The host may contain port.
  * This function doesn't validate if the URI is valid. It only parses the URI with following
  * format: scheme://host/path.
+ * If parts of the URI are missing, the corresponding output string may be empty.
  * @param the input URI string
  * @param the output host string.
  * @param the output path string.
@@ -539,13 +504,12 @@ std::string localPathFromFilePath(const absl::string_view& file_path);
 
 /**
  * Prepare headers for a HttpUri.
+ * @param the input URI
+ * @param flag whether the :scheme header shall be generated according to the input URI
+ * @return RequestMessage with headers set according to the input URI
  */
-RequestMessagePtr prepareHeaders(const envoy::config::core::v3::HttpUri& http_uri);
-
-/**
- * Serialize query-params into a string.
- */
-std::string queryParamsToString(const QueryParams& query_params);
+RequestMessagePtr prepareHeaders(const envoy::config::core::v3::HttpUri& http_uri,
+                                 bool include_scheme = false);
 
 /**
  * Returns string representation of StreamResetReason.
@@ -617,7 +581,8 @@ void transformUpgradeResponseFromH3toH1(ResponseHeaderMap& headers, absl::string
  * order is:
  * - the routeEntry() (for config that's applied on weighted clusters)
  * - the route
- * - and finally from the virtual host object (routeEntry()->virtualhost()).
+ * - the virtual host object
+ * - the route configuration
  *
  * To use, simply:
  *
@@ -640,36 +605,30 @@ const ConfigType* resolveMostSpecificPerFilterConfig(const Http::StreamFilterCal
 }
 
 /**
- * Merge all the available per route filter configs into one. To perform the merge,
- * the reduce function will be called on each two configs until a single merged config is left.
+ * Return all the available per route filter configs.
  *
- * @param reduce The first argument for this function will be the config from the previous level
- * and the second argument is the config from the current level (the more specific one). The
- * function should merge the second argument into the first argument.
+ * @param callbacks The stream filter callbacks to check for route configs.
  *
- * @return The merged config.
+ * @return all the available per route config in ascending order of specificity (i.e., route table
+ * first, then virtual host, then per route).
  */
 template <class ConfigType>
-absl::optional<ConfigType>
-getMergedPerFilterConfig(const Http::StreamFilterCallbacks* callbacks,
-                         std::function<void(ConfigType&, const ConfigType&)> reduce) {
-  static_assert(std::is_copy_constructible<ConfigType>::value,
-                "ConfigType must be copy constructible");
+absl::InlinedVector<std::reference_wrapper<const ConfigType>, 4>
+getAllPerFilterConfig(const Http::StreamFilterCallbacks* callbacks) {
   ASSERT(callbacks != nullptr);
 
-  absl::optional<ConfigType> merged;
+  absl::InlinedVector<std::reference_wrapper<const ConfigType>, 4> all_configs;
 
-  callbacks->traversePerFilterConfig(
-      [&reduce, &merged](const Router::RouteSpecificFilterConfig& cfg) {
-        const ConfigType* typed_cfg = dynamic_cast<const ConfigType*>(&cfg);
-        if (!merged) {
-          merged.emplace(*typed_cfg);
-        } else {
-          reduce(merged.value(), *typed_cfg);
-        }
-      });
+  for (const auto* config : callbacks->perFilterConfigs()) {
+    const ConfigType* typed_config = dynamic_cast<const ConfigType*>(config);
+    if (typed_config == nullptr) {
+      ENVOY_LOG_MISC(debug, "Failed to retrieve the correct type of route specific filter config");
+      continue;
+    }
+    all_configs.push_back(*typed_config);
+  }
 
-  return merged;
+  return all_configs;
 }
 
 struct AuthorityAttributes {
@@ -693,11 +652,10 @@ struct AuthorityAttributes {
 AuthorityAttributes parseAuthority(absl::string_view host);
 
 /**
- * It validates RetryPolicy defined in core api. It should be called at the main thread as
- * it may throw exception.
+ * It validates RetryPolicy defined in core api. It will return an error status if invalid.
  * @param retry_policy core retry policy
  */
-void validateCoreRetryPolicy(const envoy::config::core::v3::RetryPolicy& retry_policy);
+absl::Status validateCoreRetryPolicy(const envoy::config::core::v3::RetryPolicy& retry_policy);
 
 /**
  * It returns RetryPolicy defined in core api to route api.
@@ -744,6 +702,25 @@ struct RedirectConfig {
   const bool https_redirect_;
   const bool strip_query_;
 };
+
+/**
+ * Validates the provided scheme is valid (either http or https)
+ * @param scheme the scheme to validate
+ * @return bool true if the scheme is valid.
+ */
+bool schemeIsValid(const absl::string_view scheme);
+
+/**
+ * @param scheme the scheme to validate
+ * @return bool true if the scheme is http.
+ */
+bool schemeIsHttp(const absl::string_view scheme);
+
+/**
+ * @param scheme the scheme to validate
+ * @return bool true if the scheme is https.
+ */
+bool schemeIsHttps(const absl::string_view scheme);
 
 /*
  * Compute new path based on RedirectConfig.

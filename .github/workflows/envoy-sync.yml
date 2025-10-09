@@ -1,9 +1,13 @@
 name: 'Sync downstream'
 
+permissions:
+  contents: read
+
 on:
   push:
     branches:
     - main
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}
@@ -11,7 +15,14 @@ concurrency:
 
 jobs:
   sync:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
+    if: >-
+      ${{
+          github.repository == 'envoyproxy/envoy'
+          && (github.ref_name == 'main')
+          && (github.event.push
+              || !contains(github.actor, '[bot]'))
+      }}
     strategy:
       fail-fast: false
       matrix:
@@ -19,11 +30,16 @@ jobs:
         - go-control-plane
         - envoy-filter-example
         - data-plane-api
+        - mobile-website
     steps:
-    - uses: envoyproxy/toolshed/gh-actions/dispatch@actions-v0.0.1
+    - uses: envoyproxy/toolshed/gh-actions/appauth@actions-v0.3.26
+      id: appauth
+      with:
+        app_id: ${{ secrets.ENVOY_CI_SYNC_APP_ID }}
+        key: ${{ secrets.ENVOY_CI_SYNC_APP_KEY }}
+    - uses: envoyproxy/toolshed/gh-actions/dispatch@actions-v0.3.26
       with:
         repository: "envoyproxy/${{ matrix.downstream }}"
         ref: main
-        key: "${{ secrets.ENVOY_CI_SYNC_APP_KEY }}"
+        token: ${{ steps.appauth.outputs.token }}
         workflow: envoy-sync.yaml
-        app_id: ${{ secrets.ENVOY_CI_SYNC_APP_ID }}

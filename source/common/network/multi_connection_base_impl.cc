@@ -106,6 +106,17 @@ bool MultiConnectionBaseImpl::isHalfCloseEnabled() const {
   return connections_[0]->isHalfCloseEnabled();
 }
 
+bool MultiConnectionBaseImpl::setSocketOption(Network::SocketOptionName name,
+                                              absl::Span<uint8_t> value) {
+  bool success = true;
+  for (auto& connection : connections_) {
+    if (!connection->setSocketOption(name, value)) {
+      success = false;
+    }
+  }
+  return success;
+}
+
 std::string MultiConnectionBaseImpl::nextProtocol() const {
   return connections_[0]->nextProtocol();
 }
@@ -119,21 +130,33 @@ void MultiConnectionBaseImpl::noDelay(bool enable) {
   }
 }
 
-void MultiConnectionBaseImpl::readDisable(bool disable) {
+Connection::ReadDisableStatus MultiConnectionBaseImpl::readDisable(bool disable) {
   if (connect_finished_) {
-    connections_[0]->readDisable(disable);
-    return;
+    return connections_[0]->readDisable(disable);
   }
+
   if (!post_connect_state_.read_disable_count_.has_value()) {
     post_connect_state_.read_disable_count_ = 0;
   }
 
+  auto read_disable_state = ReadDisableStatus::StillReadDisabled;
+
   if (disable) {
+    if (post_connect_state_.read_disable_count_ == 0) {
+      read_disable_state = ReadDisableStatus::TransitionedToReadDisabled;
+    }
+
     post_connect_state_.read_disable_count_.value()++;
   } else {
     ASSERT(post_connect_state_.read_disable_count_ != 0);
     post_connect_state_.read_disable_count_.value()--;
+
+    if (post_connect_state_.read_disable_count_ == 0) {
+      read_disable_state = ReadDisableStatus::TransitionedToReadEnabled;
+    }
   }
+
+  return read_disable_state;
 }
 
 void MultiConnectionBaseImpl::detectEarlyCloseWhenReadDisabled(bool value) {
@@ -346,7 +369,11 @@ void MultiConnectionBaseImpl::close(ConnectionCloseType type, absl::string_view 
   connections_[0]->close(type, details);
 }
 
-Event::Dispatcher& MultiConnectionBaseImpl::dispatcher() {
+DetectedCloseType MultiConnectionBaseImpl::detectedCloseType() const {
+  return connections_[0]->detectedCloseType();
+};
+
+Event::Dispatcher& MultiConnectionBaseImpl::dispatcher() const {
   ASSERT(&dispatcher_ == &connections_[0]->dispatcher());
   return connections_[0]->dispatcher();
 }

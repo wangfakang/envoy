@@ -1,13 +1,13 @@
 load(
     "@envoy//bazel:envoy_build_system.bzl",
     "envoy_cc_library",
-    "envoy_package",
+    "envoy_mobile_package",
     "envoy_proto_library",
 )
 
 licenses(["notice"])  # Apache 2
 
-envoy_package()
+envoy_mobile_package()
 
 envoy_proto_library(
     name = "filter",
@@ -24,10 +24,10 @@ envoy_cc_library(
     repository = "@envoy",
     deps = [
         "filter_cc_proto",
+        "//library/common:engine_types_lib",
         "//library/common/api:c_types",
         "//library/common/api:external_api_lib",
         "//library/common/bridge:utility_lib",
-        "//library/common/data:utility_lib",
         "@envoy//source/common/common:assert_lib",
         "@envoy//source/extensions/filters/http/common:pass_through_filter_lib",
     ],

@@ -19,7 +19,7 @@ class TestHttpFilterConfigFactory : public Server::Configuration::NamedHttpFilte
 public:
   TestHttpFilterConfigFactory() = default;
 
-  Http::FilterFactoryCb
+  absl::StatusOr<Http::FilterFactoryCb>
   createFilterFactoryFromProto(const Protobuf::Message&, const std::string&,
                                Server::Configuration::FactoryContext&) override {
     return [](Http::FilterChainFactoryCallbacks& callbacks) -> void {
@@ -46,18 +46,18 @@ TEST(NamedHttpFilterConfigFactoryTest, CreateFilterFactory) {
   TestHttpFilterConfigFactory factory;
   const std::string stats_prefix = "foo";
   Server::Configuration::MockFactoryContext context;
-  ProtobufTypes::MessagePtr message{new Envoy::ProtobufWkt::Struct()};
+  ProtobufTypes::MessagePtr message{new Envoy::Protobuf::Struct()};
 
-  factory.createFilterFactoryFromProto(*message, stats_prefix, context);
+  EXPECT_TRUE(factory.createFilterFactoryFromProto(*message, stats_prefix, context).status().ok());
 }
 
 TEST(NamedHttpFilterConfigFactoryTest, Dependencies) {
   TestHttpFilterConfigFactory factory;
   const std::string stats_prefix = "foo";
   Server::Configuration::MockFactoryContext context;
-  ProtobufTypes::MessagePtr message{new Envoy::ProtobufWkt::Struct()};
+  ProtobufTypes::MessagePtr message{new Envoy::Protobuf::Struct()};
 
-  factory.createFilterFactoryFromProto(*message, stats_prefix, context);
+  EXPECT_TRUE(factory.createFilterFactoryFromProto(*message, stats_prefix, context).status().ok());
 
   EXPECT_EQ(factory.dependencies()->decode_required().size(), 1);
 }

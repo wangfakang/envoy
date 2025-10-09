@@ -18,7 +18,6 @@
 #include "test/test_common/environment.h"
 #include "test/test_common/logging.h"
 #include "test/test_common/printers.h"
-#include "test/test_common/test_runtime.h"
 #include "test/test_common/utility.h"
 
 #include "absl/strings/str_format.h"
@@ -77,6 +76,7 @@ public:
     if (filter_ != nullptr) {
       filter_->onDestroy();
     }
+    Dso::DsoManager<Dso::HttpFilterDsoImpl>::cleanUpForTest();
   }
 
   void setup(const std::string& lib_id, const std::string& lib_path,
@@ -104,9 +104,9 @@ public:
     setupFilter(plugin_name);
   }
 
-  std::string genSoPath(std::string name) {
+  std::string genSoPath() {
     return TestEnvironment::substitute(
-        "{{ test_rundir }}/contrib/golang/filters/http/test/test_data/" + name + "/filter.so");
+        "{{ test_rundir }}/contrib/golang/filters/http/test/test_data/plugins.so");
   }
 
   void setupDso(std::string id, std::string path, std::string plugin_name) {
@@ -121,6 +121,7 @@ public:
     config_ = std::make_shared<FilterConfig>(
         proto_config, Dso::DsoManager<Dso::HttpFilterDsoImpl>::getDsoByPluginName(plugin_name), "",
         context_);
+    config_->newGoPluginConfig();
     // Setup per route config for Golang filter.
     per_route_config_ =
         std::make_shared<FilterConfigPerRoute>(per_route_proto_config, server_factory_context_);
@@ -131,7 +132,7 @@ public:
     test_time.setSystemTime(std::chrono::microseconds(1583879145572237));
 
     filter_ = std::make_unique<TestFilter>(
-        config_, Dso::DsoManager<Dso::HttpFilterDsoImpl>::getDsoByPluginName(plugin_name));
+        config_, Dso::DsoManager<Dso::HttpFilterDsoImpl>::getDsoByPluginName(plugin_name), 0);
     filter_->setDecoderFilterCallbacks(decoder_callbacks_);
     filter_->setEncoderFilterCallbacks(encoder_callbacks_);
   }
@@ -165,7 +166,7 @@ public:
 // request that is headers only.
 TEST_F(GolangHttpFilterTest, ScriptHeadersOnlyRequestHeadersOnly) {
   InSequence s;
-  setup(PASSTHROUGH, genSoPath(PASSTHROUGH), PASSTHROUGH);
+  setup(PASSTHROUGH, genSoPath(), PASSTHROUGH);
 
   Http::TestRequestHeaderMapImpl request_headers{{":path", "/"}};
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers, true));
@@ -175,15 +176,18 @@ TEST_F(GolangHttpFilterTest, ScriptHeadersOnlyRequestHeadersOnly) {
 // setHeader at wrong stage
 TEST_F(GolangHttpFilterTest, SetHeaderAtWrongStage) {
   InSequence s;
-  setup(PASSTHROUGH, genSoPath(PASSTHROUGH), PASSTHROUGH);
+  setup(PASSTHROUGH, genSoPath(), PASSTHROUGH);
+  auto req = new HttpRequestInternal(*filter_);
 
-  EXPECT_EQ(CAPINotInGo, filter_->setHeader("foo", "bar", HeaderSet));
+  EXPECT_EQ(CAPINotInGo, filter_->setHeader(req->decodingState(), "foo", "bar", HeaderSet));
+
+  delete req;
 }
 
 // invalid config for routeconfig filter
 TEST_F(GolangHttpFilterTest, InvalidConfigForRouteConfigFilter) {
   InSequence s;
-  EXPECT_THROW_WITH_REGEX(setup(ROUTECONFIG, genSoPath(ROUTECONFIG), ROUTECONFIG), EnvoyException,
+  EXPECT_THROW_WITH_REGEX(setup(ROUTECONFIG, genSoPath(), ROUTECONFIG), EnvoyException,
                           "golang filter failed to parse plugin config");
 }
 

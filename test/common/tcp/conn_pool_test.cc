@@ -8,10 +8,10 @@
 #include "source/common/upstream/upstream_impl.h"
 
 #include "test/common/upstream/utility.h"
-#include "test/mocks/common.h"
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/network/mocks.h"
 #include "test/mocks/runtime/mocks.h"
+#include "test/mocks/server/overload_manager.h"
 #include "test/mocks/ssl/mocks.h"
 #include "test/mocks/tcp/mocks.h"
 #include "test/mocks/upstream/cluster_info.h"
@@ -58,7 +58,7 @@ struct ConnPoolCallbacks : public Tcp::ConnectionPool::Callbacks {
     conn_data_->addUpstreamCallbacks(callbacks_);
     host_ = host;
     ssl_ = conn_data_->connection().streamInfo().downstreamAddressProvider().sslConnection();
-    pool_ready_.ready();
+    mock_pool_ready_cb_.Call();
   }
 
   void onPoolFailure(ConnectionPool::PoolFailureReason reason, absl::string_view failure_reason,
@@ -66,12 +66,12 @@ struct ConnPoolCallbacks : public Tcp::ConnectionPool::Callbacks {
     reason_ = reason;
     host_ = host;
     failure_reason_string_ = std::string(failure_reason);
-    pool_failure_.ready();
+    mock_pool_failure_cb_.Call();
   }
 
   StrictMock<ConnectionPool::MockUpstreamCallbacks> callbacks_;
-  ReadyWatcher pool_failure_;
-  ReadyWatcher pool_ready_;
+  testing::MockFunction<void()> mock_pool_failure_cb_;
+  testing::MockFunction<void()> mock_pool_ready_cb_;
   ConnectionPool::ConnectionDataPtr conn_data_{};
   absl::optional<ConnectionPool::PoolFailureReason> reason_;
   std::string failure_reason_string_;
@@ -139,15 +139,14 @@ public:
 
     Event::MockDispatcher* dispatcher =
         static_cast<Event::MockDispatcher*>(&(test_conn.connection_->dispatcher()));
-    if (has_idle_timers_ &&
-        Runtime::runtimeFeatureEnabled("envoy.reloadable_features.tcp_pool_idle_timeout")) {
+    if (has_idle_timers_) {
       test_conn.idle_timer_ = new NiceMock<Event::MockTimer>(dispatcher);
     } else {
       // No idle timeout when idle timeout is not configured.
       EXPECT_CALL(*dispatcher, createTimer_(_)).Times(0);
     }
 
-    EXPECT_CALL(mock_dispatcher_, createClientConnection_(_, _, _, options_))
+    EXPECT_CALL(mock_dispatcher_, createClientConnection_(_, _, _, _))
         .WillOnce(Return(test_conn.connection_));
     EXPECT_CALL(*test_conn.connection_, addReadFilter(_))
         .WillOnce(Invoke(
@@ -174,6 +173,7 @@ public:
   Network::ConnectionSocket::OptionsSharedPtr options_;
   Network::TransportSocketOptionsConstSharedPtr transport_socket_options_;
   bool has_idle_timers_{false};
+  NiceMock<Server::MockOverloadManager> overload_manager_;
 
 protected:
   class ConnPoolImplForTest : public ConnPoolImpl {
@@ -181,9 +181,9 @@ protected:
     ConnPoolImplForTest(Event::MockDispatcher& dispatcher, Upstream::HostSharedPtr host,
                         Network::ConnectionSocket::OptionsSharedPtr options,
                         Network::TransportSocketOptionsConstSharedPtr transport_socket_options,
-                        ConnPoolBase& parent)
+                        ConnPoolBase& parent, Server::OverloadManager& overload_manager)
         : ConnPoolImpl(dispatcher, host, Upstream::ResourcePriority::Default, options,
-                       transport_socket_options, state_, absl::nullopt),
+                       transport_socket_options, state_, absl::nullopt, overload_manager),
           parent_(parent) {}
 
     void onConnReleased(Envoy::ConnectionPool::ActiveClient& client) override {
@@ -214,8 +214,8 @@ ConnPoolBase::ConnPoolBase(Event::MockDispatcher& dispatcher, Upstream::HostShar
                            Network::TransportSocketOptionsConstSharedPtr transport_socket_options)
     : mock_dispatcher_(dispatcher), mock_upstream_ready_cb_(upstream_ready_cb), options_(options),
       transport_socket_options_(transport_socket_options) {
-  conn_pool_ = std::make_unique<ConnPoolImplForTest>(dispatcher, host, options,
-                                                     transport_socket_options, *this);
+  conn_pool_ = std::make_unique<ConnPoolImplForTest>(
+      dispatcher, host, options, transport_socket_options, *this, overload_manager_);
 }
 
 void ConnPoolBase::expectEnableUpstreamReady(bool run) {
@@ -235,7 +235,7 @@ class TcpConnPoolImplTest : public Event::TestUsingSimulatedTime, public testing
 public:
   TcpConnPoolImplTest()
       : upstream_ready_cb_(new NiceMock<Event::MockSchedulableCallback>(&dispatcher_)),
-        host_(Upstream::makeTestHost(cluster_, "tcp://127.0.0.1:9000", simTime())) {}
+        host_(Upstream::makeTestHost(cluster_, "tcp://127.0.0.1:9000")) {}
 
   ~TcpConnPoolImplTest() override {
     EXPECT_TRUE(TestUtility::gaugesZeroed(cluster_->stats_store_.gauges()))
@@ -243,7 +243,7 @@ public:
   }
 
   void initialize() {
-    ON_CALL(*cluster_->upstream_local_address_selector_, getUpstreamLocalAddress(_, _))
+    ON_CALL(*cluster_->upstream_local_address_selector_, getUpstreamLocalAddressImpl(_))
         .WillByDefault(
             Return(Upstream::UpstreamLocalAddress({cluster_->source_address_, options_})));
     conn_pool_ = std::make_unique<ConnPoolBase>(dispatcher_, host_, upstream_ready_cb_, options_,
@@ -267,10 +267,10 @@ class TcpConnPoolImplDestructorTest : public Event::TestUsingSimulatedTime, publ
 public:
   TcpConnPoolImplDestructorTest()
       : upstream_ready_cb_(new NiceMock<Event::MockSchedulableCallback>(&dispatcher_)) {
-    host_ = Upstream::makeTestHost(cluster_, "tcp://127.0.0.1:9000", simTime());
+    host_ = Upstream::makeTestHost(cluster_, "tcp://127.0.0.1:9000");
     conn_pool_ =
         std::make_unique<ConnPoolImpl>(dispatcher_, host_, Upstream::ResourcePriority::Default,
-                                       nullptr, nullptr, state_, absl::nullopt);
+                                       nullptr, nullptr, state_, absl::nullopt, overload_manager_);
     ssl_ = std::make_shared<NiceMock<Envoy::Ssl::MockConnectionInfo>>();
   }
   ~TcpConnPoolImplDestructorTest() override = default;
@@ -286,7 +286,7 @@ public:
     EXPECT_CALL(*connection_, connect());
     EXPECT_CALL(*connection_, setConnectionStats(_));
     EXPECT_CALL(*connection_, noDelay(true));
-    EXPECT_CALL(*connection_, streamInfo());
+    EXPECT_CALL(*connection_, streamInfo()).Times(AnyNumber());
     EXPECT_CALL(*connection_, id()).Times(AnyNumber());
     EXPECT_CALL(*connection_, readDisable(_)).Times(AnyNumber());
     EXPECT_CALL(*connection_, initializeReadFilters());
@@ -300,7 +300,7 @@ public:
     EXPECT_NE(nullptr, handle);
 
     EXPECT_CALL(*connect_timer_, disableTimer());
-    EXPECT_CALL(callbacks_->pool_ready_, ready());
+    EXPECT_CALL(callbacks_->mock_pool_ready_cb_, Call);
     connection_->raiseEvent(Network::ConnectionEvent::Connected);
     connection_->stream_info_.downstream_connection_info_provider_->setSslConnection(ssl_);
   }
@@ -315,6 +315,7 @@ public:
   Network::MockClientConnection* connection_;
   std::unique_ptr<Tcp::ConnectionPool::Instance> conn_pool_;
   std::unique_ptr<ConnPoolCallbacks> callbacks_;
+  NiceMock<Server::MockOverloadManager> overload_manager_;
 };
 
 /**
@@ -362,7 +363,7 @@ struct ActiveTestConn {
     completed_ = true;
   }
 
-  void expectNewConn() { EXPECT_CALL(callbacks_.pool_ready_, ready()); }
+  void expectNewConn() { EXPECT_CALL(callbacks_.mock_pool_ready_cb_, Call); }
 
   void releaseConn() { callbacks_.conn_data_.reset(); }
 
@@ -460,28 +461,6 @@ TEST_F(TcpConnPoolImplTest, IdleTimerCloseConnections) {
   EXPECT_TRUE(conn_pool_->isIdle());
 
   EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_idle_timeout_.value());
-}
-
-/**
- * Verify that no idle timer is created if we flip the runtime guard.
- */
-TEST_F(TcpConnPoolImplTest, NoIdleTimerWithoutRuntimeGuard) {
-  TestScopedRuntime scoped_runtime;
-  scoped_runtime.mergeValues({{"envoy.reloadable_features.tcp_pool_idle_timeout", "false"}});
-
-  initialize();
-  cluster_->resetResourceManager(1, 1024, 1024, 1, 1);
-  conn_pool_->setupIdleTimers();
-
-  // No timer creation assert is in expectConnCreate.
-  ActiveTestConn c1(*this, 0, ActiveTestConn::Type::CreateConnection);
-  EXPECT_CALL(*conn_pool_, onConnReleasedForTest());
-  c1.releaseConn();
-
-  // Cause the connection to go away.
-  EXPECT_CALL(*conn_pool_, onConnDestroyedForTest());
-  conn_pool_->test_conns_[0].connection_->raiseEvent(Network::ConnectionEvent::RemoteClose);
-  dispatcher_.clearDeferredDeleteList();
 }
 
 /**
@@ -584,7 +563,7 @@ TEST_F(TcpConnPoolImplTest, VerifyBufferLimitsAndOptions) {
   EXPECT_CALL(*cluster_, perConnectionBufferLimitBytes()).WillOnce(Return(8192));
   EXPECT_CALL(*conn_pool_->test_conns_.back().connection_, setBufferLimits(8192));
 
-  EXPECT_CALL(callbacks.pool_failure_, ready());
+  EXPECT_CALL(callbacks.mock_pool_failure_cb_, Call);
   Tcp::ConnectionPool::Cancellable* handle = conn_pool_->newConnection(callbacks);
   EXPECT_NE(nullptr, handle);
 
@@ -704,7 +683,7 @@ TEST_F(TcpConnPoolImplTest, MaxPendingRequests) {
   EXPECT_NE(nullptr, handle);
 
   ConnPoolCallbacks callbacks2;
-  EXPECT_CALL(callbacks2.pool_failure_, ready());
+  EXPECT_CALL(callbacks2.mock_pool_failure_cb_, Call);
   Tcp::ConnectionPool::Cancellable* handle2 = conn_pool_->newConnection(callbacks2);
   EXPECT_EQ(nullptr, handle2);
 
@@ -732,7 +711,7 @@ TEST_F(TcpConnPoolImplTest, RemoteConnectFailure) {
   Tcp::ConnectionPool::Cancellable* handle = conn_pool_->newConnection(callbacks);
   EXPECT_NE(nullptr, handle);
 
-  EXPECT_CALL(callbacks.pool_failure_, ready());
+  EXPECT_CALL(callbacks.mock_pool_failure_cb_, Call);
   EXPECT_CALL(*conn_pool_->test_conns_[0].connect_timer_, disableTimer());
 
   EXPECT_CALL(*conn_pool_, onConnDestroyedForTest());
@@ -761,7 +740,7 @@ TEST_F(TcpConnPoolImplTest, LocalConnectFailure) {
   Tcp::ConnectionPool::Cancellable* handle = conn_pool_->newConnection(callbacks);
   EXPECT_NE(nullptr, handle);
 
-  EXPECT_CALL(callbacks.pool_failure_, ready());
+  EXPECT_CALL(callbacks.mock_pool_failure_cb_, Call);
   EXPECT_CALL(*conn_pool_->test_conns_[0].connect_timer_, disableTimer());
 
   EXPECT_CALL(*conn_pool_, onConnDestroyedForTest());
@@ -786,14 +765,14 @@ TEST_F(TcpConnPoolImplTest, ConnectTimeout) {
   EXPECT_NE(nullptr, conn_pool_->newConnection(callbacks1));
 
   ConnPoolCallbacks callbacks2;
-  EXPECT_CALL(callbacks1.pool_failure_, ready()).WillOnce(Invoke([&]() -> void {
+  EXPECT_CALL(callbacks1.mock_pool_failure_cb_, Call).WillOnce([&]() -> void {
     conn_pool_->expectConnCreate();
     EXPECT_NE(nullptr, conn_pool_->newConnection(callbacks2));
-  }));
+  });
 
   conn_pool_->test_conns_[0].connect_timer_->invokeCallback();
 
-  EXPECT_CALL(callbacks2.pool_failure_, ready());
+  EXPECT_CALL(callbacks2.mock_pool_failure_cb_, Call);
   conn_pool_->test_conns_[1].connect_timer_->invokeCallback();
 
   EXPECT_CALL(*conn_pool_, onConnDestroyedForTest()).Times(2);
@@ -858,7 +837,7 @@ TEST_F(TcpConnPoolImplTest, DisconnectWhileBound) {
   Tcp::ConnectionPool::Cancellable* handle = conn_pool_->newConnection(callbacks);
   EXPECT_NE(nullptr, handle);
 
-  EXPECT_CALL(callbacks.pool_ready_, ready());
+  EXPECT_CALL(callbacks.mock_pool_ready_cb_, Call);
 
   EXPECT_CALL(callbacks.callbacks_, onEvent(_));
   conn_pool_->test_conns_[0].connection_->raiseEvent(Network::ConnectionEvent::Connected);
@@ -883,7 +862,7 @@ TEST_F(TcpConnPoolImplTest, DisconnectWhilePending) {
   EXPECT_NE(nullptr, handle);
 
   EXPECT_CALL(*conn_pool_->test_conns_[0].connect_timer_, disableTimer());
-  EXPECT_CALL(callbacks.pool_ready_, ready());
+  EXPECT_CALL(callbacks.mock_pool_ready_cb_, Call);
   EXPECT_CALL(callbacks.callbacks_, onEvent(_));
   conn_pool_->test_conns_[0].connection_->raiseEvent(Network::ConnectionEvent::Connected);
 
@@ -901,7 +880,7 @@ TEST_F(TcpConnPoolImplTest, DisconnectWhilePending) {
 
   // test_conns_[1] is the new connection
   EXPECT_CALL(*conn_pool_->test_conns_[1].connect_timer_, disableTimer());
-  EXPECT_CALL(callbacks2.pool_ready_, ready());
+  EXPECT_CALL(callbacks2.mock_pool_ready_cb_, Call);
   conn_pool_->test_conns_[1].connection_->raiseEvent(Network::ConnectionEvent::Connected);
 
   EXPECT_CALL(*conn_pool_, onConnReleasedForTest());
@@ -933,13 +912,13 @@ TEST_F(TcpConnPoolImplTest, MaxConnections) {
   EXPECT_NE(nullptr, handle);
 
   // Connect event will bind to request 1.
-  EXPECT_CALL(callbacks.pool_ready_, ready());
+  EXPECT_CALL(callbacks.mock_pool_ready_cb_, Call);
   conn_pool_->test_conns_[0].connection_->raiseEvent(Network::ConnectionEvent::Connected);
 
   // Finishing request 1 will immediately bind to request 2.
   EXPECT_CALL(*conn_pool_, onConnReleasedForTest());
   conn_pool_->expectEnableUpstreamReady(false);
-  EXPECT_CALL(callbacks2.pool_ready_, ready());
+  EXPECT_CALL(callbacks2.mock_pool_ready_cb_, Call);
   callbacks.conn_data_.reset();
 
   conn_pool_->expectEnableUpstreamReady(true);
@@ -967,7 +946,7 @@ TEST_F(TcpConnPoolImplTest, MaxRequestsPerConnection) {
 
   EXPECT_NE(nullptr, handle);
 
-  EXPECT_CALL(callbacks.pool_ready_, ready());
+  EXPECT_CALL(callbacks.mock_pool_ready_cb_, Call);
   conn_pool_->test_conns_[0].connection_->raiseEvent(Network::ConnectionEvent::Connected);
 
   EXPECT_CALL(*conn_pool_, onConnReleasedForTest());
@@ -1205,7 +1184,6 @@ TEST_F(TcpConnPoolImplTest, TestIdleTimeout) {
   c1.releaseConn();
   conn_pool_->test_conns_[0].connection_->raiseEvent(Network::ConnectionEvent::RemoteClose);
 
-  EXPECT_CALL(idle_callback, Call());
   conn_pool_->drainConnections(Envoy::ConnectionPool::DrainBehavior::DrainAndDelete);
   EXPECT_CALL(*conn_pool_, onConnDestroyedForTest());
   dispatcher_.clearDeferredDeleteList();
@@ -1235,7 +1213,7 @@ TEST_F(TcpConnPoolImplDestructorTest, TestPendingConnectionsAreClosed) {
   ConnectionPool::Cancellable* handle = conn_pool_->newConnection(*callbacks_);
   EXPECT_NE(nullptr, handle);
 
-  EXPECT_CALL(callbacks_->pool_failure_, ready());
+  EXPECT_CALL(callbacks_->mock_pool_failure_cb_, Call);
   EXPECT_CALL(*connection_, close(Network::ConnectionCloseType::NoFlush));
   EXPECT_CALL(dispatcher_, clearDeferredDeleteList());
   conn_pool_.reset();

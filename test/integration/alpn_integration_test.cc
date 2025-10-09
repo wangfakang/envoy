@@ -146,7 +146,7 @@ TEST_P(AlpnIntegrationTest, Http2RememberSettings) {
   test_server_->waitForCounterGe("cluster.cluster_0.upstream_cx_total", 1);
 
   {
-    absl::MutexLock l(&fake_upstreams_[0]->lock());
+    absl::MutexLock l(fake_upstreams_[0]->lock());
     IntegrationCodecClientPtr codec_client1 = makeHttpConnection(lookupPort("http"));
     auto response1 = codec_client1->makeHeaderOnlyRequest(default_request_headers_);
     IntegrationCodecClientPtr codec_client2 = makeHttpConnection(lookupPort("http"));
@@ -183,6 +183,35 @@ TEST_P(AlpnIntegrationTest, Mixed) {
   ASSERT_TRUE(response2->waitForEndStream());
   EXPECT_EQ("200", response1->headers().Status()->value().getStringView());
   EXPECT_EQ("200", response2->headers().Status()->value().getStringView());
+}
+
+TEST_P(AlpnIntegrationTest, DisconnectDuringHandshake) {
+  DISABLE_UNDER_WINDOWS;
+  setUpstreamProtocol(Http::CodecType::HTTP2);
+  protocols_ = {Http::CodecType::HTTP2};
+  setUpstreamCount(1);
+  initialize();
+
+  absl::Notification unblock_accept;
+  absl::Notification accept_blocked;
+  fake_upstreams_[0]->runOnDispatcherThread([&] {
+    accept_blocked.Notify();
+    unblock_accept.WaitForNotification();
+  });
+  accept_blocked.WaitForNotification();
+
+  // Connect and wait for the upstream connection to be established.
+  codec_client_ = makeHttpConnection(makeClientConnection((lookupPort("http"))));
+  auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+  test_server_->waitForCounterGe("cluster.cluster_0.upstream_cx_total", 1);
+
+  // Close the downstream connection and wait for the upstream stream to go away.
+  codec_client_->close();
+  test_server_->waitForCounterEq("cluster.cluster_0.upstream_rq_cancelled", 1);
+
+  // Allow the connection to complete.
+  unblock_accept.Notify();
+  test_server_->waitForCounterGe("cluster.cluster_0.upstream_cx_http2_total", 1);
 }
 
 } // namespace

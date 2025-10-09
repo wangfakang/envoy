@@ -12,13 +12,13 @@ namespace CustomResponse {
     const std::string& stats_prefix, Envoy::Server::Configuration::FactoryContext& context) {
   Stats::StatNameManagedStorage prefix(stats_prefix, context.scope().symbolTable());
   auto config_ptr =
-      std::make_shared<FilterConfig>(config, context.getServerFactoryContext(), prefix.statName());
+      std::make_shared<FilterConfig>(config, context.serverFactoryContext(), prefix.statName());
   return [config_ptr](::Envoy::Http::FilterChainFactoryCallbacks& callbacks) mutable -> void {
     callbacks.addStreamFilter(std::make_shared<CustomResponseFilter>(config_ptr));
   };
 }
 
-Router::RouteSpecificFilterConfigConstSharedPtr
+absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
 CustomResponseFilterFactory::createRouteSpecificFilterConfigTyped(
     const envoy::extensions::filters::http::custom_response::v3::CustomResponse& config,
     Envoy::Server::Configuration::ServerFactoryContext& context,

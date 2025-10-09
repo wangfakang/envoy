@@ -107,17 +107,26 @@ protected:
     for (const CustomTagCase& cas : cases) {
       envoy::type::tracing::v3::CustomTag custom_tag;
       TestUtility::loadFromYaml(cas.custom_tag, custom_tag);
-      config.custom_tags_.emplace(custom_tag.tag(), CustomTagUtility::createCustomTag(custom_tag));
+      custom_tags.emplace(custom_tag.tag(), CustomTagUtility::createCustomTag(custom_tag));
       if (cas.set) {
         EXPECT_CALL(span, setTag(Eq(custom_tag.tag()), Eq(cas.value)));
       } else {
         EXPECT_CALL(span, setTag(Eq(custom_tag.tag()), _)).Times(0);
       }
     }
+
+    EXPECT_CALL(config, modifySpan(_)).WillOnce(Invoke([this](Span& span) {
+      const CustomTagContext ctx{trace_context, stream_info};
+      for (const auto& [_, custom_tag] : custom_tags) {
+        custom_tag->applySpan(span, ctx);
+      }
+    }));
   }
 
   NiceMock<MockSpan> span;
   NiceMock<MockConfig> config;
+  Tracing::CustomTagMap custom_tags;
+  Tracing::TestTraceContextImpl trace_context;
   NiceMock<StreamInfo::MockStreamInfo> stream_info;
   std::shared_ptr<NiceMock<Upstream::MockClusterInfo>> cluster_info_{
       std::make_shared<NiceMock<Upstream::MockClusterInfo>>()};
@@ -127,7 +136,7 @@ protected:
 TEST_F(FinalizerImplTest, TestAll) {
   TestEnvironment::setEnvVar("E_CC", "c", 1);
 
-  Tracing::TestTraceContextImpl trace_context{{"x-request-id", "id"}, {"x-bb", "b"}};
+  trace_context.context_map_ = {{"x-request-id", "id"}, {"x-bb", "b"}};
   trace_context.context_host_ = "test.com";
   trace_context.context_method_ = "method";
   trace_context.context_path_ = "TestService";
@@ -197,7 +206,7 @@ TEST_F(FinalizerImplTest, TestAll) {
         {"{ tag: cc-3, environment: { name: E_CC_NOT_FOUND} }", false, ""},
     });
 
-    TracerUtility::finalizeSpan(span, trace_context, stream_info, config, true);
+    TracerUtility::finalizeSpan(span, stream_info, config, true);
   }
 
   {
@@ -232,7 +241,7 @@ TEST_F(FinalizerImplTest, TestAll) {
         {"{ tag: cc-3, environment: { name: E_CC_NOT_FOUND} }", false, ""},
     });
 
-    TracerUtility::finalizeSpan(span, trace_context, stream_info, config, false);
+    TracerUtility::finalizeSpan(span, stream_info, config, false);
   }
 }
 
@@ -240,9 +249,10 @@ TEST(EgressConfigImplTest, EgressConfigImplTest) {
   EgressConfigImpl config_impl;
 
   EXPECT_EQ(OperationName::Egress, config_impl.operationName());
-  EXPECT_EQ(nullptr, config_impl.customTags());
   EXPECT_EQ(false, config_impl.verbose());
   EXPECT_EQ(Tracing::DefaultMaxPathTagLength, config_impl.maxPathTagLength());
+  NiceMock<MockSpan> span;
+  config_impl.modifySpan(span);
 }
 
 TEST(NullTracerTest, BasicFunctionality) {
@@ -252,6 +262,9 @@ TEST(NullTracerTest, BasicFunctionality) {
   Tracing::TestTraceContextImpl trace_context{};
   Upstream::HostDescriptionConstSharedPtr host{
       new testing::NiceMock<Upstream::MockHostDescription>()};
+  Upstream::ClusterInfoConstSharedPtr cluster{new testing::NiceMock<Upstream::MockClusterInfo>()};
+  Tracing::UpstreamContext upstream_context(host.get(), cluster.get(), Tracing::ServiceType::Http,
+                                            false);
 
   SpanPtr span_ptr =
       null_tracer.startSpan(config, trace_context, stream_info, {Reason::Sampling, true});
@@ -261,8 +274,9 @@ TEST(NullTracerTest, BasicFunctionality) {
   span_ptr->setTag("foo", "bar");
   span_ptr->setBaggage("key", "value");
   ASSERT_EQ("", span_ptr->getBaggage("baggage_key"));
-  ASSERT_EQ(span_ptr->getTraceIdAsHex(), "");
-  span_ptr->injectContext(trace_context, host);
+  ASSERT_EQ(span_ptr->getTraceId(), "");
+  ASSERT_EQ(span_ptr->getSpanId(), "");
+  span_ptr->injectContext(trace_context, upstream_context);
   span_ptr->log(SystemTime(), "fake_event");
 
   EXPECT_NE(nullptr, span_ptr->spawnChild(config, "foo", SystemTime()));
@@ -289,6 +303,7 @@ public:
                                                     {"grpc-status", "14"},
                                                     {"grpc-message", "unavailable"}};
   Http::TestResponseTrailerMapImpl response_trailers_;
+  Tracing::HttpTraceContext trace_context_{request_headers_};
   NiceMock<StreamInfo::MockStreamInfo> stream_info_;
   NiceMock<LocalInfo::MockLocalInfo> local_info_;
   NiceMock<MockConfig> config_;
@@ -303,7 +318,7 @@ TEST_F(TracerImplTest, BasicFunctionalityNullSpan) {
   EXPECT_CALL(config_, operationName()).Times(2);
   const std::string operation_name = "ingress";
   EXPECT_CALL(*driver_, startSpan_(_, _, _, operation_name, _)).WillOnce(Return(nullptr));
-  tracer_->startSpan(config_, request_headers_, stream_info_, {Reason::Sampling, true});
+  tracer_->startSpan(config_, trace_context_, stream_info_, {Reason::Sampling, true});
 }
 
 TEST_F(TracerImplTest, BasicFunctionalityNodeSet) {
@@ -316,7 +331,7 @@ TEST_F(TracerImplTest, BasicFunctionalityNodeSet) {
   EXPECT_CALL(*span, setTag(_, _)).Times(testing::AnyNumber());
   EXPECT_CALL(*span, setTag(Eq(Tracing::Tags::get().NodeId), Eq("node_name")));
 
-  tracer_->startSpan(config_, request_headers_, stream_info_, {Reason::Sampling, true});
+  tracer_->startSpan(config_, trace_context_, stream_info_, {Reason::Sampling, true});
 }
 
 TEST_F(TracerImplTest, ChildGrpcUpstreamSpanTest) {
@@ -330,7 +345,7 @@ TEST_F(TracerImplTest, ChildGrpcUpstreamSpanTest) {
   EXPECT_CALL(*span, setTag(Eq(Tracing::Tags::get().NodeId), Eq("node_name")));
 
   auto parent_span =
-      tracer_->startSpan(config_, request_headers_, stream_info_, {Reason::Sampling, true});
+      tracer_->startSpan(config_, trace_context_, stream_info_, {Reason::Sampling, true});
 
   NiceMock<MockSpan>* second_span = new NiceMock<MockSpan>();
 
@@ -376,8 +391,7 @@ TEST_F(TracerImplTest, MetadataCustomTagReturnsDefaultValue) {
   *testing_metadata.mutable_default_value() = "default_value";
   MetadataCustomTag tag("testing", testing_metadata);
   StreamInfo::MockStreamInfo testing_info_;
-  Http::TestRequestHeaderMapImpl header_map_;
-  CustomTagContext context{&header_map_, testing_info_};
+  CustomTagContext context{trace_context_, testing_info_};
   EXPECT_EQ(tag.value(context), "default_value");
 }
 

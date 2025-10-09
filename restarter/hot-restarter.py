@@ -17,7 +17,8 @@ TERM_WAIT_SECONDS = 30
 restart_epoch = 0
 pid_list = []
 
-LOG_FORMAT = "[%(asctime)s][%(process)d][%(levelname)s][%(filename)s:%(lineno)d] %(message)s"
+LOG_FORMAT = "[%(asctime)s.%(msecs)03d][%(process)d][%(levelname)s][core] [%(filename)s:%(lineno)d] %(message)s"
+DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOG_LEVEL = logging.INFO
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,6 @@ def term_all_children():
     # First uninstall the SIGCHLD handler so that we don't get called again.
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
 
-    global pid_list
     for pid in pid_list:
         logger.info("sending TERM to PID={}".format(pid))
         try:
@@ -113,7 +113,6 @@ def sighup_handler(signum, frame):
 def sigusr1_handler(signum, frame):
     """ Handler for SIGUSR1. Propagate SIGUSR1 to all of the child processes """
 
-    global pid_list
     for pid in pid_list:
         logger.info("sending SIGUSR1 to PID={}".format(pid))
         try:
@@ -131,7 +130,6 @@ def sigchld_handler(signum, frame):
     logger.info("got SIGCHLD")
 
     kill_all_and_exit = False
-    global pid_list
     pid_list_copy = list(pid_list)
     for pid in pid_list_copy:
         ret_pid, exit_status = os.waitpid(pid, os.WNOHANG)
@@ -196,7 +194,7 @@ def fork_and_exec():
 def init_logger():
     """init logger"""
     stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    stream_handler.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
     logger.setLevel(LOG_LEVEL)
     logger.addHandler(stream_handler)
 

@@ -15,24 +15,14 @@ Factory::create(OptRef<const Upstream::LoadBalancerConfig> lb_config,
                 const Upstream::PrioritySet& priority_set, Runtime::Loader& runtime,
                 Random::RandomGenerator& random, TimeSource&) {
 
-  const auto* typed_lb_config =
-      dynamic_cast<const Upstream::LoadBalancerConfigWrapper*>(lb_config.ptr());
-  auto typed_proto_config = typed_lb_config == nullptr
-                                ? OptRef<const MaglevLbProto>{}
-                                : typed_lb_config->typedProtoConfig<MaglevLbProto>();
-
-  // Assume legacy config.
-  if (!typed_proto_config.has_value()) {
-    return std::make_unique<Upstream::MaglevLoadBalancer>(
-        priority_set, cluster_info.lbStats(), cluster_info.statsScope(), runtime, random,
-        cluster_info.lbMaglevConfig(), cluster_info.lbConfig());
-  }
+  const auto typed_lb_config = dynamic_cast<const Upstream::TypedMaglevLbConfig*>(lb_config.ptr());
+  ASSERT(typed_lb_config != nullptr, "Invalid maglev load balancer config");
 
   return std::make_unique<Upstream::MaglevLoadBalancer>(
       priority_set, cluster_info.lbStats(), cluster_info.statsScope(), runtime, random,
       static_cast<uint32_t>(PROTOBUF_PERCENT_TO_ROUNDED_INTEGER_OR_DEFAULT(
           cluster_info.lbConfig(), healthy_panic_threshold, 100, 50)),
-      typed_proto_config.value());
+      typed_lb_config->lb_config_, typed_lb_config->hash_policy_);
 }
 
 /**

@@ -1,9 +1,12 @@
-load("@build_bazel_rules_android//android:rules.bzl", "android_binary")
-load("@io_bazel_rules_kotlin//kotlin:android.bzl", "kt_android_library")
+load("@envoy//bazel:envoy_build_system.bzl", "envoy_mobile_package")
+load("@rules_android//android:rules.bzl", "android_binary")
 load("@rules_detekt//detekt:defs.bzl", "detekt")
 load("@rules_jvm_external//:defs.bzl", "artifact")
+load("@rules_kotlin//kotlin:android.bzl", "kt_android_library")
 
 licenses(["notice"])  # Apache 2
+
+envoy_mobile_package()
 
 android_binary(
     name = "hello_envoy_kt",
@@ -34,6 +37,7 @@ kt_android_library(
         artifact("androidx.recyclerview:recyclerview"),
         artifact("androidx.annotation:annotation"),
         artifact("com.google.code.findbugs:jsr305"),
+        artifact("com.google.protobuf:protobuf-javalite"),
     ],
 )
 

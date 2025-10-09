@@ -83,11 +83,15 @@ can be specified using a ',' delimited list. The supported policies are:
     request, including any retries that take place.
 
 gateway-error
-  This policy is similar to the *5xx* policy but will only retry requests that result in a 502, 503,
-  or 504.
+  This policy is similar to the *5xx* policy but will attempt a retry if the upstream server responds
+  with 502, 503, or 504 response code, or does not respond at all (disconnect/reset/read timeout).
 
 reset
   Envoy will attempt a retry if the upstream server does not respond at all (disconnect/reset/read timeout.)
+
+reset-before-request
+  Equivalent to *reset* but will only retry requests that have not been sent to the upstream server
+  (i.e. the headers have not been sent).
 
 connect-failure
   Envoy will attempt a retry if a request is failed because of a connection failure to the upstream
@@ -372,6 +376,19 @@ or :ref:`regex_rewrite <envoy_v3_api_field_config.route.v3.RouteAction.regex_rew
 Envoy will put the original path header in this header. This can be useful for logging and
 debugging.
 
+.. _config_http_filters_router_x-envoy-original-host:
+
+x-envoy-original-host
+^^^^^^^^^^^^^^^^^^^^^
+
+If the route utilizes
+:ref:`host_rewrite_literal <envoy_v3_api_field_config.route.v3.RouteAction.host_rewrite_literal>`,
+:ref:`auto_host_rewrite <envoy_v3_api_field_config.route.v3.RouteAction.auto_host_rewrite>`,
+:ref:`host_rewrite_header <envoy_v3_api_field_config.route.v3.RouteAction.host_rewrite_header>`,
+:ref:`host_rewrite_path_regex <envoy_v3_api_field_config.route.v3.RouteAction.host_rewrite_path_regex>`,
+Envoy will put the original host header in this header. This can be useful for logging and
+debugging.
+
 .. _config_http_filters_router_x-envoy-upstream-stream-duration-ms:
 
 x-envoy-upstream-stream-duration-ms
@@ -429,6 +446,7 @@ owning HTTP connection manager.
   rq_direct_response, Counter, Total requests that resulted in a direct response
   rq_total, Counter, Total routed requests
   rq_reset_after_downstream_response_started, Counter, Total requests that were reset after downstream response had started
+  rq_overload_local_reply, Counter, Total requests that were load shed if downstream filter load shed point is configured
 
 .. _config_http_filters_router_vcluster_stats:
 
@@ -436,7 +454,7 @@ Virtual Clusters
 ^^^^^^^^^^^^^^^^
 
 Virtual cluster statistics are output in the
-*vhost.<virtual host name>.vcluster.<virtual cluster name>.* namespace and include the following
+``vhost.<virtual host name>.vcluster.<virtual cluster name>.`` namespace and include the following
 statistics:
 
 .. csv-table::

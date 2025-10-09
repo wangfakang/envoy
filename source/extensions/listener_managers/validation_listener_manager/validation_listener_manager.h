@@ -1,6 +1,6 @@
 #pragma once
 
-#include "source/extensions/listener_managers/listener_manager/listener_manager_impl.h"
+#include "source/common/listener_manager/listener_manager_impl.h"
 #include "source/server/listener_manager_factory.h"
 
 namespace Envoy {
@@ -14,28 +14,35 @@ public:
   LdsApiPtr createLdsApi(const envoy::config::core::v3::ConfigSource& lds_config,
                          const xds::core::v3::ResourceLocator* lds_resources_locator) override {
     return std::make_unique<LdsApiImpl>(
-        lds_config, lds_resources_locator, parent_.clusterManager(), parent_.initManager(),
-        *parent_.stats().rootScope(), parent_.listenerManager(),
+        lds_config, lds_resources_locator, parent_.xdsManager(), parent_.clusterManager(),
+        parent_.initManager(), *parent_.stats().rootScope(), parent_.listenerManager(),
         parent_.messageValidationContext().dynamicValidationVisitor());
   }
-  std::vector<Network::FilterFactoryCb> createNetworkFilterFactoryList(
+  absl::StatusOr<Filter::NetworkFilterFactoriesList> createNetworkFilterFactoryList(
       const Protobuf::RepeatedPtrField<envoy::config::listener::v3::Filter>& filters,
       Server::Configuration::FilterChainFactoryContext& filter_chain_factory_context) override {
     return ProdListenerComponentFactory::createNetworkFilterFactoryListImpl(
-        filters, filter_chain_factory_context);
+        filters, filter_chain_factory_context, network_config_provider_manager_);
   }
-  Filter::ListenerFilterFactoriesList createListenerFilterFactoryList(
+  absl::StatusOr<Filter::ListenerFilterFactoriesList> createListenerFilterFactoryList(
       const Protobuf::RepeatedPtrField<envoy::config::listener::v3::ListenerFilter>& filters,
       Configuration::ListenerFactoryContext& context) override {
     return ProdListenerComponentFactory::createListenerFilterFactoryListImpl(
         filters, context, tcp_listener_config_provider_manager_);
   }
-  std::vector<Network::UdpListenerFilterFactoryCb> createUdpListenerFilterFactoryList(
+  absl::StatusOr<std::vector<Network::UdpListenerFilterFactoryCb>>
+  createUdpListenerFilterFactoryList(
       const Protobuf::RepeatedPtrField<envoy::config::listener::v3::ListenerFilter>& filters,
       Configuration::ListenerFactoryContext& context) override {
     return ProdListenerComponentFactory::createUdpListenerFilterFactoryListImpl(filters, context);
   }
-  Network::SocketSharedPtr
+  absl::StatusOr<Filter::QuicListenerFilterFactoriesList> createQuicListenerFilterFactoryList(
+      const Protobuf::RepeatedPtrField<envoy::config::listener::v3::ListenerFilter>& filters,
+      Configuration::ListenerFactoryContext& context) override {
+    return ProdListenerComponentFactory::createQuicListenerFilterFactoryListImpl(
+        filters, context, quic_listener_config_provider_manager_);
+  }
+  absl::StatusOr<Network::SocketSharedPtr>
   createListenSocket(Network::Address::InstanceConstSharedPtr, Network::Socket::Type,
                      const Network::Socket::OptionsSharedPtr&, ListenerComponentFactory::BindType,
                      const Network::SocketCreationOptions&, uint32_t) override {
@@ -55,7 +62,9 @@ public:
   }
 
 private:
+  Filter::NetworkFilterConfigProviderManagerImpl network_config_provider_manager_;
   Filter::TcpListenerFilterConfigProviderManagerImpl tcp_listener_config_provider_manager_;
+  Filter::QuicListenerFilterConfigProviderManagerImpl quic_listener_config_provider_manager_;
   Instance& parent_;
 };
 

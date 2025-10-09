@@ -44,7 +44,7 @@ This filter has a statistics tree rooted at *tls_inspector* with the following s
     - Description
 
   * - client_hello_too_large
-    - counter
+    - Counter
     - total unreasonably large client hello received
 
   * - tls_found
@@ -81,4 +81,12 @@ This filter has a statistics tree rooted at *tls_inspector* with the following s
       If the connection terminates early nothing is recorded if we didn't have
       sufficient bytes for either of the cases above.
 
+.. _config_listener_filters_tls_inspector_dynamic_metadata:
+
+Dynamic Metadata
+----------------
+
+If the filter fails to detect TLS it will populate dynamic metadata under the key
+`envoy.filters.listener.tls_inspector` indicating the reason (eg. ``ClientHello`` too
+large or not detected at all).
 

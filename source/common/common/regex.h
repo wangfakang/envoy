@@ -20,12 +20,16 @@ namespace Regex {
 
 class CompiledGoogleReMatcher : public CompiledMatcher {
 public:
-  explicit CompiledGoogleReMatcher(const std::string& regex, bool do_program_size_check);
+  // Create, applying re2.max_program_size.error_level and re2.max_program_size.warn_level.
+  static absl::StatusOr<std::unique_ptr<CompiledGoogleReMatcher>>
+  createAndSizeCheck(const std::string& regex);
+  static absl::StatusOr<std::unique_ptr<CompiledGoogleReMatcher>>
+  create(const envoy::type::matcher::v3::RegexMatcher& config);
+  static absl::StatusOr<std::unique_ptr<CompiledGoogleReMatcher>>
+  create(const xds::type::matcher::v3::RegexMatcher& config);
 
-  explicit CompiledGoogleReMatcher(const xds::type::matcher::v3::RegexMatcher& config)
-      : CompiledGoogleReMatcher(config.regex(), false) {}
-
-  explicit CompiledGoogleReMatcher(const envoy::type::matcher::v3::RegexMatcher& config);
+  // To avoid hiding other implementations of match.
+  using CompiledMatcher::match;
 
   // CompiledMatcher
   bool match(absl::string_view value) const override { return re2::RE2::FullMatch(value, regex_); }
@@ -37,13 +41,35 @@ public:
     return result;
   }
 
-private:
+  // CompiledMatcher
+  const std::string& pattern() const override { return regex_.pattern(); }
+
+protected:
+  explicit CompiledGoogleReMatcher(const std::string& regex) : regex_(regex, re2::RE2::Quiet) {
+    ENVOY_BUG(regex_.ok(), "Invalid regex");
+  }
+  explicit CompiledGoogleReMatcher(const std::string& regex, absl::Status& creation_status,
+                                   bool do_program_size_check);
+  explicit CompiledGoogleReMatcher(const envoy::type::matcher::v3::RegexMatcher& config,
+                                   absl::Status& creation_status);
+  explicit CompiledGoogleReMatcher(const xds::type::matcher::v3::RegexMatcher& config,
+                                   absl::Status& creation_status)
+      : CompiledGoogleReMatcher(config.regex(), creation_status, false) {}
+
   const re2::RE2 regex_;
+};
+
+// Allow creating CompiledGoogleReMatcher without checking for status failures
+// for call sites which really really want to.
+class CompiledGoogleReMatcherNoSafetyChecks : public CompiledGoogleReMatcher {
+public:
+  CompiledGoogleReMatcherNoSafetyChecks(const std::string& regex)
+      : CompiledGoogleReMatcher(regex) {}
 };
 
 class GoogleReEngine : public Engine {
 public:
-  CompiledMatcherPtr matcher(const std::string& regex) const override;
+  absl::StatusOr<CompiledMatcherPtr> matcher(const std::string& regex) const override;
 };
 
 class GoogleReEngineFactory : public EngineFactory {
@@ -58,8 +84,6 @@ public:
 
 DECLARE_FACTORY(GoogleReEngineFactory);
 
-using EngineSingleton = InjectableSingleton<Engine>;
-
 enum class Type { Re2, StdRegex };
 
 /**
@@ -67,17 +91,15 @@ enum class Type { Re2, StdRegex };
  */
 class Utility {
 public:
-  /**
-   * Construct a compiled regex matcher from a match config.
-   */
   template <class RegexMatcherType>
-  static CompiledMatcherPtr parseRegex(const RegexMatcherType& matcher) {
+  static absl::StatusOr<CompiledMatcherPtr> parseRegex(const RegexMatcherType& matcher,
+                                                       Engine& engine) {
     // Fallback deprecated engine type in regex matcher.
     if (matcher.has_google_re2()) {
-      return std::make_unique<CompiledGoogleReMatcher>(matcher);
+      return CompiledGoogleReMatcher::create(matcher);
     }
 
-    return EngineSingleton::get().matcher(matcher.regex());
+    return engine.matcher(matcher.regex());
   }
 };
 

@@ -49,11 +49,8 @@ RequestHeaderCustomTag::RequestHeaderCustomTag(
       default_value_(request_header.default_value()) {}
 
 absl::string_view RequestHeaderCustomTag::value(const CustomTagContext& ctx) const {
-  if (ctx.trace_context == nullptr) {
-    return default_value_;
-  }
   // TODO(https://github.com/envoyproxy/envoy/issues/13454): Potentially populate all header values.
-  const auto entry = ctx.trace_context->getByKey(name_);
+  const auto entry = name_.get(ctx.trace_context);
   return entry.value_or(default_value_);
 }
 
@@ -98,17 +95,17 @@ MetadataCustomTag::metadataToString(const envoy::config::core::v3::Metadata* met
     return absl::nullopt;
   }
 
-  const ProtobufWkt::Value& value = Envoy::Config::Metadata::metadataValue(metadata, metadata_key_);
+  const Protobuf::Value& value = Envoy::Config::Metadata::metadataValue(metadata, metadata_key_);
   switch (value.kind_case()) {
-  case ProtobufWkt::Value::kBoolValue:
+  case Protobuf::Value::kBoolValue:
     return value.bool_value() ? "true" : "false";
-  case ProtobufWkt::Value::kNumberValue:
+  case Protobuf::Value::kNumberValue:
     return absl::StrCat(value.number_value());
-  case ProtobufWkt::Value::kStringValue:
+  case Protobuf::Value::kStringValue:
     return value.string_value();
-  case ProtobufWkt::Value::kListValue:
+  case Protobuf::Value::kListValue:
     return jsonOrNullopt(value.list_value());
-  case ProtobufWkt::Value::kStructValue:
+  case Protobuf::Value::kStructValue:
     return jsonOrNullopt(value.struct_value());
   default:
     break;

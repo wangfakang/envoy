@@ -1,7 +1,9 @@
 #include "source/common/http/conn_manager_impl.h"
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <list>
 #include <memory>
 #include <string>
@@ -9,6 +11,7 @@
 
 #include "envoy/buffer/buffer.h"
 #include "envoy/common/time.h"
+#include "envoy/config/core/v3/base.pb.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/event/scaled_range_timer_manager.h"
 #include "envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.pb.h"
@@ -55,6 +58,18 @@
 namespace Envoy {
 namespace Http {
 
+const absl::string_view ConnectionManagerImpl::PrematureResetTotalStreamCountKey =
+    "overload.premature_reset_total_stream_count";
+const absl::string_view ConnectionManagerImpl::PrematureResetMinStreamLifetimeSecondsKey =
+    "overload.premature_reset_min_stream_lifetime_seconds";
+// Runtime key for maximum number of requests that can be processed from a single connection per
+// I/O cycle. Requests over this limit are deferred until the next I/O cycle.
+const absl::string_view ConnectionManagerImpl::MaxRequestsPerIoCycle =
+    "http.max_requests_per_io_cycle";
+// Don't attempt to intelligently delay close: https://github.com/envoyproxy/envoy/issues/30010
+const absl::string_view ConnectionManagerImpl::OptionallyDelayClose =
+    "http1.optionally_delay_close";
+
 bool requestWasConnect(const RequestHeaderMapSharedPtr& headers, Protocol protocol) {
   if (!headers) {
     return false;
@@ -84,32 +99,45 @@ ConnectionManagerImpl::generateListenerStats(const std::string& prefix, Stats::S
   return {CONN_MAN_LISTENER_STATS(POOL_COUNTER_PREFIX(scope, prefix))};
 }
 
-ConnectionManagerImpl::ConnectionManagerImpl(ConnectionManagerConfig& config,
-                                             const Network::DrainDecision& drain_close,
-                                             Random::RandomGenerator& random_generator,
-                                             Http::Context& http_context, Runtime::Loader& runtime,
-                                             const LocalInfo::LocalInfo& local_info,
-                                             Upstream::ClusterManager& cluster_manager,
-                                             Server::OverloadManager& overload_manager,
-                                             TimeSource& time_source)
-    : config_(config), stats_(config_.stats()),
+ConnectionManagerImpl::ConnectionManagerImpl(
+    ConnectionManagerConfigSharedPtr config, const Network::DrainDecision& drain_close,
+    Random::RandomGenerator& random_generator, Http::Context& http_context,
+    Runtime::Loader& runtime, const LocalInfo::LocalInfo& local_info,
+    Upstream::ClusterManager& cluster_manager, Server::OverloadManager& overload_manager,
+    TimeSource& time_source, envoy::config::core::v3::TrafficDirection direction)
+    : config_(std::move(config)), stats_(config_->stats()),
       conn_length_(new Stats::HistogramCompletableTimespanImpl(
           stats_.named_.downstream_cx_length_ms_, time_source)),
       drain_close_(drain_close), user_agent_(http_context.userAgentContext()),
       random_generator_(random_generator), runtime_(runtime), local_info_(local_info),
-      cluster_manager_(cluster_manager), listener_stats_(config_.listenerStats()),
+      cluster_manager_(cluster_manager), listener_stats_(config_->listenerStats()),
       overload_manager_(overload_manager),
       overload_state_(overload_manager.getThreadLocalOverloadState()),
-      accept_new_http_stream_(overload_manager.getLoadShedPoint(
-          "envoy.load_shed_points.http_connection_manager_decode_headers")),
+      accept_new_http_stream_(
+          overload_manager.getLoadShedPoint(Server::LoadShedPointName::get().HcmDecodeHeaders)),
+      hcm_ondata_creating_codec_(
+          overload_manager.getLoadShedPoint(Server::LoadShedPointName::get().HcmCodecCreation)),
       overload_stop_accepting_requests_ref_(
           overload_state_.getState(Server::OverloadActionNames::get().StopAcceptingRequests)),
       overload_disable_keepalive_ref_(
           overload_state_.getState(Server::OverloadActionNames::get().DisableHttpKeepAlive)),
       time_source_(time_source), proxy_name_(StreamInfo::ProxyStatusUtils::makeProxyName(
                                      /*node_id=*/local_info_.node().id(),
-                                     /*server_name=*/config_.serverName(),
-                                     /*proxy_status_config=*/config_.proxyStatusConfig())) {}
+                                     /*server_name=*/config_->serverName(),
+                                     /*proxy_status_config=*/config_->proxyStatusConfig())),
+      max_requests_during_dispatch_(
+          runtime_.snapshot().getInteger(ConnectionManagerImpl::MaxRequestsPerIoCycle, UINT32_MAX)),
+      direction_(direction),
+      allow_upstream_half_close_(Runtime::runtimeFeatureEnabled(
+          "envoy.reloadable_features.allow_multiplexed_upstream_half_close")) {
+  ENVOY_LOG_ONCE_IF(
+      trace, accept_new_http_stream_ == nullptr,
+      "LoadShedPoint envoy.load_shed_points.http_connection_manager_decode_headers is not "
+      "found. Is it configured?");
+  ENVOY_LOG_ONCE_IF(trace, hcm_ondata_creating_codec_ == nullptr,
+                    "LoadShedPoint envoy.load_shed_points.hcm_ondata_creating_codec is not found. "
+                    "Is it configured?");
+}
 
 const ResponseHeaderMap& ConnectionManagerImpl::continueHeader() {
   static const auto headers = createHeaderMap<ResponseHeaderMapImpl>(
@@ -120,6 +148,10 @@ const ResponseHeaderMap& ConnectionManagerImpl::continueHeader() {
 void ConnectionManagerImpl::initializeReadFilterCallbacks(Network::ReadFilterCallbacks& callbacks) {
   read_callbacks_ = &callbacks;
   dispatcher_ = &callbacks.connection().dispatcher();
+  if (max_requests_during_dispatch_ != UINT32_MAX) {
+    deferred_request_processing_callback_ =
+        dispatcher_->createSchedulableCallback([this]() -> void { onDeferredRequestProcessing(); });
+  }
 
   stats_.named_.downstream_cx_total_.inc();
   stats_.named_.downstream_cx_active_.inc();
@@ -130,7 +162,7 @@ void ConnectionManagerImpl::initializeReadFilterCallbacks(Network::ReadFilterCal
 
   read_callbacks_->connection().addConnectionCallbacks(*this);
 
-  if (config_.addProxyProtocolConnectionState() &&
+  if (config_->addProxyProtocolConnectionState() &&
       !read_callbacks_->connection()
            .streamInfo()
            .filterState()
@@ -144,20 +176,21 @@ void ConnectionManagerImpl::initializeReadFilterCallbacks(Network::ReadFilterCal
         StreamInfo::FilterState::LifeSpan::Connection);
   }
 
-  if (config_.idleTimeout()) {
+  if (config_->idleTimeout()) {
     connection_idle_timer_ =
         dispatcher_->createScaledTimer(Event::ScaledTimerType::HttpDownstreamIdleConnectionTimeout,
                                        [this]() -> void { onIdleTimeout(); });
-    connection_idle_timer_->enableTimer(config_.idleTimeout().value());
+    connection_idle_timer_->enableTimer(config_->idleTimeout().value());
   }
 
-  if (config_.maxConnectionDuration()) {
+  if (config_->maxConnectionDuration()) {
     connection_duration_timer_ =
-        dispatcher_->createTimer([this]() -> void { onConnectionDurationTimeout(); });
-    connection_duration_timer_->enableTimer(config_.maxConnectionDuration().value());
+        dispatcher_->createScaledTimer(Event::ScaledTimerType::HttpDownstreamMaxConnectionTimeout,
+                                       [this]() -> void { onConnectionDurationTimeout(); });
+    connection_duration_timer_->enableTimer(config_->maxConnectionDuration().value());
   }
 
-  read_callbacks_->connection().setDelayedCloseTimeout(config_.delayedCloseTimeout());
+  read_callbacks_->connection().setDelayedCloseTimeout(config_->delayedCloseTimeout());
 
   read_callbacks_->connection().setConnectionStats(
       {stats_.named_.downstream_cx_rx_bytes_total_, stats_.named_.downstream_cx_rx_bytes_buffered_,
@@ -183,13 +216,18 @@ ConnectionManagerImpl::~ConnectionManagerImpl() {
     }
   }
 
+  if (soft_drain_http1_) {
+    stats_.named_.downstream_cx_http1_soft_drain_.dec();
+  }
+
   conn_length_->complete();
   user_agent_.completeConnectionLength(*conn_length_);
 }
 
 void ConnectionManagerImpl::checkForDeferredClose(bool skip_delay_close) {
   Network::ConnectionCloseType close = Network::ConnectionCloseType::FlushWriteAndDelay;
-  if (skip_delay_close) {
+  if (runtime_.snapshot().getBoolean(ConnectionManagerImpl::OptionallyDelayClose, true) &&
+      skip_delay_close) {
     close = Network::ConnectionCloseType::FlushWrite;
   }
   if (drain_state_ == DrainState::Closing && streams_.empty() && !codec_->wantsToWrite()) {
@@ -212,8 +250,9 @@ void ConnectionManagerImpl::doEndStream(ActiveStream& stream, bool check_for_def
   // here is when Envoy "ends" the stream by calling recreateStream at which point recreateStream
   // explicitly nulls out response_encoder to avoid the downstream being notified of the
   // Envoy-internal stream instance being ended.
-  if (stream.response_encoder_ != nullptr && (!stream.filter_manager_.remoteDecodeComplete() ||
-                                              !stream.state_.codec_saw_local_complete_)) {
+  if (stream.response_encoder_ != nullptr &&
+      (!stream.filter_manager_.hasLastDownstreamByteReceived() ||
+       !stream.state_.codec_saw_local_complete_)) {
     // Indicate local is complete at this point so that if we reset during a continuation, we don't
     // raise further data or trailers.
     ENVOY_STREAM_LOG(debug, "doEndStream() resetting stream", stream);
@@ -226,13 +265,13 @@ void ConnectionManagerImpl::doEndStream(ActiveStream& stream, bool check_for_def
     // communicated via CONNECT_ERROR
     if (requestWasConnect(stream.request_headers_, codec_->protocol()) &&
         (stream.filter_manager_.streamInfo().hasResponseFlag(
-             StreamInfo::ResponseFlag::UpstreamConnectionFailure) ||
+             StreamInfo::CoreResponseFlag::UpstreamConnectionFailure) ||
          stream.filter_manager_.streamInfo().hasResponseFlag(
-             StreamInfo::ResponseFlag::UpstreamConnectionTermination))) {
+             StreamInfo::CoreResponseFlag::UpstreamConnectionTermination))) {
       stream.response_encoder_->getStream().resetStream(StreamResetReason::ConnectError);
     } else {
       if (stream.filter_manager_.streamInfo().hasResponseFlag(
-              StreamInfo::ResponseFlag::UpstreamProtocolError)) {
+              StreamInfo::CoreResponseFlag::UpstreamProtocolError)) {
         stream.response_encoder_->getStream().resetStream(StreamResetReason::ProtocolError);
       } else {
         stream.response_encoder_->getStream().resetStream(StreamResetReason::LocalReset);
@@ -249,22 +288,30 @@ void ConnectionManagerImpl::doEndStream(ActiveStream& stream, bool check_for_def
     drain_state_ = DrainState::Closing;
   }
 
-  // If HTTP/1.0 has no content length, it is framed by close and won't consider
-  // the request complete until the FIN is read. Don't delay close in this case.
-  bool http_10_sans_cl = (codec_->protocol() == Protocol::Http10) &&
-                         (!stream.response_headers_ || !stream.response_headers_->ContentLength());
-  // We also don't delay-close in the case of HTTP/1.1 where the request is
-  // fully read, as there's no race condition to avoid.
-  bool connection_close = stream.state_.saw_connection_close_;
-  bool request_complete = stream.filter_manager_.remoteDecodeComplete();
-
   if (check_for_deferred_close) {
+    // If HTTP/1.0 has no content length, it is framed by close and won't consider
+    // the request complete until the FIN is read. Don't delay close in this case.
+    const bool http_10_sans_cl =
+        (codec_->protocol() == Protocol::Http10) &&
+        (!stream.response_headers_ || !stream.response_headers_->ContentLength());
+    // We also don't delay-close in the case of HTTP/1.1 where the request is
+    // fully read, as there's no race condition to avoid.
+    const bool connection_close =
+        stream.filter_manager_.streamInfo().shouldDrainConnectionUponCompletion();
+    const bool request_complete = stream.filter_manager_.hasLastDownstreamByteReceived();
+
     // Don't do delay close for HTTP/1.0 or if the request is complete.
     checkForDeferredClose(connection_close && (request_complete || http_10_sans_cl));
   }
 }
 
 void ConnectionManagerImpl::doDeferredStreamDestroy(ActiveStream& stream) {
+  if (!stream.state_.is_internally_destroyed_) {
+    ++closed_non_internally_destroyed_requests_;
+    if (isPrematureRstStream(stream)) {
+      ++number_premature_stream_resets_;
+    }
+  }
   if (stream.max_stream_duration_timer_ != nullptr) {
     stream.max_stream_duration_timer_->disableTimer();
     stream.max_stream_duration_timer_ = nullptr;
@@ -283,29 +330,20 @@ void ConnectionManagerImpl::doDeferredStreamDestroy(ActiveStream& stream) {
     stream.access_log_flush_timer_ = nullptr;
   }
 
-  if (stream.expand_agnostic_stream_lifetime_) {
-    // Only destroy the active stream if the underlying codec has notified us of
-    // completion or we've internal redirect the stream.
-    if (!stream.canDestroyStream()) {
-      // Track that this stream is not expecting any additional calls apart from
-      // codec notification.
-      stream.state_.is_zombie_stream_ = true;
-      return;
-    }
+  // Only destroy the active stream if the underlying codec has notified us of
+  // completion or we've internal redirect the stream.
+  if (!stream.canDestroyStream()) {
+    // Track that this stream is not expecting any additional calls apart from
+    // codec notification.
+    stream.state_.is_zombie_stream_ = true;
+    return;
+  }
 
-    if (stream.response_encoder_ != nullptr) {
-      stream.response_encoder_->getStream().registerCodecEventCallbacks(nullptr);
-    }
+  if (stream.response_encoder_ != nullptr) {
+    stream.response_encoder_->getStream().registerCodecEventCallbacks(nullptr);
   }
 
   stream.completeRequest();
-
-  // Set roundtrip time in connectionInfoSetter before OnStreamComplete
-  absl::optional<std::chrono::milliseconds> t = read_callbacks_->connection().lastRoundTripTime();
-  if (t.has_value()) {
-    read_callbacks_->connection().connectionInfoSetter().setRoundTripTime(t.value());
-  }
-
   stream.filter_manager_.onStreamComplete();
 
   // For HTTP/3, skip access logging here and add deferred logging info
@@ -320,7 +358,7 @@ void ConnectionManagerImpl::doDeferredStreamDestroy(ActiveStream& stream) {
     stream.deferHeadersAndTrailers();
   } else {
     // For HTTP/1 and HTTP/2, log here as usual.
-    stream.filter_manager_.log(AccessLog::AccessLogType::DownstreamEnd);
+    stream.log(AccessLog::AccessLogType::DownstreamEnd);
   }
 
   stream.filter_manager_.destroyFilters();
@@ -335,8 +373,15 @@ void ConnectionManagerImpl::doDeferredStreamDestroy(ActiveStream& stream) {
   }
 
   if (connection_idle_timer_ && streams_.empty()) {
-    connection_idle_timer_->enableTimer(config_.idleTimeout().value());
+    connection_idle_timer_->enableTimer(config_->idleTimeout().value());
   }
+  maybeDrainDueToPrematureResets();
+}
+
+RequestDecoderHandlePtr ConnectionManagerImpl::newStreamHandle(ResponseEncoder& response_encoder,
+                                                               bool is_internally_created) {
+  RequestDecoder& decoder = newStream(response_encoder, is_internally_created);
+  return std::make_unique<ActiveStreamHandle>(static_cast<ActiveStream&>(decoder));
 }
 
 RequestDecoder& ConnectionManagerImpl::newStream(ResponseEncoder& response_encoder,
@@ -359,14 +404,14 @@ RequestDecoder& ConnectionManagerImpl::newStream(ResponseEncoder& response_encod
     response_encoder.getStream().setAccount(downstream_stream_account);
   }
 
-  ActiveStreamPtr new_stream(new ActiveStream(*this, response_encoder.getStream().bufferLimit(),
-                                              std::move(downstream_stream_account)));
+  auto new_stream = std::make_unique<ActiveStream>(
+      *this, response_encoder.getStream().bufferLimit(), std::move(downstream_stream_account));
 
   accumulated_requests_++;
-  if (config_.maxRequestsPerConnection() > 0 &&
-      accumulated_requests_ >= config_.maxRequestsPerConnection()) {
+  if (config_->maxRequestsPerConnection() > 0 &&
+      accumulated_requests_ >= config_->maxRequestsPerConnection()) {
     if (codec_->protocol() < Protocol::Http2) {
-      new_stream->state_.saw_connection_close_ = true;
+      new_stream->filter_manager_.streamInfo().setShouldDrainConnectionUponCompletion(true);
       // Prevent erroneous debug log of closing due to incoming connection close header.
       drain_state_ = DrainState::Closing;
     } else if (drain_state_ == DrainState::NotDraining) {
@@ -376,13 +421,22 @@ RequestDecoder& ConnectionManagerImpl::newStream(ResponseEncoder& response_encod
     stats_.named_.downstream_cx_max_requests_reached_.inc();
   }
 
+  if (soft_drain_http1_) {
+    new_stream->filter_manager_.streamInfo().setShouldDrainConnectionUponCompletion(true);
+    // Prevent erroneous debug log of closing due to incoming connection close header.
+    drain_state_ = DrainState::Closing;
+  }
+
   new_stream->state_.is_internally_created_ = is_internally_created;
   new_stream->response_encoder_ = &response_encoder;
   new_stream->response_encoder_->getStream().addCallbacks(*new_stream);
-  if (new_stream->expand_agnostic_stream_lifetime_) {
-    new_stream->response_encoder_->getStream().registerCodecEventCallbacks(new_stream.get());
+  new_stream->response_encoder_->getStream().registerCodecEventCallbacks(new_stream.get());
+  if (config_->streamFlushTimeout().has_value()) {
+    new_stream->response_encoder_->getStream().setFlushTimeout(
+        config_->streamFlushTimeout().value());
+  } else {
+    new_stream->response_encoder_->getStream().setFlushTimeout(config_->streamIdleTimeout());
   }
-  new_stream->response_encoder_->getStream().setFlushTimeout(new_stream->idle_timeout_ms_);
   new_stream->streamInfo().setDownstreamBytesMeter(response_encoder.getStream().bytesMeter());
   // If the network connection is backed up, the stream should be made aware of it on creation.
   // Both HTTP/1.x and HTTP/2 codecs handle this in StreamCallbackHelper::addCallbacksHelper.
@@ -393,7 +447,7 @@ RequestDecoder& ConnectionManagerImpl::newStream(ResponseEncoder& response_encod
 }
 
 void ConnectionManagerImpl::handleCodecErrorImpl(absl::string_view error, absl::string_view details,
-                                                 StreamInfo::ResponseFlag response_flag) {
+                                                 StreamInfo::CoreResponseFlag response_flag) {
   ENVOY_CONN_LOG(debug, "dispatch error: {}", read_callbacks_->connection(), error);
   read_callbacks_->connection().streamInfo().setResponseFlag(response_flag);
 
@@ -404,18 +458,18 @@ void ConnectionManagerImpl::handleCodecErrorImpl(absl::string_view error, absl::
 
 void ConnectionManagerImpl::handleCodecError(absl::string_view error) {
   handleCodecErrorImpl(error, absl::StrCat("codec_error:", StringUtil::replaceAllEmptySpace(error)),
-                       StreamInfo::ResponseFlag::DownstreamProtocolError);
+                       StreamInfo::CoreResponseFlag::DownstreamProtocolError);
 }
 
 void ConnectionManagerImpl::handleCodecOverloadError(absl::string_view error) {
   handleCodecErrorImpl(error,
                        absl::StrCat("overload_error:", StringUtil::replaceAllEmptySpace(error)),
-                       StreamInfo::ResponseFlag::OverloadManager);
+                       StreamInfo::CoreResponseFlag::OverloadManager);
 }
 
 void ConnectionManagerImpl::createCodec(Buffer::Instance& data) {
   ASSERT(!codec_);
-  codec_ = config_.createCodec(read_callbacks_->connection(), data, *this, overload_manager_);
+  codec_ = config_->createCodec(read_callbacks_->connection(), data, *this, overload_manager_);
 
   switch (codec_->protocol()) {
   case Protocol::Http3:
@@ -435,7 +489,14 @@ void ConnectionManagerImpl::createCodec(Buffer::Instance& data) {
 }
 
 Network::FilterStatus ConnectionManagerImpl::onData(Buffer::Instance& data, bool) {
+  requests_during_dispatch_count_ = 0;
   if (!codec_) {
+    // Close connections if Envoy is under pressure, typically memory, before creating codec.
+    if (hcm_ondata_creating_codec_ != nullptr && hcm_ondata_creating_codec_->shouldShedLoad()) {
+      stats_.named_.downstream_rq_overload_close_.inc();
+      handleCodecOverloadError("onData codec creation overload");
+      return Network::FilterStatus::StopIteration;
+    }
     // Http3 codec should have been instantiated by now.
     createCodec(data);
   }
@@ -454,9 +515,6 @@ Network::FilterStatus ConnectionManagerImpl::onData(Buffer::Instance& data, bool
       handleCodecError(status.message());
       return Network::FilterStatus::StopIteration;
     } else if (isEnvoyOverloadError(status)) {
-      // The other codecs aren't wired to send this status.
-      ASSERT(codec_->protocol() < Protocol::Http2,
-             "Expected only HTTP1.1 and below to send overload error.");
       stats_.named_.downstream_rq_overload_close_.inc();
       handleCodecOverloadError(status.message());
       return Network::FilterStatus::StopIteration;
@@ -499,8 +557,8 @@ Network::FilterStatus ConnectionManagerImpl::onNewConnection() {
   return Network::FilterStatus::StopIteration;
 }
 
-void ConnectionManagerImpl::resetAllStreams(absl::optional<StreamInfo::ResponseFlag> response_flag,
-                                            absl::string_view details) {
+void ConnectionManagerImpl::resetAllStreams(
+    absl::optional<StreamInfo::CoreResponseFlag> response_flag, absl::string_view details) {
   while (!streams_.empty()) {
     // Mimic a downstream reset in this case. We must also remove callbacks here. Though we are
     // about to close the connection and will disable further reads, it is possible that flushing
@@ -555,13 +613,14 @@ void ConnectionManagerImpl::onEvent(Network::ConnectionEvent event) {
     // NOTE: In the case where a local close comes from outside the filter, this will cause any
     // stream closures to increment remote close stats. We should do better here in the future,
     // via the pre-close callback mentioned above.
-    doConnectionClose(absl::nullopt, absl::nullopt, details);
+    doConnectionClose(absl::nullopt, StreamInfo::CoreResponseFlag::DownstreamConnectionTermination,
+                      details);
   }
 }
 
 void ConnectionManagerImpl::doConnectionClose(
     absl::optional<Network::ConnectionCloseType> close_type,
-    absl::optional<StreamInfo::ResponseFlag> response_flag, absl::string_view details) {
+    absl::optional<StreamInfo::CoreResponseFlag> response_flag, absl::string_view details) {
   if (connection_idle_timer_) {
     connection_idle_timer_->disableTimer();
     connection_idle_timer_.reset();
@@ -601,6 +660,80 @@ void ConnectionManagerImpl::doConnectionClose(
   }
 }
 
+bool ConnectionManagerImpl::isPrematureRstStream(const ActiveStream& stream) const {
+  // Check if the request was prematurely reset, by comparing its lifetime to the configured
+  // threshold.
+  ASSERT(!stream.state_.is_internally_destroyed_);
+  absl::optional<std::chrono::nanoseconds> duration =
+      stream.filter_manager_.streamInfo().currentDuration();
+
+  // Check if request lifetime is longer than the premature reset threshold.
+  if (duration) {
+    const uint64_t lifetime = std::chrono::duration_cast<std::chrono::seconds>(*duration).count();
+    const uint64_t min_lifetime = runtime_.snapshot().getInteger(
+        ConnectionManagerImpl::PrematureResetMinStreamLifetimeSecondsKey, 1);
+    if (lifetime > min_lifetime) {
+      return false;
+    }
+  }
+
+  // If request has completed before configured threshold, also check if the Envoy proxied the
+  // response from the upstream. Requests without the response status were reset.
+  // TODO(RyanTheOptimist): Possibly support half_closed_local instead.
+  return !stream.filter_manager_.streamInfo().responseCode();
+}
+
+// Sends a GOAWAY if too many streams have been reset prematurely on this
+// connection.
+void ConnectionManagerImpl::maybeDrainDueToPrematureResets() {
+  // If the connection has been drained due to premature resets, do not check this again.
+  // Without this flag, recursion may occur, as shown in the following stack trace:
+  //
+  //   maybeDrainDueToPrematureResets()
+  //   doConnectionClose()
+  //   resetAllStreams()
+  //   onResetStream()
+  //   doDeferredStreamDestroy()
+  //   maybeDrainDueToPrematureResets()
+  //   ...
+  //
+  // The recursion will continue until all streams are destroyed. If there are many streams
+  // that may result in a stack overflow. This flag is used to avoid above recursion.
+  if (drained_due_to_premature_resets_) {
+    return;
+  }
+
+  if (closed_non_internally_destroyed_requests_ == 0) {
+    return;
+  }
+
+  const uint64_t limit =
+      runtime_.snapshot().getInteger(ConnectionManagerImpl::PrematureResetTotalStreamCountKey, 500);
+
+  if (closed_non_internally_destroyed_requests_ < limit) {
+    // Even though the total number of streams have not reached `limit`, check if the number of bad
+    // streams is high enough that even if every subsequent stream is good, the connection
+    // would be closed once the limit is reached, and if so close the connection now.
+    if (number_premature_stream_resets_ * 2 < limit) {
+      return;
+    }
+  } else {
+    if (number_premature_stream_resets_ * 2 < closed_non_internally_destroyed_requests_) {
+      return;
+    }
+  }
+
+  if (read_callbacks_->connection().state() == Network::Connection::State::Open) {
+    stats_.named_.downstream_rq_too_many_premature_resets_.inc();
+
+    // Mark the the connection has been drained due to too many premature resets.
+    drained_due_to_premature_resets_ = true;
+
+    doConnectionClose(Network::ConnectionCloseType::Abort, absl::nullopt,
+                      "too_many_premature_resets");
+  }
+}
+
 void ConnectionManagerImpl::onGoAway(GoAwayErrorCode) {
   // Currently we do nothing with remote go away frames. In the future we can decide to no longer
   // push resources if applicable.
@@ -625,10 +758,18 @@ void ConnectionManagerImpl::onConnectionDurationTimeout() {
   if (!codec_) {
     // Attempt to write out buffered data one last time and issue a local close if successful.
     doConnectionClose(Network::ConnectionCloseType::FlushWrite,
-                      StreamInfo::ResponseFlag::DurationTimeout,
+                      StreamInfo::CoreResponseFlag::DurationTimeout,
                       StreamInfo::ResponseCodeDetails::get().DurationTimeout);
   } else if (drain_state_ == DrainState::NotDraining) {
-    startDrainSequence();
+    if (config_->http1SafeMaxConnectionDuration() && codec_->protocol() < Protocol::Http2) {
+      ENVOY_CONN_LOG(debug,
+                     "HTTP1-safe max connection duration is configured -- skipping drain sequence.",
+                     read_callbacks_->connection());
+      stats_.named_.downstream_cx_http1_soft_drain_.inc();
+      soft_drain_http1_ = true;
+    } else {
+      startDrainSequence();
+    }
   }
 }
 
@@ -637,6 +778,18 @@ void ConnectionManagerImpl::onDrainTimeout() {
   codec_->goAway();
   drain_state_ = DrainState::Closing;
   checkForDeferredClose(false);
+}
+
+void ConnectionManagerImpl::sendGoAwayAndClose() {
+  ENVOY_CONN_LOG(trace, "connection manager sendGoAwayAndClose was triggerred from filters.",
+                 read_callbacks_->connection());
+  if (go_away_sent_) {
+    return;
+  }
+  codec_->goAway();
+  go_away_sent_ = true;
+  doConnectionClose(Network::ConnectionCloseType::FlushWriteAndDelay, absl::nullopt,
+                    "forced_goaway");
 }
 
 void ConnectionManagerImpl::chargeTracingStats(const Tracing::Reason& tracing_reason,
@@ -657,129 +810,83 @@ void ConnectionManagerImpl::chargeTracingStats(const Tracing::Reason& tracing_re
   }
 }
 
-// TODO(chaoqin-li1123): Make on demand vhds and on demand srds works at the same time.
-void ConnectionManagerImpl::RdsRouteConfigUpdateRequester::requestRouteConfigUpdate(
-    Http::RouteConfigUpdatedCallbackSharedPtr route_config_updated_cb) {
-  absl::optional<Router::ConfigConstSharedPtr> route_config = parent_.routeConfig();
-  Event::Dispatcher& thread_local_dispatcher = *parent_.connection_manager_.dispatcher_;
-  if (route_config.has_value() && route_config.value()->usesVhds()) {
-    ASSERT(!parent_.request_headers_->Host()->value().empty());
-    const auto& host_header = absl::AsciiStrToLower(parent_.request_headers_->getHostValue());
-    requestVhdsUpdate(host_header, thread_local_dispatcher, std::move(route_config_updated_cb));
-    return;
-  } else if (scope_key_builder_.has_value()) {
-    Router::ScopeKeyPtr scope_key = scope_key_builder_->computeScopeKey(*parent_.request_headers_);
-    // If scope_key is not null, the scope exists but RouteConfiguration is not initialized.
-    if (scope_key != nullptr) {
-      requestSrdsUpdate(std::move(scope_key), thread_local_dispatcher,
-                        std::move(route_config_updated_cb));
-      return;
-    }
-  }
-  // Continue the filter chain if no on demand update is requested.
-  (*route_config_updated_cb)(false);
-}
-
-void ConnectionManagerImpl::RdsRouteConfigUpdateRequester::requestVhdsUpdate(
-    const std::string& host_header, Event::Dispatcher& thread_local_dispatcher,
-    Http::RouteConfigUpdatedCallbackSharedPtr route_config_updated_cb) {
-  route_config_provider_->requestVirtualHostsUpdate(host_header, thread_local_dispatcher,
-                                                    std::move(route_config_updated_cb));
-}
-
-void ConnectionManagerImpl::RdsRouteConfigUpdateRequester::requestSrdsUpdate(
-    Router::ScopeKeyPtr scope_key, Event::Dispatcher& thread_local_dispatcher,
-    Http::RouteConfigUpdatedCallbackSharedPtr route_config_updated_cb) {
-  // Since inline scope_route_config_provider is not fully implemented and never used,
-  // dynamic cast in constructor always succeed and the pointer should not be null here.
-  ASSERT(scoped_route_config_provider_ != nullptr);
-  Http::RouteConfigUpdatedCallback scoped_route_config_updated_cb =
-      Http::RouteConfigUpdatedCallback(
-          [this, weak_route_config_updated_cb = std::weak_ptr<Http::RouteConfigUpdatedCallback>(
-                     route_config_updated_cb)](bool scope_exist) {
-            // If the callback can be locked, this ActiveStream is still alive.
-            if (auto cb = weak_route_config_updated_cb.lock()) {
-              // Refresh the route before continue the filter chain.
-              if (scope_exist) {
-                parent_.refreshCachedRoute();
-              }
-              (*cb)(scope_exist && parent_.hasCachedRoute());
-            }
-          });
-  scoped_route_config_provider_->onDemandRdsUpdate(std::move(scope_key), thread_local_dispatcher,
-                                                   std::move(scoped_route_config_updated_cb));
-}
-
 absl::optional<absl::string_view>
 ConnectionManagerImpl::HttpStreamIdProviderImpl::toStringView() const {
   if (parent_.request_headers_ == nullptr) {
     return {};
   }
-  ASSERT(parent_.connection_manager_.config_.requestIDExtension() != nullptr);
-  return parent_.connection_manager_.config_.requestIDExtension()->get(*parent_.request_headers_);
+  ASSERT(parent_.connection_manager_.config_->requestIDExtension() != nullptr);
+  return parent_.connection_manager_.config_->requestIDExtension()->get(*parent_.request_headers_);
 }
 
 absl::optional<uint64_t> ConnectionManagerImpl::HttpStreamIdProviderImpl::toInteger() const {
   if (parent_.request_headers_ == nullptr) {
     return {};
   }
-  ASSERT(parent_.connection_manager_.config_.requestIDExtension() != nullptr);
-  return parent_.connection_manager_.config_.requestIDExtension()->getInteger(
+  ASSERT(parent_.connection_manager_.config_->requestIDExtension() != nullptr);
+  return parent_.connection_manager_.config_->requestIDExtension()->getInteger(
       *parent_.request_headers_);
 }
+
+namespace {
+constexpr absl::string_view kRouteFactoryName = "envoy.route_config_update_requester.default";
+} // namespace
 
 ConnectionManagerImpl::ActiveStream::ActiveStream(ConnectionManagerImpl& connection_manager,
                                                   uint32_t buffer_limit,
                                                   Buffer::BufferMemoryAccountSharedPtr account)
     : connection_manager_(connection_manager),
-      connection_manager_tracing_config_(connection_manager_.config_.tracingConfig() == nullptr
+      connection_manager_tracing_config_(connection_manager_.config_->tracingConfig() == nullptr
                                              ? absl::nullopt
                                              : makeOptRef<const TracingConnectionManagerConfig>(
-                                                   *connection_manager_.config_.tracingConfig())),
+                                                   *connection_manager_.config_->tracingConfig())),
       stream_id_(connection_manager.random_generator_.random()),
       filter_manager_(*this, *connection_manager_.dispatcher_,
                       connection_manager_.read_callbacks_->connection(), stream_id_,
-                      std::move(account), connection_manager_.config_.proxy100Continue(),
-                      buffer_limit, connection_manager_.config_.filterFactory(),
-                      connection_manager_.config_.localReply(),
+                      std::move(account), connection_manager_.config_->proxy100Continue(),
+                      buffer_limit, connection_manager_.config_->filterFactory(),
+                      connection_manager_.config_->localReply(),
                       connection_manager_.codec_->protocol(), connection_manager_.timeSource(),
                       connection_manager_.read_callbacks_->connection().streamInfo().filterState(),
-                      StreamInfo::FilterState::LifeSpan::Connection),
+                      connection_manager_.overload_manager_),
       request_response_timespan_(new Stats::HistogramCompletableTimespanImpl(
           connection_manager_.stats_.named_.downstream_rq_time_, connection_manager_.timeSource())),
-      expand_agnostic_stream_lifetime_(
-          Runtime::runtimeFeatureEnabled(Runtime::expand_agnostic_stream_lifetime)),
+      has_explicit_global_flush_timeout_(
+          connection_manager.config_->streamFlushTimeout().has_value()),
       header_validator_(
-          connection_manager.config_.makeHeaderValidator(connection_manager.codec_->protocol())) {
-  ASSERT(!connection_manager.config_.isRoutable() ||
-             ((connection_manager.config_.routeConfigProvider() == nullptr &&
-               connection_manager.config_.scopedRouteConfigProvider() != nullptr &&
-               connection_manager.config_.scopeKeyBuilder().has_value()) ||
-              (connection_manager.config_.routeConfigProvider() != nullptr &&
-               connection_manager.config_.scopedRouteConfigProvider() == nullptr &&
-               !connection_manager.config_.scopeKeyBuilder().has_value())),
+          connection_manager.config_->makeHeaderValidator(connection_manager.codec_->protocol())),
+      trace_refresh_after_route_refresh_(Runtime::runtimeFeatureEnabled(
+          "envoy.reloadable_features.trace_refresh_after_route_refresh")) {
+  ASSERT(!connection_manager.config_->isRoutable() ||
+             ((connection_manager.config_->routeConfigProvider() == nullptr &&
+               connection_manager.config_->scopedRouteConfigProvider() != nullptr &&
+               connection_manager.config_->scopeKeyBuilder().has_value()) ||
+              (connection_manager.config_->routeConfigProvider() != nullptr &&
+               connection_manager.config_->scopedRouteConfigProvider() == nullptr &&
+               !connection_manager.config_->scopeKeyBuilder().has_value())),
          "Either routeConfigProvider or (scopedRouteConfigProvider and scopeKeyBuilder) should be "
          "set in "
          "ConnectionManagerImpl.");
-  for (const AccessLog::InstanceSharedPtr& access_log : connection_manager_.config_.accessLogs()) {
-    filter_manager_.addAccessLogHandler(access_log);
-  }
 
   filter_manager_.streamInfo().setStreamIdProvider(
       std::make_shared<HttpStreamIdProviderImpl>(*this));
 
-  if (connection_manager_.config_.isRoutable() &&
-      connection_manager.config_.routeConfigProvider() != nullptr) {
-    route_config_update_requester_ =
-        std::make_unique<ConnectionManagerImpl::RdsRouteConfigUpdateRequester>(
-            connection_manager.config_.routeConfigProvider(), *this);
-  } else if (connection_manager_.config_.isRoutable() &&
-             connection_manager.config_.scopedRouteConfigProvider() != nullptr &&
-             connection_manager.config_.scopeKeyBuilder().has_value()) {
-    route_config_update_requester_ =
-        std::make_unique<ConnectionManagerImpl::RdsRouteConfigUpdateRequester>(
-            connection_manager.config_.scopedRouteConfigProvider(),
-            connection_manager.config_.scopeKeyBuilder(), *this);
+  filter_manager_.streamInfo().setShouldSchemeMatchUpstream(
+      connection_manager.config_->shouldSchemeMatchUpstream());
+
+  // TODO(chaoqin-li1123): can this be moved to the on demand filter?
+  auto factory = Envoy::Config::Utility::getFactoryByName<RouteConfigUpdateRequesterFactory>(
+      kRouteFactoryName);
+  if (connection_manager_.config_->isRoutable() &&
+      connection_manager.config_->routeConfigProvider() != nullptr && factory) {
+    route_config_update_requester_ = factory->createRouteConfigUpdateRequester(
+        connection_manager.config_->routeConfigProvider());
+  } else if (connection_manager_.config_->isRoutable() &&
+             connection_manager.config_->scopedRouteConfigProvider() != nullptr &&
+             connection_manager.config_->scopeKeyBuilder().has_value() && factory) {
+    route_config_update_requester_ = factory->createRouteConfigUpdateRequester(
+        connection_manager.config_->scopedRouteConfigProvider(),
+        connection_manager.config_->scopeKeyBuilder());
   }
   ScopeTrackerScopeState scope(this,
                                connection_manager_.read_callbacks_->connection().dispatcher());
@@ -794,62 +901,78 @@ ConnectionManagerImpl::ActiveStream::ActiveStream(ConnectionManagerImpl& connect
     connection_manager_.stats_.named_.downstream_rq_http1_total_.inc();
   }
 
-  if (connection_manager_.config_.streamIdleTimeout().count()) {
-    idle_timeout_ms_ = connection_manager_.config_.streamIdleTimeout();
+  if (connection_manager_.config_->streamIdleTimeout().count()) {
+    idle_timeout_ms_ = connection_manager_.config_->streamIdleTimeout();
     stream_idle_timer_ = connection_manager_.dispatcher_->createScaledTimer(
         Event::ScaledTimerType::HttpDownstreamIdleStreamTimeout,
         [this]() -> void { onIdleTimeout(); });
     resetIdleTimer();
   }
 
-  if (connection_manager_.config_.requestTimeout().count()) {
-    std::chrono::milliseconds request_timeout = connection_manager_.config_.requestTimeout();
+  if (connection_manager_.config_->requestTimeout().count()) {
+    std::chrono::milliseconds request_timeout = connection_manager_.config_->requestTimeout();
     request_timer_ =
         connection_manager.dispatcher_->createTimer([this]() -> void { onRequestTimeout(); });
     request_timer_->enableTimer(request_timeout, this);
   }
 
-  if (connection_manager_.config_.requestHeadersTimeout().count()) {
+  if (connection_manager_.config_->requestHeadersTimeout().count()) {
     std::chrono::milliseconds request_headers_timeout =
-        connection_manager_.config_.requestHeadersTimeout();
+        connection_manager_.config_->requestHeadersTimeout();
     request_header_timer_ =
         connection_manager.dispatcher_->createTimer([this]() -> void { onRequestHeaderTimeout(); });
     request_header_timer_->enableTimer(request_headers_timeout, this);
   }
 
-  const auto max_stream_duration = connection_manager_.config_.maxStreamDuration();
+  const auto max_stream_duration = connection_manager_.config_->maxStreamDuration();
   if (max_stream_duration.has_value() && max_stream_duration.value().count()) {
     max_stream_duration_timer_ = connection_manager.dispatcher_->createTimer(
         [this]() -> void { onStreamMaxDurationReached(); });
-    max_stream_duration_timer_->enableTimer(connection_manager_.config_.maxStreamDuration().value(),
-                                            this);
+    max_stream_duration_timer_->enableTimer(
+        connection_manager_.config_->maxStreamDuration().value(), this);
   }
 
-  if (connection_manager_.config_.accessLogFlushInterval().has_value()) {
+  if (connection_manager_.config_->accessLogFlushInterval().has_value()) {
     access_log_flush_timer_ = connection_manager.dispatcher_->createTimer([this]() -> void {
       // If the request is complete, we've already done the stream-end access-log, and shouldn't
       // do the periodic log.
       if (!streamInfo().requestComplete().has_value()) {
-        filter_manager_.log(AccessLog::AccessLogType::DownstreamPeriodic);
+        log(AccessLog::AccessLogType::DownstreamPeriodic);
         refreshAccessLogFlushTimer();
+      }
+      const SystemTime now = connection_manager_.timeSource().systemTime();
+      // Downstream bytes meter is guaranteed to be non-null because ActiveStream and the timer
+      // event are created on the same thread that sets the meter in
+      // ConnectionManagerImpl::newStream.
+      filter_manager_.streamInfo().getDownstreamBytesMeter()->takeDownstreamPeriodicLoggingSnapshot(
+          now);
+      if (auto& upstream_bytes_meter = filter_manager_.streamInfo().getUpstreamBytesMeter();
+          upstream_bytes_meter != nullptr) {
+        upstream_bytes_meter->takeDownstreamPeriodicLoggingSnapshot(now);
       }
     });
     refreshAccessLogFlushTimer();
   }
 }
 
+void ConnectionManagerImpl::ActiveStream::log(AccessLog::AccessLogType type) {
+  const Formatter::HttpFormatterContext log_context{
+      request_headers_.get(), response_headers_.get(), response_trailers_.get(), {}, type,
+      active_span_.get()};
+
+  filter_manager_.log(log_context);
+
+  for (const auto& access_logger : connection_manager_.config_->accessLogs()) {
+    access_logger->log(log_context, filter_manager_.streamInfo());
+  }
+}
+
 void ConnectionManagerImpl::ActiveStream::completeRequest() {
   filter_manager_.streamInfo().onRequestComplete();
 
-  if (connection_manager_.remote_close_) {
-    filter_manager_.streamInfo().setResponseCodeDetails(
-        StreamInfo::ResponseCodeDetails::get().DownstreamRemoteDisconnect);
-    filter_manager_.streamInfo().setResponseFlag(
-        StreamInfo::ResponseFlag::DownstreamConnectionTermination);
-  }
   connection_manager_.stats_.named_.downstream_rq_active_.dec();
   if (filter_manager_.streamInfo().healthCheck()) {
-    connection_manager_.config_.tracingStats().health_check_.inc();
+    connection_manager_.config_->tracingStats().health_check_.inc();
   }
 
   if (active_span_) {
@@ -874,40 +997,50 @@ void ConnectionManagerImpl::ActiveStream::resetIdleTimer() {
 void ConnectionManagerImpl::ActiveStream::onIdleTimeout() {
   connection_manager_.stats_.named_.downstream_rq_idle_timeout_.inc();
 
-  filter_manager_.streamInfo().setResponseFlag(StreamInfo::ResponseFlag::StreamIdleTimeout);
-  sendLocalReply(Http::Utility::maybeRequestTimeoutCode(filter_manager_.remoteDecodeComplete()),
-                 "stream timeout", nullptr, absl::nullopt,
-                 StreamInfo::ResponseCodeDetails::get().StreamIdleTimeout);
+  filter_manager_.streamInfo().setResponseFlag(StreamInfo::CoreResponseFlag::StreamIdleTimeout);
+  sendLocalReply(
+      Http::Utility::maybeRequestTimeoutCode(filter_manager_.hasLastDownstreamByteReceived()),
+      "stream timeout", nullptr, absl::nullopt,
+      StreamInfo::ResponseCodeDetails::get().StreamIdleTimeout);
 }
 
 void ConnectionManagerImpl::ActiveStream::onRequestTimeout() {
   connection_manager_.stats_.named_.downstream_rq_timeout_.inc();
-  sendLocalReply(Http::Utility::maybeRequestTimeoutCode(filter_manager_.remoteDecodeComplete()),
-                 "request timeout", nullptr, absl::nullopt,
-                 StreamInfo::ResponseCodeDetails::get().RequestOverallTimeout);
+  sendLocalReply(
+      Http::Utility::maybeRequestTimeoutCode(filter_manager_.hasLastDownstreamByteReceived()),
+      "request timeout", nullptr, absl::nullopt,
+      StreamInfo::ResponseCodeDetails::get().RequestOverallTimeout);
 }
 
 void ConnectionManagerImpl::ActiveStream::onRequestHeaderTimeout() {
   connection_manager_.stats_.named_.downstream_rq_header_timeout_.inc();
-  sendLocalReply(Http::Utility::maybeRequestTimeoutCode(filter_manager_.remoteDecodeComplete()),
-                 "request header timeout", nullptr, absl::nullopt,
-                 StreamInfo::ResponseCodeDetails::get().RequestHeaderTimeout);
+  sendLocalReply(
+      Http::Utility::maybeRequestTimeoutCode(filter_manager_.hasLastDownstreamByteReceived()),
+      "request header timeout", nullptr, absl::nullopt,
+      StreamInfo::ResponseCodeDetails::get().RequestHeaderTimeout);
 }
 
 void ConnectionManagerImpl::ActiveStream::onStreamMaxDurationReached() {
   ENVOY_STREAM_LOG(debug, "Stream max duration time reached", *this);
   connection_manager_.stats_.named_.downstream_rq_max_duration_reached_.inc();
-  sendLocalReply(Http::Utility::maybeRequestTimeoutCode(filter_manager_.remoteDecodeComplete()),
-                 "downstream duration timeout", nullptr,
-                 Grpc::Status::WellKnownGrpcStatus::DeadlineExceeded,
-                 StreamInfo::ResponseCodeDetails::get().MaxDurationTimeout);
+  sendLocalReply(
+      Http::Utility::maybeRequestTimeoutCode(filter_manager_.hasLastDownstreamByteReceived()),
+      "downstream duration timeout", nullptr, Grpc::Status::WellKnownGrpcStatus::DeadlineExceeded,
+      StreamInfo::ResponseCodeDetails::get().MaxDurationTimeout);
 }
 
 void ConnectionManagerImpl::ActiveStream::chargeStats(const ResponseHeaderMap& headers) {
-  uint64_t response_code = Utility::getResponseStatus(headers);
-  filter_manager_.streamInfo().response_code_ = response_code;
+  if (trace_refresh_after_route_refresh_ && connection_manager_tracing_config_.has_value()) {
+    const Tracing::Decision tracing_decision =
+        Tracing::TracerUtility::shouldTraceRequest(filter_manager_.streamInfo());
+    ConnectionManagerImpl::chargeTracingStats(tracing_decision.reason,
+                                              connection_manager_.config_->tracingStats());
+  }
 
-  if (filter_manager_.streamInfo().health_check_request_) {
+  uint64_t response_code = Utility::getResponseStatus(headers);
+  filter_manager_.streamInfo().setResponseCode(response_code);
+
+  if (filter_manager_.streamInfo().healthCheck()) {
     return;
   }
 
@@ -951,11 +1084,95 @@ uint32_t ConnectionManagerImpl::ActiveStream::localPort() {
   return ip->port();
 }
 
+namespace {
+bool streamErrorOnlyErrors(absl::string_view error_details) {
+  // Pre UHV HCM did not respect stream_error_on_invalid_http_message
+  // and only sent 400 for specific errors.
+  // TODO(#28555): make these errors respect the stream_error_on_invalid_http_message
+  return error_details == UhvResponseCodeDetail::get().FragmentInUrlPath ||
+         error_details == UhvResponseCodeDetail::get().EscapedSlashesInPath ||
+         error_details == UhvResponseCodeDetail::get().Percent00InPath;
+}
+} // namespace
+
+void ConnectionManagerImpl::ActiveStream::setRequestDecorator(RequestHeaderMap& headers) {
+  ASSERT(active_span_ != nullptr);
+
+  const Router::Decorator* decorater =
+      hasCachedRoute() ? cached_route_.value()->decorator() : nullptr;
+
+  // If a decorator has been defined, apply it to the active span.
+  absl::string_view decorated_operation;
+  if (decorater != nullptr) {
+    decorated_operation = decorater->getOperation();
+
+    decorater->apply(*active_span_);
+    state_.decorated_propagate_ = decorater->propagate();
+  }
+
+  if (connection_manager_tracing_config_->operation_name_ == Tracing::OperationName::Egress) {
+    // For egress (outbound) requests, pass the decorator's operation name (if defined and
+    // propagation enabled) as a request header to enable the receiving service to use it in its
+    // server span.
+    if (!decorated_operation.empty() && state_.decorated_propagate_) {
+      headers.setEnvoyDecoratorOperation(decorated_operation);
+    }
+  } else {
+    absl::string_view req_operation_override = headers.getEnvoyDecoratorOperationValue();
+
+    // For ingress (inbound) requests, if a decorator operation name has been provided, it
+    // should be used to override the active span's operation.
+    if (!req_operation_override.empty()) {
+      active_span_->setOperation(req_operation_override);
+
+      // Set the decorator operation as overridden to avoid propagating the route decorator
+      // operation to the client when the setResponseDecorator() is called.
+      state_.decorator_overriden_ = true;
+    }
+    // Remove header so not propagated to service
+    headers.removeEnvoyDecoratorOperation();
+  }
+}
+
+void ConnectionManagerImpl::ActiveStream::setResponseDecorator(ResponseHeaderMap& headers) {
+  ASSERT(active_span_ != nullptr);
+
+  if (connection_manager_tracing_config_->operation_name_ == Tracing::OperationName::Ingress) {
+    // For ingress (inbound) responses, if the request headers do not include a
+    // decorator operation (override), and the decorated operation should be
+    // propagated, then pass the decorator's operation name (if defined)
+    // as a response header to enable the client service to use it in its client span.
+    if (state_.decorated_propagate_ && !state_.decorator_overriden_) {
+      const Router::Decorator* decorater =
+          hasCachedRoute() ? cached_route_.value()->decorator() : nullptr;
+      absl::string_view decorated_operation =
+          decorater != nullptr ? decorater->getOperation() : absl::string_view();
+
+      if (!decorated_operation.empty()) {
+        // If the decorator operation is defined, set it as the response header.
+        headers.setEnvoyDecoratorOperation(decorated_operation);
+      }
+    }
+  } else if (connection_manager_tracing_config_->operation_name_ ==
+             Tracing::OperationName::Egress) {
+    const absl::string_view resp_operation_override = headers.getEnvoyDecoratorOperationValue();
+
+    // For Egress (outbound) response, if a decorator operation name has been provided, it
+    // should be used to override the active span's operation.
+    if (!resp_operation_override.empty()) {
+      active_span_->setOperation(resp_operation_override);
+    }
+    // Remove header so not propagated to service.
+    headers.removeEnvoyDecoratorOperation();
+  }
+}
+
 bool ConnectionManagerImpl::ActiveStream::validateHeaders() {
   if (header_validator_) {
     auto validation_result = header_validator_->validateRequestHeaders(*request_headers_);
     bool failure = !validation_result.ok();
     bool redirect = false;
+    bool is_grpc = Grpc::Common::hasGrpcContentType(*request_headers_);
     std::string failure_details(validation_result.details());
     if (!failure) {
       auto transformation_result = header_validator_->transformRequestHeaders(*request_headers_);
@@ -963,6 +1180,11 @@ bool ConnectionManagerImpl::ActiveStream::validateHeaders() {
       redirect = transformation_result.action() ==
                  Http::ServerHeaderValidator::RequestHeadersTransformationResult::Action::Redirect;
       failure_details = std::string(transformation_result.details());
+      if (redirect && !is_grpc) {
+        connection_manager_.stats_.named_.downstream_rq_redirected_with_normalized_path_.inc();
+      } else if (failure) {
+        connection_manager_.stats_.named_.downstream_rq_failed_path_normalization_.inc();
+      }
     }
     if (failure) {
       std::function<void(ResponseHeaderMap & headers)> modify_headers;
@@ -970,7 +1192,6 @@ bool ConnectionManagerImpl::ActiveStream::validateHeaders() {
                                ? Code::NotImplemented
                                : Code::BadRequest;
       absl::optional<Grpc::Status::GrpcStatus> grpc_status;
-      bool is_grpc = Grpc::Common::hasGrpcContentType(*request_headers_);
       if (redirect && !is_grpc) {
         response_code = Code::TemporaryRedirect;
         modify_headers = [new_path = request_headers_->Path()->value().getStringView()](
@@ -990,7 +1211,8 @@ bool ConnectionManagerImpl::ActiveStream::validateHeaders() {
         resetStream();
       } else {
         sendLocalReply(response_code, "", modify_headers, grpc_status, failure_details);
-        if (!response_encoder_->streamErrorOnInvalidHttpMessage()) {
+        if (!response_encoder_->streamErrorOnInvalidHttpMessage() &&
+            !streamErrorOnlyErrors(failure_details)) {
           connection_manager_.handleCodecError(failure_details);
         }
       }
@@ -1001,15 +1223,15 @@ bool ConnectionManagerImpl::ActiveStream::validateHeaders() {
   return true;
 }
 
-bool ConnectionManagerImpl::ActiveStream::validateTrailers() {
+bool ConnectionManagerImpl::ActiveStream::validateTrailers(RequestTrailerMap& trailers) {
   if (!header_validator_) {
     return true;
   }
 
-  auto validation_result = header_validator_->validateRequestTrailers(*request_trailers_);
+  auto validation_result = header_validator_->validateRequestTrailers(trailers);
   std::string failure_details(validation_result.details());
   if (validation_result.ok()) {
-    auto transformation_result = header_validator_->transformRequestTrailers(*request_trailers_);
+    auto transformation_result = header_validator_->transformRequestTrailers(trailers);
     if (transformation_result.ok()) {
       return true;
     }
@@ -1044,12 +1266,12 @@ bool ConnectionManagerImpl::ActiveStream::validateTrailers() {
   return false;
 }
 
-void ConnectionManagerImpl::ActiveStream::maybeEndDecode(bool end_stream) {
+void ConnectionManagerImpl::ActiveStream::maybeRecordLastByteReceived(bool end_stream) {
   // If recreateStream is called, the HCM rewinds state and may send more encodeData calls.
-  if (end_stream && !filter_manager_.remoteDecodeComplete()) {
+  if (end_stream && !filter_manager_.hasLastDownstreamByteReceived()) {
     filter_manager_.streamInfo().downstreamTiming().onLastDownstreamRxByteReceived(
         connection_manager_.dispatcher_->timeSource());
-    ENVOY_STREAM_LOG(debug, "request end stream", *this);
+    ENVOY_STREAM_LOG(debug, "request end stream timestamp recorded", *this);
   }
 }
 
@@ -1067,6 +1289,12 @@ void ConnectionManagerImpl::ActiveStream::decodeHeaders(RequestHeaderMapSharedPt
                                                         bool end_stream) {
   ENVOY_STREAM_LOG(debug, "request headers complete (end_stream={}):\n{}", *this, end_stream,
                    *headers);
+  // We only want to record this when reading the headers the first time, not when recreating
+  // a stream.
+  if (!filter_manager_.hasLastDownstreamByteReceived()) {
+    filter_manager_.streamInfo().downstreamTiming().onLastDownstreamHeaderRxByteReceived(
+        connection_manager_.dispatcher_->timeSource());
+  }
   ScopeTrackerScopeState scope(this,
                                connection_manager_.read_callbacks_->connection().dispatcher());
   request_headers_ = std::move(headers);
@@ -1076,14 +1304,20 @@ void ConnectionManagerImpl::ActiveStream::decodeHeaders(RequestHeaderMapSharedPt
     request_header_timer_.reset();
   }
 
-  // Both saw_connection_close_ and is_head_request_ affect local replies: set
-  // them as early as possible.
+  // Both shouldDrainConnectionUponCompletion() and is_head_request_ affect local replies: set them
+  // as early as possible.
   const Protocol protocol = connection_manager_.codec_->protocol();
-  state_.saw_connection_close_ = HeaderUtility::shouldCloseConnection(protocol, *request_headers_);
+  if (HeaderUtility::shouldCloseConnection(protocol, *request_headers_)) {
+    // Only mark the connection to be closed if the request indicates so. The connection might
+    // already be marked so before this step, in which case if shouldCloseConnection() returns
+    // false, the stream info value shouldn't be overridden.
+    filter_manager_.streamInfo().setShouldDrainConnectionUponCompletion(true);
+  }
+
   filter_manager_.streamInfo().protocol(protocol);
 
   // We end the decode here to mark that the downstream stream is complete.
-  maybeEndDecode(end_stream);
+  maybeRecordLastByteReceived(end_stream);
 
   if (!validateHeaders()) {
     ENVOY_STREAM_LOG(debug, "request headers validation failed\n{}", *this, *request_headers_);
@@ -1091,17 +1325,17 @@ void ConnectionManagerImpl::ActiveStream::decodeHeaders(RequestHeaderMapSharedPt
   }
 
   // We need to snap snapped_route_config_ here as it's used in mutateRequestHeaders later.
-  if (connection_manager_.config_.isRoutable()) {
-    if (connection_manager_.config_.routeConfigProvider() != nullptr) {
-      snapped_route_config_ = connection_manager_.config_.routeConfigProvider()->configCast();
-    } else if (connection_manager_.config_.scopedRouteConfigProvider() != nullptr &&
-               connection_manager_.config_.scopeKeyBuilder().has_value()) {
+  if (connection_manager_.config_->isRoutable()) {
+    if (connection_manager_.config_->routeConfigProvider() != nullptr) {
+      snapped_route_config_ = connection_manager_.config_->routeConfigProvider()->configCast();
+    } else if (connection_manager_.config_->scopedRouteConfigProvider() != nullptr &&
+               connection_manager_.config_->scopeKeyBuilder().has_value()) {
       snapped_scoped_routes_config_ =
-          connection_manager_.config_.scopedRouteConfigProvider()->config<Router::ScopedConfig>();
+          connection_manager_.config_->scopedRouteConfigProvider()->config<Router::ScopedConfig>();
       snapScopedRouteConfig();
     }
   } else {
-    snapped_route_config_ = connection_manager_.config_.routeConfigProvider()->configCast();
+    snapped_route_config_ = connection_manager_.config_->routeConfigProvider()->configCast();
   }
 
   // Drop new requests when overloaded as soon as we have decoded the headers.
@@ -1116,12 +1350,19 @@ void ConnectionManagerImpl::ActiveStream::decodeHeaders(RequestHeaderMapSharedPt
     // overload it is more important to avoid unnecessary allocation than to create the filters.
     filter_manager_.skipFilterChainCreation();
     connection_manager_.stats_.named_.downstream_rq_overload_close_.inc();
-    sendLocalReply(Http::Code::ServiceUnavailable, "envoy overloaded", nullptr, absl::nullopt,
-                   StreamInfo::ResponseCodeDetails::get().Overload);
+    sendLocalReply(
+        Http::Code::ServiceUnavailable, "envoy overloaded",
+        [this](Http::ResponseHeaderMap& headers) {
+          if (connection_manager_.config_->appendLocalOverload()) {
+            headers.addReference(Http::Headers::get().EnvoyLocalOverloaded,
+                                 Http::Headers::get().EnvoyOverloadedValues.True);
+          }
+        },
+        absl::nullopt, StreamInfo::ResponseCodeDetails::get().Overload);
     return;
   }
 
-  if (!connection_manager_.config_.proxy100Continue() && request_headers_->Expect() &&
+  if (!connection_manager_.config_->proxy100Continue() && request_headers_->Expect() &&
       // The Expect field-value is case-insensitive.
       // https://tools.ietf.org/html/rfc7231#section-5.1.1
       absl::EqualsIgnoreCase((request_headers_->Expect()->value().getStringView()),
@@ -1167,6 +1408,14 @@ void ConnectionManagerImpl::ActiveStream::decodeHeaders(RequestHeaderMapSharedPt
     return;
   }
 
+  // Rewrite the host of CONNECT-UDP requests.
+  if (HeaderUtility::isConnectUdpRequest(*request_headers_) &&
+      !HeaderUtility::rewriteAuthorityForConnectUdp(*request_headers_)) {
+    sendLocalReply(Code::NotFound, "The path is incorrect for CONNECT-UDP", nullptr, absl::nullopt,
+                   StreamInfo::ResponseCodeDetails::get().InvalidPath);
+    return;
+  }
+
   // Currently we only support relative paths at the application layer.
   if (!request_headers_->getPathValue().empty() && request_headers_->getPathValue()[0] != '/') {
     connection_manager_.stats_.named_.downstream_rq_non_relative_path_.inc();
@@ -1175,9 +1424,11 @@ void ConnectionManagerImpl::ActiveStream::decodeHeaders(RequestHeaderMapSharedPt
     return;
   }
 
+#ifndef ENVOY_ENABLE_UHV
+  // In UHV mode path normalization is done in the UHV
   // Path sanitization should happen before any path access other than the above sanity check.
   const auto action =
-      ConnectionManagerUtility::maybeNormalizePath(*request_headers_, connection_manager_.config_);
+      ConnectionManagerUtility::maybeNormalizePath(*request_headers_, *connection_manager_.config_);
   // gRPC requests are rejected if Envoy is configured to redirect post-normalization. This is
   // because gRPC clients do not support redirect.
   if (action == ConnectionManagerUtility::NormalizePathAction::Reject ||
@@ -1200,8 +1451,9 @@ void ConnectionManagerImpl::ActiveStream::decodeHeaders(RequestHeaderMapSharedPt
   }
 
   ASSERT(action == ConnectionManagerUtility::NormalizePathAction::Continue);
+#endif
   auto optional_port = ConnectionManagerUtility::maybeNormalizeHost(
-      *request_headers_, connection_manager_.config_, localPort());
+      *request_headers_, *connection_manager_.config_, localPort());
   if (optional_port.has_value() &&
       requestWasConnect(request_headers_, connection_manager_.codec_->protocol())) {
     filter_manager_.streamInfo().filterState()->setData(
@@ -1214,7 +1466,7 @@ void ConnectionManagerImpl::ActiveStream::decodeHeaders(RequestHeaderMapSharedPt
     // Modify the downstream remote address depending on configuration and headers.
     const auto mutate_result = ConnectionManagerUtility::mutateRequestHeaders(
         *request_headers_, connection_manager_.read_callbacks_->connection(),
-        connection_manager_.config_, *snapped_route_config_, connection_manager_.local_info_,
+        *connection_manager_.config_, *snapped_route_config_, connection_manager_.local_info_,
         filter_manager_.streamInfo());
 
     // IP detection failed, reject the request.
@@ -1237,28 +1489,33 @@ void ConnectionManagerImpl::ActiveStream::decodeHeaders(RequestHeaderMapSharedPt
   if (!state_.is_internally_created_) { // Only mutate tracing headers on first pass.
     filter_manager_.streamInfo().setTraceReason(
         ConnectionManagerUtility::mutateTracingRequestHeader(
-            *request_headers_, connection_manager_.runtime_, connection_manager_.config_,
+            *request_headers_, connection_manager_.runtime_, *connection_manager_.config_,
             cached_route_.value().get()));
   }
 
   filter_manager_.streamInfo().setRequestHeaders(*request_headers_);
+  const FilterManager::CreateChainResult create_chain_result =
+      filter_manager_.createDownstreamFilterChain();
+  if (create_chain_result.upgradeAccepted()) {
+    connection_manager_.stats_.named_.downstream_cx_upgrades_total_.inc();
+    connection_manager_.stats_.named_.downstream_cx_upgrades_active_.inc();
+    state_.successful_upgrade_ = true;
+  }
 
-  const bool upgrade_rejected = filter_manager_.createFilterChain() == false;
-
-  if (connection_manager_.config_.flushAccessLogOnNewRequest()) {
-    filter_manager_.log(AccessLog::AccessLogType::DownstreamStart);
+  if (connection_manager_.config_->flushAccessLogOnNewRequest()) {
+    log(AccessLog::AccessLogType::DownstreamStart);
   }
 
   // TODO if there are no filters when starting a filter iteration, the connection manager
   // should return 404. The current returns no response if there is no router filter.
   if (hasCachedRoute()) {
     // Do not allow upgrades if the route does not support it.
-    if (upgrade_rejected) {
+    if (create_chain_result.upgradeRejected()) {
       // While downstream servers should not send upgrade payload without the upgrade being
       // accepted, err on the side of caution and refuse to process any further requests on this
       // connection, to avoid a class of HTTP/1.1 smuggling bugs where Upgrade or CONNECT payload
       // contains a smuggled HTTP request.
-      state_.saw_connection_close_ = true;
+      filter_manager_.streamInfo().setShouldDrainConnectionUponCompletion(true);
       connection_manager_.stats_.named_.downstream_rq_ws_on_non_ws_route_.inc();
       sendLocalReply(Code::Forbidden, "", nullptr, absl::nullopt,
                      StreamInfo::ResponseCodeDetails::get().UpgradeFailed);
@@ -1272,7 +1529,13 @@ void ConnectionManagerImpl::ActiveStream::decodeHeaders(RequestHeaderMapSharedPt
     traceRequest();
   }
 
-  filter_manager_.decodeHeaders(*request_headers_, end_stream);
+  ENVOY_EXECUTION_SCOPE(trackedStream(), active_span_.get());
+  if (!connection_manager_.shouldDeferRequestProxyingToNextIoCycle()) {
+    filter_manager_.decodeHeaders(*request_headers_, end_stream);
+  } else {
+    state_.deferred_to_next_io_iteration_ = true;
+    state_.deferred_end_stream_ = end_stream;
+  }
 
   // Reset it here for both global and overridden cases.
   resetIdleTimer();
@@ -1281,90 +1544,75 @@ void ConnectionManagerImpl::ActiveStream::decodeHeaders(RequestHeaderMapSharedPt
 void ConnectionManagerImpl::ActiveStream::traceRequest() {
   const Tracing::Decision tracing_decision =
       Tracing::TracerUtility::shouldTraceRequest(filter_manager_.streamInfo());
-  ConnectionManagerImpl::chargeTracingStats(tracing_decision.reason,
-                                            connection_manager_.config_.tracingStats());
 
+  if (!trace_refresh_after_route_refresh_) {
+    ConnectionManagerImpl::chargeTracingStats(tracing_decision.reason,
+                                              connection_manager_.config_->tracingStats());
+  }
+
+  Tracing::HttpTraceContext trace_context(*request_headers_);
   active_span_ = connection_manager_.tracer().startSpan(
-      *this, *request_headers_, filter_manager_.streamInfo(), tracing_decision);
+      *this, trace_context, filter_manager_.streamInfo(), tracing_decision);
 
   if (!active_span_) {
     return;
   }
 
-  // TODO: Need to investigate the following code based on the cached route, as may
-  // be broken in the case a filter changes the route.
-
-  // If a decorator has been defined, apply it to the active span.
-  if (hasCachedRoute() && cached_route_.value()->decorator()) {
-    const Router::Decorator* decorator = cached_route_.value()->decorator();
-
-    decorator->apply(*active_span_);
-
-    state_.decorated_propagate_ = decorator->propagate();
-
-    // Cache decorated operation.
-    if (!decorator->getOperation().empty()) {
-      decorated_operation_ = &decorator->getOperation();
-    }
-  }
-
-  if (connection_manager_tracing_config_->operation_name_ == Tracing::OperationName::Egress) {
-    // For egress (outbound) requests, pass the decorator's operation name (if defined and
-    // propagation enabled) as a request header to enable the receiving service to use it in its
-    // server span.
-    if (decorated_operation_ && state_.decorated_propagate_) {
-      request_headers_->setEnvoyDecoratorOperation(*decorated_operation_);
-    }
-  } else {
-    const HeaderEntry* req_operation_override = request_headers_->EnvoyDecoratorOperation();
-
-    // For ingress (inbound) requests, if a decorator operation name has been provided, it
-    // should be used to override the active span's operation.
-    if (req_operation_override) {
-      if (!req_operation_override->value().empty()) {
-        active_span_->setOperation(req_operation_override->value().getStringView());
-
-        // Clear the decorated operation so won't be used in the response header, as
-        // it has been overridden by the inbound decorator operation request header.
-        decorated_operation_ = nullptr;
-      }
-      // Remove header so not propagated to service
-      request_headers_->removeEnvoyDecoratorOperation();
-    }
-  }
+  setRequestDecorator(*request_headers_);
 }
 
 void ConnectionManagerImpl::ActiveStream::decodeData(Buffer::Instance& data, bool end_stream) {
   ScopeTrackerScopeState scope(this,
                                connection_manager_.read_callbacks_->connection().dispatcher());
-  maybeEndDecode(end_stream);
+  ENVOY_EXECUTION_SCOPE(trackedStream(), active_span_.get());
+  maybeRecordLastByteReceived(end_stream);
   filter_manager_.streamInfo().addBytesReceived(data.length());
-
-  filter_manager_.decodeData(data, end_stream);
+  if (!state_.deferred_to_next_io_iteration_) {
+    filter_manager_.decodeData(data, end_stream);
+  } else {
+    if (!deferred_data_) {
+      deferred_data_ = std::make_unique<Buffer::OwnedImpl>();
+    }
+    deferred_data_->move(data);
+    state_.deferred_end_stream_ = end_stream;
+  }
 }
 
 void ConnectionManagerImpl::ActiveStream::decodeTrailers(RequestTrailerMapPtr&& trailers) {
   ENVOY_STREAM_LOG(debug, "request trailers complete:\n{}", *this, *trailers);
   ScopeTrackerScopeState scope(this,
                                connection_manager_.read_callbacks_->connection().dispatcher());
+  ENVOY_EXECUTION_SCOPE(trackedStream(), active_span_.get());
   resetIdleTimer();
 
   ASSERT(!request_trailers_);
-  request_trailers_ = std::move(trailers);
-  if (!validateTrailers()) {
-    ENVOY_STREAM_LOG(debug, "request trailers validation failed:\n{}", *this, *request_trailers_);
+  if (!validateTrailers(*trailers)) {
+    ENVOY_STREAM_LOG(debug, "request trailers validation failed:\n{}", *this, *trailers);
     return;
   }
-  maybeEndDecode(true);
-  filter_manager_.decodeTrailers(*request_trailers_);
+  maybeRecordLastByteReceived(true);
+  if (!state_.deferred_to_next_io_iteration_) {
+    request_trailers_ = std::move(trailers);
+    filter_manager_.decodeTrailers(*request_trailers_);
+  } else {
+    // Save trailers in a different variable since `request_trailers_` is available to the filter
+    // manager via `requestTrailers()` callback and makes filter manager see trailers prematurely
+    // when deferred request is processed.
+    deferred_request_trailers_ = std::move(trailers);
+  }
 }
 
 void ConnectionManagerImpl::ActiveStream::decodeMetadata(MetadataMapPtr&& metadata_map) {
+  ENVOY_EXECUTION_SCOPE(trackedStream(), active_span_.get());
   resetIdleTimer();
-  // After going through filters, the ownership of metadata_map will be passed to terminal filter.
-  // The terminal filter may encode metadata_map to the next hop immediately or store metadata_map
-  // and encode later when connection pool is ready.
-  filter_manager_.decodeMetadata(*metadata_map);
+  if (!state_.deferred_to_next_io_iteration_) {
+    // After going through filters, the ownership of metadata_map will be passed to terminal filter.
+    // The terminal filter may encode metadata_map to the next hop immediately or store metadata_map
+    // and encode later when connection pool is ready.
+    filter_manager_.decodeMetadata(*metadata_map);
+  } else {
+    deferred_metadata_.push(std::move(metadata_map));
+  }
 }
 
 void ConnectionManagerImpl::ActiveStream::disarmRequestTimeout() {
@@ -1378,14 +1626,14 @@ void ConnectionManagerImpl::startDrainSequence() {
   drain_state_ = DrainState::Draining;
   codec_->shutdownNotice();
   drain_timer_ = dispatcher_->createTimer([this]() -> void { onDrainTimeout(); });
-  drain_timer_->enableTimer(config_.drainTimeout());
+  drain_timer_->enableTimer(config_->drainTimeout());
 }
 
 void ConnectionManagerImpl::ActiveStream::snapScopedRouteConfig() {
   // NOTE: if a RDS subscription hasn't got a RouteConfiguration back, a Router::NullConfigImpl is
   // returned, in that case we let it pass.
   auto scope_key =
-      connection_manager_.config_.scopeKeyBuilder()->computeScopeKey(*request_headers_);
+      connection_manager_.config_->scopeKeyBuilder()->computeScopeKey(*request_headers_);
   snapped_route_config_ = snapped_scoped_routes_config_->getRouteConfig(scope_key);
   if (snapped_route_config_ == nullptr) {
     ENVOY_STREAM_LOG(trace, "can't find SRDS scope.", *this);
@@ -1398,12 +1646,13 @@ void ConnectionManagerImpl::ActiveStream::snapScopedRouteConfig() {
 void ConnectionManagerImpl::ActiveStream::refreshCachedRoute() { refreshCachedRoute(nullptr); }
 
 void ConnectionManagerImpl::ActiveStream::refreshDurationTimeout() {
-  if (!filter_manager_.streamInfo().route() ||
-      !filter_manager_.streamInfo().route()->routeEntry() || !request_headers_) {
+  if (!hasCachedRoute() || !request_headers_) {
     return;
   }
-  const auto& route = filter_manager_.streamInfo().route()->routeEntry();
-
+  const Router::RouteEntry* route = cached_route_.value()->routeEntry();
+  if (route == nullptr) {
+    return;
+  }
   auto grpc_timeout = Grpc::Common::getGrpcTimeout(*request_headers_);
   std::chrono::milliseconds timeout;
   bool disable_timer = false;
@@ -1420,7 +1669,7 @@ void ConnectionManagerImpl::ActiveStream::refreshDurationTimeout() {
     } else {
       // Fall back to HCM config. If no HCM duration limit exists, disable
       // timers set by any prior route configuration.
-      const auto max_stream_duration = connection_manager_.config_.maxStreamDuration();
+      const auto max_stream_duration = connection_manager_.config_->maxStreamDuration();
       if (max_stream_duration.has_value() && max_stream_duration.value().count()) {
         timeout = max_stream_duration.value();
       } else {
@@ -1467,7 +1716,7 @@ void ConnectionManagerImpl::ActiveStream::refreshDurationTimeout() {
 
   // See how long this stream has been alive, and adjust the timeout
   // accordingly.
-  std::chrono::duration time_used = std::chrono::duration_cast<std::chrono::milliseconds>(
+  std::chrono::milliseconds time_used = std::chrono::duration_cast<std::chrono::milliseconds>(
       connection_manager_.timeSource().monotonicTime() -
       filter_manager_.streamInfo().startTimeMonotonic());
   if (timeout > time_used) {
@@ -1491,56 +1740,67 @@ void ConnectionManagerImpl::ActiveStream::refreshCachedRoute(const Router::Route
     return;
   }
 
-  Router::RouteConstSharedPtr route;
+  Router::VirtualHostRoute route_result;
   if (request_headers_ != nullptr) {
-    if (connection_manager_.config_.isRoutable() &&
-        connection_manager_.config_.scopedRouteConfigProvider() != nullptr &&
-        connection_manager_.config_.scopeKeyBuilder().has_value()) {
+    if (connection_manager_.config_->isRoutable() &&
+        connection_manager_.config_->scopedRouteConfigProvider() != nullptr &&
+        connection_manager_.config_->scopeKeyBuilder().has_value()) {
       // NOTE: re-select scope as well in case the scope key header has been changed by a filter.
       snapScopedRouteConfig();
     }
     if (snapped_route_config_ != nullptr) {
-      route = snapped_route_config_->route(cb, *request_headers_, filter_manager_.streamInfo(),
-                                           stream_id_);
+      route_result = snapped_route_config_->route(cb, *request_headers_,
+                                                  filter_manager_.streamInfo(), stream_id_);
     }
   }
 
-  setRoute(route);
+  setVirtualHostRoute(std::move(route_result));
 }
 
-void ConnectionManagerImpl::ActiveStream::refreshCachedTracingCustomTags() {
-  if (!connection_manager_tracing_config_.has_value()) {
+void ConnectionManagerImpl::ActiveStream::refreshTracing() {
+  if (!trace_refresh_after_route_refresh_) {
     return;
   }
-  const Tracing::CustomTagMap& conn_manager_tags = connection_manager_tracing_config_->custom_tags_;
-  const Tracing::CustomTagMap* route_tags = nullptr;
-  if (hasCachedRoute() && cached_route_.value()->tracingConfig()) {
-    route_tags = &cached_route_.value()->tracingConfig()->getCustomTags();
-  }
-  const bool configured_in_conn = !conn_manager_tags.empty();
-  const bool configured_in_route = route_tags && !route_tags->empty();
-  if (!configured_in_conn && !configured_in_route) {
+
+  if (!connection_manager_tracing_config_.has_value() || active_span_ == nullptr ||
+      request_headers_ == nullptr) {
     return;
   }
-  Tracing::CustomTagMap& custom_tag_map = getOrMakeTracingCustomTagMap();
-  if (configured_in_route) {
-    custom_tag_map.insert(route_tags->begin(), route_tags->end());
+
+  ASSERT(cached_route_.has_value());
+
+  // NOTE: if the trace reason have been encoded into the request id then the trace reason may
+  // not be updated. That means we may cannot to force a traced request to be untraced by the
+  // refreshing.
+  const auto trace_reason = ConnectionManagerUtility::mutateTracingRequestHeader(
+      *request_headers_, connection_manager_.runtime_, *connection_manager_.config_,
+      cached_route_.value().get());
+  filter_manager_.streamInfo().setTraceReason(trace_reason);
+  const Tracing::Decision tracing_decision =
+      Tracing::TracerUtility::shouldTraceRequest(filter_manager_.streamInfo());
+  if (active_span_->useLocalDecision()) {
+    active_span_->setSampled(tracing_decision.traced);
   }
-  if (configured_in_conn) {
-    custom_tag_map.insert(conn_manager_tags.begin(), conn_manager_tags.end());
-  }
+
+  setRequestDecorator(*request_headers_);
 }
 
 // TODO(chaoqin-li1123): Make on demand vhds and on demand srds works at the same time.
 void ConnectionManagerImpl::ActiveStream::requestRouteConfigUpdate(
     Http::RouteConfigUpdatedCallbackSharedPtr route_config_updated_cb) {
-  route_config_update_requester_->requestRouteConfigUpdate(route_config_updated_cb);
+  ENVOY_BUG(route_config_update_requester_.has_value(),
+            "RouteConfigUpdate requested but RDS not compiled into the binary. Try linking "
+            "//source/common/http:rds_lib");
+  if (route_config_update_requester_.has_value()) {
+    (*route_config_update_requester_)
+        ->requestRouteConfigUpdate(*this, route_config_updated_cb, routeConfig(),
+                                   *connection_manager_.dispatcher_, *request_headers_);
+  }
 }
 
 absl::optional<Router::ConfigConstSharedPtr> ConnectionManagerImpl::ActiveStream::routeConfig() {
-  if (connection_manager_.config_.routeConfigProvider() != nullptr) {
-    return absl::optional<Router::ConfigConstSharedPtr>(
-        connection_manager_.config_.routeConfigProvider()->configCast());
+  if (connection_manager_.config_->routeConfigProvider() != nullptr) {
+    return {connection_manager_.config_->routeConfigProvider()->configCast()};
   }
   return {};
 }
@@ -1549,22 +1809,23 @@ void ConnectionManagerImpl::ActiveStream::onLocalReply(Code code) {
   // The BadRequest error code indicates there has been a messaging error.
   if (code == Http::Code::BadRequest && connection_manager_.codec_->protocol() < Protocol::Http2 &&
       !response_encoder_->streamErrorOnInvalidHttpMessage()) {
-    state_.saw_connection_close_ = true;
+    filter_manager_.streamInfo().setShouldDrainConnectionUponCompletion(true);
   }
 }
 
 void ConnectionManagerImpl::ActiveStream::encode1xxHeaders(ResponseHeaderMap& response_headers) {
+  ENVOY_EXECUTION_SCOPE(trackedStream(), active_span_.get());
   // Strip the T-E headers etc. Defer other header additions as well as drain-close logic to the
   // continuation headers.
   ConnectionManagerUtility::mutateResponseHeaders(
-      response_headers, request_headers_.get(), connection_manager_.config_, EMPTY_STRING,
+      response_headers, request_headers_.get(), *connection_manager_.config_, EMPTY_STRING,
       filter_manager_.streamInfo(), connection_manager_.proxy_name_,
       connection_manager_.clear_hop_by_hop_response_headers_);
 
   // Count both the 1xx and follow-up response code in stats.
   chargeStats(response_headers);
 
-  ENVOY_STREAM_LOG(debug, "encoding 100 continue headers via codec:\n{}", *this, response_headers);
+  ENVOY_STREAM_LOG(debug, "encoding 1xx continue headers via codec:\n{}", *this, response_headers);
 
   // Now actually encode via the codec.
   response_encoder_->encode1xxHeaders(response_headers);
@@ -1572,24 +1833,25 @@ void ConnectionManagerImpl::ActiveStream::encode1xxHeaders(ResponseHeaderMap& re
 
 void ConnectionManagerImpl::ActiveStream::encodeHeaders(ResponseHeaderMap& headers,
                                                         bool end_stream) {
+  ENVOY_EXECUTION_SCOPE(trackedStream(), active_span_.get());
   // Base headers.
 
   // We want to preserve the original date header, but we add a date header if it is absent
   if (!headers.Date()) {
-    connection_manager_.config_.dateProvider().setDateHeader(headers);
+    connection_manager_.config_->dateProvider().setDateHeader(headers);
   }
 
   // Following setReference() is safe because serverName() is constant for the life of the
   // listener.
-  const auto transformation = connection_manager_.config_.serverHeaderTransformation();
+  const auto transformation = connection_manager_.config_->serverHeaderTransformation();
   if (transformation == ConnectionManagerConfig::HttpConnectionManagerProto::OVERWRITE ||
       (transformation == ConnectionManagerConfig::HttpConnectionManagerProto::APPEND_IF_ABSENT &&
        headers.Server() == nullptr)) {
-    headers.setReferenceServer(connection_manager_.config_.serverName());
+    headers.setReferenceServer(connection_manager_.config_->serverName());
   }
   ConnectionManagerUtility::mutateResponseHeaders(
-      headers, request_headers_.get(), connection_manager_.config_,
-      connection_manager_.config_.via(), filter_manager_.streamInfo(),
+      headers, request_headers_.get(), *connection_manager_.config_,
+      connection_manager_.config_->via(), filter_manager_.streamInfo(),
       connection_manager_.proxy_name_, connection_manager_.clear_hop_by_hop_response_headers_);
 
   bool drain_connection_due_to_overload = false;
@@ -1601,10 +1863,19 @@ void ConnectionManagerImpl::ActiveStream::encodeHeaders(ResponseHeaderMap& heade
     connection_manager_.stats_.named_.downstream_cx_overload_disable_keepalive_.inc();
   }
 
+  // If we're an inbound listener, then we should drain even if the drain direction is inbound only.
+  // If not, then we only drain if the drain direction is all.
+  Network::DrainDirection drain_scope =
+      connection_manager_.direction_ == envoy::config::core::v3::TrafficDirection::INBOUND
+          ? Network::DrainDirection::InboundOnly
+          : Network::DrainDirection::All;
+
   // See if we want to drain/close the connection. Send the go away frame prior to encoding the
-  // header block.
+  // header block. Only drain if the drain direction is not inbound only or the connection is
+  // inbound.
   if (connection_manager_.drain_state_ == DrainState::NotDraining &&
-      (connection_manager_.drain_close_.drainClose() || drain_connection_due_to_overload)) {
+      (connection_manager_.drain_close_.drainClose(drain_scope) ||
+       drain_connection_due_to_overload)) {
 
     // This doesn't really do anything for HTTP/1.1 other then give the connection another boost
     // of time to race with incoming requests. For HTTP/2 connections, send a GOAWAY frame to
@@ -1618,16 +1889,17 @@ void ConnectionManagerImpl::ActiveStream::encodeHeaders(ResponseHeaderMap& heade
     // As HTTP/1.0 and below can not do chunked encoding, if there is no content
     // length the response will be framed by connection close.
     if (!headers.ContentLength()) {
-      state_.saw_connection_close_ = true;
+      filter_manager_.streamInfo().setShouldDrainConnectionUponCompletion(true);
     }
     // If the request came with a keep-alive and no other factor resulted in a
     // connection close header, send an explicit keep-alive header.
-    if (!state_.saw_connection_close_) {
+    if (!filter_manager_.streamInfo().shouldDrainConnectionUponCompletion()) {
       headers.setConnection(Headers::get().ConnectionValues.KeepAlive);
     }
   }
 
-  if (connection_manager_.drain_state_ == DrainState::NotDraining && state_.saw_connection_close_) {
+  if (connection_manager_.drain_state_ == DrainState::NotDraining &&
+      filter_manager_.streamInfo().shouldDrainConnectionUponCompletion()) {
     ENVOY_STREAM_LOG(debug, "closing connection due to connection close header", *this);
     connection_manager_.drain_state_ = DrainState::Closing;
   }
@@ -1635,7 +1907,7 @@ void ConnectionManagerImpl::ActiveStream::encodeHeaders(ResponseHeaderMap& heade
   // If we are destroying a stream before remote is complete and the connection does not support
   // multiplexing, we should disconnect since we don't want to wait around for the request to
   // finish.
-  if (!filter_manager_.remoteDecodeComplete()) {
+  if (!filter_manager_.hasLastDownstreamByteReceived()) {
     if (connection_manager_.codec_->protocol() < Protocol::Http2) {
       connection_manager_.drain_state_ = DrainState::Closing;
     }
@@ -1648,12 +1920,9 @@ void ConnectionManagerImpl::ActiveStream::encodeHeaders(ResponseHeaderMap& heade
     state_.is_tunneling_ = true;
   }
 
-  if (Runtime::runtimeFeatureEnabled(
-          "envoy.reloadable_features.prohibit_route_refresh_after_response_headers_sent")) {
-    // Block route cache if the response headers is received and processed. Because after this
-    // point, the cached route should never be updated or refreshed.
-    blockRouteCache();
-  }
+  // Block route cache if the response headers is received and processed. Because after this
+  // point, the cached route should never be updated or refreshed.
+  blockRouteCache();
 
   if (connection_manager_.drain_state_ != DrainState::NotDraining &&
       connection_manager_.codec_->protocol() < Protocol::Http2) {
@@ -1665,36 +1934,15 @@ void ConnectionManagerImpl::ActiveStream::encodeHeaders(ResponseHeaderMap& heade
     }
   }
 
-  if (connection_manager_tracing_config_.has_value()) {
-    if (connection_manager_tracing_config_->operation_name_ == Tracing::OperationName::Ingress) {
-      // For ingress (inbound) responses, if the request headers do not include a
-      // decorator operation (override), and the decorated operation should be
-      // propagated, then pass the decorator's operation name (if defined)
-      // as a response header to enable the client service to use it in its client span.
-      if (decorated_operation_ && state_.decorated_propagate_) {
-        headers.setEnvoyDecoratorOperation(*decorated_operation_);
-      }
-    } else if (connection_manager_tracing_config_->operation_name_ ==
-               Tracing::OperationName::Egress) {
-      const HeaderEntry* resp_operation_override = headers.EnvoyDecoratorOperation();
-
-      // For Egress (outbound) response, if a decorator operation name has been provided, it
-      // should be used to override the active span's operation.
-      if (resp_operation_override) {
-        if (!resp_operation_override->value().empty() && active_span_) {
-          active_span_->setOperation(resp_operation_override->value().getStringView());
-        }
-        // Remove header so not propagated to service.
-        headers.removeEnvoyDecoratorOperation();
-      }
-    }
+  if (connection_manager_tracing_config_.has_value() && active_span_ != nullptr) {
+    setResponseDecorator(headers);
   }
 
   chargeStats(headers);
 
   if (state_.is_tunneling_ &&
-      connection_manager_.config_.flushAccessLogOnTunnelSuccessfullyEstablished()) {
-    filter_manager_.log(AccessLog::AccessLogType::DownstreamTunnelSuccessfullyEstablished);
+      connection_manager_.config_->flushAccessLogOnTunnelSuccessfullyEstablished()) {
+    log(AccessLog::AccessLogType::DownstreamTunnelSuccessfullyEstablished);
   }
   ENVOY_STREAM_LOG(debug, "encoding headers via codec (end_stream={}):\n{}", *this, end_stream,
                    headers);
@@ -1719,6 +1967,7 @@ void ConnectionManagerImpl::ActiveStream::encodeHeaders(ResponseHeaderMap& heade
 }
 
 void ConnectionManagerImpl::ActiveStream::encodeData(Buffer::Instance& data, bool end_stream) {
+  ENVOY_EXECUTION_SCOPE(trackedStream(), active_span_.get());
   ENVOY_STREAM_LOG(trace, "encoding data via codec (size={} end_stream={})", *this, data.length(),
                    end_stream);
 
@@ -1727,12 +1976,14 @@ void ConnectionManagerImpl::ActiveStream::encodeData(Buffer::Instance& data, boo
 }
 
 void ConnectionManagerImpl::ActiveStream::encodeTrailers(ResponseTrailerMap& trailers) {
+  ENVOY_EXECUTION_SCOPE(trackedStream(), active_span_.get());
   ENVOY_STREAM_LOG(debug, "encoding trailers via codec:\n{}", *this, trailers);
 
   response_encoder_->encodeTrailers(trailers);
 }
 
 void ConnectionManagerImpl::ActiveStream::encodeMetadata(MetadataMapPtr&& metadata) {
+  ENVOY_EXECUTION_SCOPE(trackedStream(), active_span_.get());
   MetadataMapVector metadata_map_vector;
   metadata_map_vector.emplace_back(std::move(metadata));
   ENVOY_STREAM_LOG(debug, "encoding metadata via codec:\n{}", *this, metadata_map_vector);
@@ -1773,16 +2024,23 @@ void ConnectionManagerImpl::ActiveStream::onResetStream(StreamResetReason reset_
   // If the codec sets its responseDetails() for a reason other than peer reset, set a
   // DownstreamProtocolError. Either way, propagate details.
   if (!encoder_details.empty() && reset_reason == StreamResetReason::LocalReset) {
-    filter_manager_.streamInfo().setResponseFlag(StreamInfo::ResponseFlag::DownstreamProtocolError);
+    filter_manager_.streamInfo().setResponseFlag(
+        StreamInfo::CoreResponseFlag::DownstreamProtocolError);
   }
   if (!encoder_details.empty()) {
+    if (reset_reason == StreamResetReason::ConnectError ||
+        reset_reason == StreamResetReason::RemoteReset ||
+        reset_reason == StreamResetReason::RemoteRefusedStreamReset) {
+      filter_manager_.streamInfo().setResponseFlag(
+          StreamInfo::CoreResponseFlag::DownstreamRemoteReset);
+    }
     filter_manager_.streamInfo().setResponseCodeDetails(encoder_details);
   }
 
   // Check if we're in the overload manager reset case.
   // encoder_details should be empty in this case as we don't have a codec error.
   if (encoder_details.empty() && reset_reason == StreamResetReason::OverloadManager) {
-    filter_manager_.streamInfo().setResponseFlag(StreamInfo::ResponseFlag::OverloadManager);
+    filter_manager_.streamInfo().setResponseFlag(StreamInfo::CoreResponseFlag::OverloadManager);
     filter_manager_.streamInfo().setResponseCodeDetails(
         StreamInfo::ResponseCodeDetails::get().Overload);
   }
@@ -1834,8 +2092,29 @@ Tracing::OperationName ConnectionManagerImpl::ActiveStream::operationName() cons
   return connection_manager_tracing_config_->operation_name_;
 }
 
-const Tracing::CustomTagMap* ConnectionManagerImpl::ActiveStream::customTags() const {
-  return tracing_custom_tags_.get();
+void ConnectionManagerImpl::ActiveStream::modifySpan(Tracing::Span& span) const {
+  ASSERT(connection_manager_tracing_config_.has_value());
+
+  const Tracing::HttpTraceContext trace_context(*request_headers_);
+  const Tracing::CustomTagContext ctx{trace_context, filter_manager_.streamInfo()};
+
+  // Cache the optional custom tags from the route first.
+  OptRef<const Tracing::CustomTagMap> route_custom_tags;
+
+  if (hasCachedRoute() && cached_route_.value()->tracingConfig() != nullptr) {
+    route_custom_tags.emplace(cached_route_.value()->tracingConfig()->getCustomTags());
+    for (const auto& tag : *route_custom_tags) {
+      tag.second->applySpan(span, ctx);
+    }
+  }
+
+  for (const auto& tag : connection_manager_tracing_config_->custom_tags_) {
+    if (!route_custom_tags.has_value() || !route_custom_tags->contains(tag.first)) {
+      // If the tag is defined in both the connection manager and the route,
+      // use the route's tag.
+      tag.second->applySpan(span, ctx);
+    }
+  }
 }
 
 bool ConnectionManagerImpl::ActiveStream::verbose() const {
@@ -1846,6 +2125,11 @@ bool ConnectionManagerImpl::ActiveStream::verbose() const {
 uint32_t ConnectionManagerImpl::ActiveStream::maxPathTagLength() const {
   ASSERT(connection_manager_tracing_config_.has_value());
   return connection_manager_tracing_config_->max_path_tag_length_;
+}
+
+bool ConnectionManagerImpl::ActiveStream::spawnUpstreamSpan() const {
+  ASSERT(connection_manager_tracing_config_.has_value());
+  return connection_manager_tracing_config_->spawn_upstream_span_;
 }
 
 const Router::RouteEntry::UpgradeMap* ConnectionManagerImpl::ActiveStream::upgradeMap() {
@@ -1893,6 +2177,15 @@ ConnectionManagerImpl::ActiveStream::route(const Router::RouteCallback& cb) {
   return cached_route_.value();
 }
 
+void ConnectionManagerImpl::ActiveStream::setRoute(Router::RouteConstSharedPtr route) {
+  Router::VirtualHostRoute vhost_route;
+  if (route != nullptr) {
+    vhost_route.vhost = route->virtualHost();
+    vhost_route.route = std::move(route);
+  }
+  setVirtualHostRoute(std::move(vhost_route));
+}
+
 /**
  * Sets the cached route to the RouteConstSharedPtr argument passed in. Handles setting the
  * cached_route_/cached_cluster_info_ ActiveStream attributes, the FilterManager streamInfo, tracing
@@ -1901,14 +2194,15 @@ ConnectionManagerImpl::ActiveStream::route(const Router::RouteCallback& cb) {
  * Declared as a StreamFilterCallbacks member function for filters to call directly, but also
  * functions as a helper to refreshCachedRoute(const Router::RouteCallback& cb).
  */
-void ConnectionManagerImpl::ActiveStream::setRoute(Router::RouteConstSharedPtr route) {
+void ConnectionManagerImpl::ActiveStream::setVirtualHostRoute(
+    Router::VirtualHostRoute vhost_route) {
   // If the cached route is blocked then any attempt to clear it or refresh it
   // will be ignored.
-  // setRoute() may be called directly by the interface of DownstreamStreamFilterCallbacks,
-  // so check for routeCacheBlocked() here again.
   if (routeCacheBlocked()) {
     return;
   }
+
+  Router::RouteConstSharedPtr route = std::move(vhost_route.route);
 
   // Update the cached route.
   setCachedRoute({route});
@@ -1921,42 +2215,57 @@ void ConnectionManagerImpl::ActiveStream::setRoute(Router::RouteConstSharedPtr r
     cached_cluster_info_ = (nullptr == cluster) ? nullptr : cluster->info();
   }
 
-  // Update route and cluster info in the filter manager's stream info.
-  filter_manager_.streamInfo().route_ = std::move(route); // Now can move route here safely.
+  // Update route, vhost and cluster info in the filter manager's stream info.
+  // Now can move route here safely.
+  filter_manager_.streamInfo().route_ = std::move(route);
+  filter_manager_.streamInfo().vhost_ = std::move(vhost_route.vhost);
   filter_manager_.streamInfo().setUpstreamClusterInfo(cached_cluster_info_.value());
 
-  refreshCachedTracingCustomTags();
+  refreshTracing();
   refreshDurationTimeout();
-  refreshIdleTimeout();
+  refreshIdleAndFlushTimeouts();
 }
 
-void ConnectionManagerImpl::ActiveStream::refreshIdleTimeout() {
-  if (hasCachedRoute()) {
-    const Router::RouteEntry* route_entry = cached_route_.value()->routeEntry();
-    if (route_entry != nullptr && route_entry->idleTimeout()) {
-      idle_timeout_ms_ = route_entry->idleTimeout().value();
-      response_encoder_->getStream().setFlushTimeout(idle_timeout_ms_);
-      if (idle_timeout_ms_.count()) {
-        // If we have a route-level idle timeout but no global stream idle timeout, create a timer.
-        if (stream_idle_timer_ == nullptr) {
-          stream_idle_timer_ = connection_manager_.dispatcher_->createScaledTimer(
-              Event::ScaledTimerType::HttpDownstreamIdleStreamTimeout,
-              [this]() -> void { onIdleTimeout(); });
-        }
-      } else if (stream_idle_timer_ != nullptr) {
-        // If we had a global stream idle timeout but the route-level idle timeout is set to zero
-        // (to override), we disable the idle timer.
-        stream_idle_timer_->disableTimer();
-        stream_idle_timer_ = nullptr;
+void ConnectionManagerImpl::ActiveStream::refreshIdleAndFlushTimeouts() {
+  if (!hasCachedRoute()) {
+    return;
+  }
+  const Router::RouteEntry* route_entry = cached_route_.value()->routeEntry();
+  if (route_entry == nullptr) {
+    return;
+  }
+
+  if (route_entry->idleTimeout().has_value()) {
+    idle_timeout_ms_ = route_entry->idleTimeout().value();
+    if (idle_timeout_ms_.count()) {
+      // If we have a route-level idle timeout but no global stream idle timeout, create a timer.
+      if (stream_idle_timer_ == nullptr) {
+        stream_idle_timer_ = connection_manager_.dispatcher_->createScaledTimer(
+            Event::ScaledTimerType::HttpDownstreamIdleStreamTimeout,
+            [this]() -> void { onIdleTimeout(); });
       }
+    } else if (stream_idle_timer_ != nullptr) {
+      // If we had a global stream idle timeout but the route-level idle timeout is set to zero
+      // (to override), we disable the idle timer.
+      stream_idle_timer_->disableTimer();
+      stream_idle_timer_ = nullptr;
     }
+  }
+
+  if (route_entry->flushTimeout().has_value()) {
+    response_encoder_->getStream().setFlushTimeout(route_entry->flushTimeout().value());
+  } else if (!has_explicit_global_flush_timeout_ && route_entry->idleTimeout().has_value()) {
+    // If there is no route-level flush timeout, and the global flush timeout was also inherited
+    // from the idle timeout, also inherit the route-level idle timeout. This is for backwards
+    // compatibility.
+    response_encoder_->getStream().setFlushTimeout(idle_timeout_ms_);
   }
 }
 
 void ConnectionManagerImpl::ActiveStream::refreshAccessLogFlushTimer() {
-  if (connection_manager_.config_.accessLogFlushInterval().has_value()) {
+  if (connection_manager_.config_->accessLogFlushInterval().has_value()) {
     access_log_flush_timer_->enableTimer(
-        connection_manager_.config_.accessLogFlushInterval().value(), this);
+        connection_manager_.config_->accessLogFlushInterval().value(), this);
   }
 }
 
@@ -1968,10 +2277,27 @@ void ConnectionManagerImpl::ActiveStream::clearRouteCache() {
   }
 
   setCachedRoute({});
-
   cached_cluster_info_ = absl::optional<Upstream::ClusterInfoConstSharedPtr>();
-  if (tracing_custom_tags_) {
-    tracing_custom_tags_->clear();
+}
+
+void ConnectionManagerImpl::ActiveStream::refreshRouteCluster() {
+  // If there is no cached route, or route cache is frozen, or the request headers are not
+  // available, then do not refresh the route cluster.
+  if (!hasCachedRoute() || routeCacheBlocked() || request_headers_ == nullptr) {
+    return;
+  }
+  if (const auto* entry = (*cached_route_)->routeEntry(); entry != nullptr) {
+    // Refresh the cluster if possible.
+    entry->refreshRouteCluster(*request_headers_, filter_manager_.streamInfo());
+
+    // Refresh the cached cluster info is necessary.
+    if (!cached_cluster_info_.has_value() || cached_cluster_info_.value() == nullptr ||
+        (*cached_cluster_info_)->name() != entry->clusterName()) {
+      auto* cluster =
+          connection_manager_.cluster_manager_.getThreadLocalCluster(entry->clusterName());
+      cached_cluster_info_ = (nullptr == cluster) ? nullptr : cluster->info();
+      filter_manager_.streamInfo().setUpstreamClusterInfo(cached_cluster_info_.value());
+    }
   }
 }
 
@@ -1998,6 +2324,7 @@ void ConnectionManagerImpl::ActiveStream::onRequestDataTooLarge() {
 
 void ConnectionManagerImpl::ActiveStream::recreateStream(
     StreamInfo::FilterStateSharedPtr filter_state) {
+  ENVOY_EXECUTION_SCOPE(trackedStream(), active_span_.get());
   ResponseEncoder* response_encoder = response_encoder_;
   response_encoder_ = nullptr;
 
@@ -2062,6 +2389,79 @@ void ConnectionManagerImpl::ActiveStream::onResponseDataTooLarge() {
 void ConnectionManagerImpl::ActiveStream::resetStream(Http::StreamResetReason, absl::string_view) {
   connection_manager_.stats_.named_.downstream_rq_tx_reset_.inc();
   connection_manager_.doEndStream(*this);
+}
+
+bool ConnectionManagerImpl::ActiveStream::onDeferredRequestProcessing() {
+  // TODO(yanavlasov): Merge this with the filter manager continueIteration() method
+  if (!state_.deferred_to_next_io_iteration_) {
+    return false;
+  }
+  ENVOY_EXECUTION_SCOPE(trackedStream(), active_span_.get());
+  state_.deferred_to_next_io_iteration_ = false;
+  bool end_stream = state_.deferred_end_stream_ && deferred_data_ == nullptr &&
+                    deferred_request_trailers_ == nullptr && deferred_metadata_.empty();
+  filter_manager_.decodeHeaders(*request_headers_, end_stream);
+  if (end_stream) {
+    return true;
+  }
+  // Send metadata before data, as data may have an associated end_stream.
+  while (!deferred_metadata_.empty()) {
+    MetadataMapPtr& metadata = deferred_metadata_.front();
+    filter_manager_.decodeMetadata(*metadata);
+    deferred_metadata_.pop();
+  }
+  // Filter manager will return early from decodeData and decodeTrailers if
+  // request has completed.
+  if (deferred_data_ != nullptr) {
+    end_stream = state_.deferred_end_stream_ && deferred_request_trailers_ == nullptr;
+    filter_manager_.decodeData(*deferred_data_, end_stream);
+  }
+  if (deferred_request_trailers_ != nullptr) {
+    request_trailers_ = std::move(deferred_request_trailers_);
+    filter_manager_.decodeTrailers(*request_trailers_);
+  }
+  return true;
+}
+
+bool ConnectionManagerImpl::shouldDeferRequestProxyingToNextIoCycle() {
+  // Do not defer this stream if stream deferral is disabled
+  if (deferred_request_processing_callback_ == nullptr) {
+    return false;
+  }
+  // Defer this stream if there are already deferred streams, so they are not
+  // processed out of order
+  if (deferred_request_processing_callback_->enabled()) {
+    return true;
+  }
+  ++requests_during_dispatch_count_;
+  bool defer = requests_during_dispatch_count_ > max_requests_during_dispatch_;
+  if (defer) {
+    deferred_request_processing_callback_->scheduleCallbackNextIteration();
+  }
+  return defer;
+}
+
+void ConnectionManagerImpl::onDeferredRequestProcessing() {
+  if (streams_.empty()) {
+    return;
+  }
+  requests_during_dispatch_count_ = 1; // 1 stream is always let through
+  // Streams are inserted at the head of the list. As such process deferred
+  // streams in the reverse order.
+  auto reverse_iter = std::prev(streams_.end());
+  bool at_first_element = false;
+  do {
+    at_first_element = reverse_iter == streams_.begin();
+    // Move the iterator to the previous item in case the `onDeferredRequestProcessing` call removes
+    // the stream from the list.
+    auto previous_element = std::prev(reverse_iter);
+    bool was_deferred = (*reverse_iter)->onDeferredRequestProcessing();
+    if (was_deferred && shouldDeferRequestProxyingToNextIoCycle()) {
+      break;
+    }
+    reverse_iter = previous_element;
+    // TODO(yanavlasov): see if `rend` can be used.
+  } while (!at_first_element);
 }
 
 } // namespace Http

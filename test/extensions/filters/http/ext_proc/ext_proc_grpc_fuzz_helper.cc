@@ -107,14 +107,14 @@ ExtProcFuzzHelper::ExtProcFuzzHelper(FuzzedDataProvider* provider) { provider_ =
 
 std::string ExtProcFuzzHelper::consumeRepeatedString() {
   const uint32_t str_len = provider_->ConsumeIntegralInRange<uint32_t>(0, ExtProcFuzzMaxDataSize);
-  return std::string(str_len, 'b');
+  return {static_cast<char>(str_len), 'b'};
 }
 
 // Since FuzzedDataProvider requires enums to define a kMaxValue, we cannot
 // use the envoy::type::v3::StatusCode enum directly.
 StatusCode ExtProcFuzzHelper::randomHttpStatus() {
   const StatusCode rv = provider_->PickValueInArray(HttpStatusCodes);
-  ENVOY_LOG_MISC(trace, "Selected HTTP StatusCode {}", rv);
+  ENVOY_LOG_MISC(trace, "Selected HTTP StatusCode {}", static_cast<int>(rv));
   return rv;
 }
 
@@ -122,7 +122,7 @@ StatusCode ExtProcFuzzHelper::randomHttpStatus() {
 // use the grpc::StatusCode enum directly.
 grpc::StatusCode ExtProcFuzzHelper::randomGrpcStatusCode() {
   const grpc::StatusCode rv = provider_->PickValueInArray(GrpcStatusCodes);
-  ENVOY_LOG_MISC(trace, "Selected gRPC StatusCode {}", rv);
+  ENVOY_LOG_MISC(trace, "Selected gRPC StatusCode {}", static_cast<int>(rv));
   return rv;
 }
 
@@ -146,8 +146,8 @@ void ExtProcFuzzHelper::logRequest(const ProcessingRequest* req) {
 
 grpc::Status ExtProcFuzzHelper::randomGrpcStatusWithMessage() {
   const grpc::StatusCode code = randomGrpcStatusCode();
-  ENVOY_LOG_MISC(trace, "Closing stream with StatusCode {}", code);
-  return grpc::Status(code, consumeRepeatedString());
+  ENVOY_LOG_MISC(trace, "Closing stream with StatusCode {}", static_cast<int>(code));
+  return {code, consumeRepeatedString()};
 }
 
 // TODO(ikepolinsky): implement this function

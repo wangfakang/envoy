@@ -1,56 +1,38 @@
 #include "source/extensions/filters/http/rate_limit_quota/client_impl.h"
 
-#include "source/common/tracing/http_tracer_impl.h"
+#include <cstddef>
+#include <memory>
+
+#include "envoy/type/v3/ratelimit_strategy.pb.h"
+#include "envoy/type/v3/token_bucket.pb.h"
+
+#include "source/common/common/logger.h"
+#include "source/extensions/filters/http/rate_limit_quota/global_client_impl.h"
+#include "source/extensions/filters/http/rate_limit_quota/quota_bucket_cache.h"
 
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
 namespace RateLimitQuota {
 
-void RateLimitClientImpl::onRemoteClose(Grpc::Status::GrpcStatus, const std::string&) {
-  // TODO(tyxia) Add implementation later.
-  stream_closed_ = true;
+using BucketAction = RateLimitQuotaResponse::BucketAction;
+
+void LocalRateLimitClientImpl::createBucket(
+    const BucketId& bucket_id, size_t id, const BucketAction& default_bucket_action,
+    std::unique_ptr<envoy::type::v3::RateLimitStrategy> fallback_action,
+    std::chrono::milliseconds fallback_ttl, bool initial_request_allowed) {
+  // Intentionally crash if the local client is initialized with a null global
+  // client or TLS slot due to a bug.
+  global_client_->createBucket(bucket_id, id, default_bucket_action, std::move(fallback_action),
+                               fallback_ttl, initial_request_allowed);
 }
 
-void RateLimitClientImpl::rateLimit(RateLimitQuotaCallbacks& callbacks) {
-  ASSERT(callbacks_ == nullptr);
-  callbacks_ = &callbacks;
-  ASSERT(stream_ != nullptr);
-  // TODO(tyxia) Build the report and handle end_stream later.
-  envoy::service::rate_limit_quota::v3::RateLimitQuotaUsageReports reports;
-  send(std::move(reports), /*end_stream=*/true);
-}
-
-void RateLimitClientImpl::send(
-    envoy::service::rate_limit_quota::v3::RateLimitQuotaUsageReports&& reports, bool end_stream) {
-  stream_->sendMessage(std::move(reports), end_stream);
-}
-
-absl::Status RateLimitClientImpl::startStream(const StreamInfo::StreamInfo& stream_info) {
-  // Starts stream if it has not been opened yet.
-  if (stream_ == nullptr) {
-    stream_ = aync_client_.start(
-        *Protobuf::DescriptorPool::generated_pool()->FindMethodByName(
-            "envoy.service.rate_limit_quota.v3.RateLimitQuotaService.StreamRateLimitQuotas"),
-        *this,
-        Http::AsyncClient::RequestOptions().setParentContext(
-            Http::AsyncClient::ParentContext{&stream_info}));
-  }
-  return absl::OkStatus();
-}
-
-void RateLimitClientImpl::onReceiveMessage(RateLimitQuotaResponsePtr&& response) {
-  ASSERT(callbacks_ != nullptr);
-  callbacks_->onQuotaResponse(*response);
-}
-
-void RateLimitClientImpl::closeStream() {
-  // Close the stream if it is in open state.
-  if (stream_ != nullptr && !stream_closed_) {
-    stream_->closeStream();
-    stream_closed_ = true;
-    stream_->resetStream();
-  }
+std::shared_ptr<CachedBucket> LocalRateLimitClientImpl::getBucket(size_t id) {
+  std::shared_ptr<BucketsCache> buckets_cache = getBucketsCache();
+  // Intentionally crash if the client is initialized with a null global cache
+  // or TLS slot due to a bug.
+  auto bucket_it = buckets_cache->find(id);
+  return (bucket_it != buckets_cache->end()) ? bucket_it->second : nullptr;
 }
 
 } // namespace RateLimitQuota

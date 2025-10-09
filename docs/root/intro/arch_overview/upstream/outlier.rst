@@ -64,8 +64,7 @@ consecutive 5xx) or at a specified interval (for example in the case of periodic
 ejection algorithm works as follows:
 
 #. A host is determined to be an outlier.
-#. If no hosts have been ejected, Envoy will eject the host immediately. Otherwise, it checks to make
-   sure the number of ejected hosts is below the allowed threshold (specified via the
+#. It checks to make sure the number of ejected hosts is below the allowed threshold (specified via the
    :ref:`outlier_detection.max_ejection_percent<envoy_v3_api_field_config.cluster.v3.OutlierDetection.max_ejection_percent>`
    setting). If the number of ejected hosts is above the threshold, the host is not ejected.
 #. The host is ejected for some number of milliseconds. Ejection means that the host is marked
@@ -87,6 +86,18 @@ ejection algorithm works as follows:
 #. An ejected host will automatically be brought back into service after the ejection time has
    been satisfied. Generally, outlier detection is used alongside :ref:`active health checking
    <arch_overview_health_checking>` for a comprehensive health checking solution.
+
+.. note::
+
+  If :ref:`active health checking <arch_overview_health_checking>` is also configured, a successful active health check unejects the host and
+  clears all outlier detection counters. If the host has not reached :ref:`unhealthy_threshold<envoy_v3_api_field_config.core.v3.HealthCheck.unhealthy_threshold>`
+  failed health checks yet, a single successful health check will uneject the host. If the FAILED_ACTIVE_HC health flag is set for the host,
+  :ref:`healthy_threshold<envoy_v3_api_field_config.core.v3.HealthCheck.healthy_threshold>` consecutive successful health checks
+  will uneject the host (and clear the FAILED_ACTIVE_HC flag).
+  If your active health check is not validating data plane traffic then in situations where
+  active health checking passes but the traffic is failing, the endpoint will be unejected prematurely. To disable this option then set
+  :ref:`outlier_detection.successful_active_health_check_uneject_host<envoy_v3_api_field_config.cluster.v3.OutlierDetection.successful_active_health_check_uneject_host>`
+  configuration flag to ``false``.
 
 Detection types
 ---------------
@@ -194,18 +205,25 @@ required request volume in an interval is less than the
 :ref:`outlier_detection.failure_percentage_minimum_hosts<envoy_v3_api_field_config.cluster.v3.OutlierDetection.failure_percentage_minimum_hosts>`
 value.
 
-.. _arch_overview_outlier_detection_grpc:
+.. _arch_overview_outlier_detection_error_mapping:
+
+Error Mapping
+-------------
+
+By default outlier detection understands only HTTP status codes. Responses' status codes 5xx are threated as
+errors and any other codes are treated as success. If there is a need to treat a response in different way,
+mapping is required. Currently the following mappings are available:
 
 gRPC
-----------------------
+^^^^
 
 For gRPC requests, the outlier detection will use the HTTP status mapped from the `grpc-status <https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#responses>`_ response header.
 
+HTTP
+^^^^
 
-.. note::
-
-  If :ref: `active health <arch_overview_health_checking>` is also configured, a successful active health check unejects the host and
-  clears all outlier detection counters.
+If there is a need to redefine whether a response should be treated as error, it can be done by configuring
+:ref:`outlier_detection<envoy_v3_api_field_extensions.upstreams.http.v3.HttpProtocolOptions.outlier_detection>` section in cluster's :ref:`extension_protocol_options<envoy_v3_api_field_config.cluster.v3.Cluster.typed_extension_protocol_options>`. If a response matches the matcher, it is reported to outlier detection as code 5xx (error). If the response does not match the matcher, it is forwarded to the outlier detection as code 200 (success).
 
 .. _arch_overview_outlier_detection_logging:
 

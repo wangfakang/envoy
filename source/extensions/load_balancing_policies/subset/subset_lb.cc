@@ -11,112 +11,58 @@
 #include "source/common/config/metadata.h"
 #include "source/common/config/well_known_names.h"
 #include "source/common/protobuf/utility.h"
-#include "source/common/upstream/load_balancer_impl.h"
-#include "source/extensions/load_balancing_policies/maglev/maglev_lb.h"
-#include "source/extensions/load_balancing_policies/ring_hash/ring_hash_lb.h"
 
 #include "absl/container/node_hash_set.h"
 
 namespace Envoy {
 namespace Upstream {
 
-using HostPredicate = std::function<bool(const Host&)>;
+namespace {
 
-LegacyChildLoadBalancerCreatorImpl::LegacyChildLoadBalancerCreatorImpl(
-    LoadBalancerType lb_type,
-    OptRef<const envoy::config::cluster::v3::Cluster::RingHashLbConfig> lb_ring_hash_config,
-    OptRef<const envoy::config::cluster::v3::Cluster::MaglevLbConfig> lb_maglev_config,
-    OptRef<const envoy::config::cluster::v3::Cluster::RoundRobinLbConfig> round_robin_config,
-    OptRef<const envoy::config::cluster::v3::Cluster::LeastRequestLbConfig> least_request_config,
-    const envoy::config::cluster::v3::Cluster::CommonLbConfig& common_config)
-    : lb_type_(lb_type),
-      lb_ring_hash_config_(
-          lb_ring_hash_config.has_value()
-              ? std::make_unique<const envoy::config::cluster::v3::Cluster::RingHashLbConfig>(
-                    lb_ring_hash_config.ref())
-              : nullptr),
-      lb_maglev_config_(
-          lb_maglev_config.has_value()
-              ? std::make_unique<const envoy::config::cluster::v3::Cluster::MaglevLbConfig>(
-                    lb_maglev_config.ref())
-              : nullptr),
-      round_robin_config_(
-          round_robin_config.has_value()
-              ? std::make_unique<const envoy::config::cluster::v3::Cluster::RoundRobinLbConfig>(
-                    round_robin_config.ref())
-              : nullptr),
-      least_request_config_(
-          least_request_config.has_value()
-              ? std::make_unique<const envoy::config::cluster::v3::Cluster::LeastRequestLbConfig>(
-                    least_request_config.ref())
-              : nullptr),
-      common_config_(common_config) {}
-
-std::pair<Upstream::ThreadAwareLoadBalancerPtr, Upstream::LoadBalancerPtr>
-LegacyChildLoadBalancerCreatorImpl::createLoadBalancer(
-    const Upstream::PrioritySet& child_priority_set,
-    const Upstream::PrioritySet* local_priority_set, ClusterLbStats& stats, Stats::Scope& scope,
-    Runtime::Loader& runtime, Random::RandomGenerator& random, TimeSource& time_source) {
-  switch (lb_type_) {
-  case Upstream::LoadBalancerType::LeastRequest: {
-    Upstream::LoadBalancerPtr lb = std::make_unique<Upstream::LeastRequestLoadBalancer>(
-        child_priority_set, local_priority_set, stats, runtime, random, common_config_,
-        lbLeastRequestConfig(), time_source);
-    return {nullptr, std::move(lb)};
+/**
+ * Iterates all the selectors and finds the first one that match_criteria contains all the keys
+ * of the selector. Returns nullptr if no selector matches, otherwise returns sub match criteria
+ * that contains only the keys of the selector.
+ */
+Router::MetadataMatchCriteriaConstPtr
+filterCriteriaBySelectors(const std::vector<SubsetSelectorPtr>& subset_selectors,
+                          const Router::MetadataMatchCriteria* match_criteria) {
+  if (match_criteria != nullptr) {
+    for (const auto& selector : subset_selectors) {
+      const auto& selector_keys = selector->selectorKeys();
+      auto sub_match_criteria = match_criteria->filterMatchCriteria(selector_keys);
+      if (sub_match_criteria != nullptr &&
+          sub_match_criteria->metadataMatchCriteria().size() == selector_keys.size()) {
+        return sub_match_criteria;
+      }
+    }
   }
-  case Upstream::LoadBalancerType::Random: {
-    Upstream::LoadBalancerPtr lb = std::make_unique<Upstream::RandomLoadBalancer>(
-        child_priority_set, local_priority_set, stats, runtime, random, common_config_);
-    return {nullptr, std::move(lb)};
-  }
-  case Upstream::LoadBalancerType::RoundRobin: {
-    Upstream::LoadBalancerPtr lb = std::make_unique<Upstream::RoundRobinLoadBalancer>(
-        child_priority_set, local_priority_set, stats, runtime, random, common_config_,
-        lbRoundRobinConfig(), time_source);
-    return {nullptr, std::move(lb)};
-  }
-  case Upstream::LoadBalancerType::RingHash: {
-    // TODO(mattklein123): The ring hash LB is thread aware, but currently the subset LB is not.
-    // We should make the subset LB thread aware since the calculations are costly, and then we
-    // can also use a thread aware sub-LB properly. The following works fine but is not optimal.
-    Upstream::ThreadAwareLoadBalancerPtr lb = std::make_unique<Upstream::RingHashLoadBalancer>(
-        child_priority_set, stats, scope, runtime, random, lbRingHashConfig(), common_config_);
-    return {std::move(lb), nullptr};
-  }
-  case Upstream::LoadBalancerType::Maglev: {
-    // TODO(mattklein123): The Maglev LB is thread aware, but currently the subset LB is not.
-    // We should make the subset LB thread aware since the calculations are costly, and then we
-    // can also use a thread aware sub-LB properly. The following works fine but is not optimal.
-
-    Upstream::ThreadAwareLoadBalancerPtr lb = std::make_unique<Upstream::MaglevLoadBalancer>(
-        child_priority_set, stats, scope, runtime, random, lbMaglevConfig(), common_config_);
-    return {std::move(lb), nullptr};
-  }
-  case Upstream::LoadBalancerType::OriginalDst:
-  case Upstream::LoadBalancerType::ClusterProvided:
-  case Upstream::LoadBalancerType::LoadBalancingPolicyConfig:
-    // These load balancer types can only be created when there is no subset configuration.
-    PANIC("not implemented");
-  }
-  return {nullptr, nullptr};
+  return nullptr;
 }
 
-SubsetLoadBalancer::SubsetLoadBalancer(const LoadBalancerSubsetInfo& subsets,
-                                       ChildLoadBalancerCreatorPtr child_lb,
+} // namespace
+
+using HostPredicate = std::function<bool(const Host&)>;
+
+SubsetLoadBalancer::SubsetLoadBalancer(const SubsetLoadBalancerConfig& lb_config,
+                                       const Upstream::ClusterInfo& cluster_info,
                                        const PrioritySet& priority_set,
                                        const PrioritySet* local_priority_set, ClusterLbStats& stats,
                                        Stats::Scope& scope, Runtime::Loader& runtime,
                                        Random::RandomGenerator& random, TimeSource& time_source)
-    : stats_(stats), scope_(scope), runtime_(runtime), random_(random), time_source_(time_source),
-      fallback_policy_(subsets.fallbackPolicy()),
-      metadata_fallback_policy_(subsets.metadataFallbackPolicy()),
-      default_subset_metadata_(subsets.defaultSubset().fields().begin(),
-                               subsets.defaultSubset().fields().end()),
-      subset_selectors_(subsets.subsetSelectors()), original_priority_set_(priority_set),
-      original_local_priority_set_(local_priority_set), child_lb_creator_(std::move(child_lb)),
-      locality_weight_aware_(subsets.localityWeightAware()),
-      scale_locality_weight_(subsets.scaleLocalityWeight()), list_as_any_(subsets.listAsAny()) {
-  ASSERT(subsets.isEnabled());
+    : lb_config_(lb_config), cluster_info_(cluster_info), stats_(stats), scope_(scope),
+      runtime_(runtime), random_(random), time_source_(time_source),
+      fallback_policy_(lb_config_.subsetInfo().fallbackPolicy()),
+      metadata_fallback_policy_(lb_config_.subsetInfo().metadataFallbackPolicy()),
+      default_subset_metadata_(lb_config_.subsetInfo().defaultSubset().fields().begin(),
+                               lb_config_.subsetInfo().defaultSubset().fields().end()),
+      subset_selectors_(lb_config_.subsetInfo().subsetSelectors()),
+      original_priority_set_(priority_set), original_local_priority_set_(local_priority_set),
+      locality_weight_aware_(lb_config_.subsetInfo().localityWeightAware()),
+      scale_locality_weight_(lb_config_.subsetInfo().scaleLocalityWeight()),
+      list_as_any_(lb_config_.subsetInfo().listAsAny()),
+      allow_redundant_keys_(lb_config_.subsetInfo().allowRedundantKeys()) {
+  ASSERT(lb_config_.subsetInfo().isEnabled());
 
   if (fallback_policy_ != envoy::config::cluster::v3::Cluster::LbSubsetConfig::NO_FALLBACK) {
     if (fallback_policy_ == envoy::config::cluster::v3::Cluster::LbSubsetConfig::ANY_ENDPOINT) {
@@ -131,7 +77,7 @@ SubsetLoadBalancer::SubsetLoadBalancer(const LoadBalancerSubsetInfo& subsets,
     }
   }
 
-  if (subsets.panicModeAny()) {
+  if (lb_config_.subsetInfo().panicModeAny()) {
     initSubsetAnyOnce();
     panic_mode_subset_ = subset_any_;
   }
@@ -235,13 +181,13 @@ void SubsetLoadBalancer::initSelectorFallbackSubset(
   }
 }
 
-HostConstSharedPtr SubsetLoadBalancer::chooseHost(LoadBalancerContext* context) {
+HostSelectionResponse SubsetLoadBalancer::chooseHost(LoadBalancerContext* context) {
   if (metadata_fallback_policy_ !=
       envoy::config::cluster::v3::
           Cluster_LbSubsetConfig_LbSubsetMetadataFallbackPolicy_FALLBACK_LIST) {
     return chooseHostIteration(context);
   }
-  const ProtobufWkt::Value* metadata_fallbacks = getMetadataFallbackList(context);
+  const Protobuf::Value* metadata_fallbacks = getMetadataFallbackList(context);
   if (metadata_fallbacks == nullptr) {
     return chooseHostIteration(context);
   }
@@ -284,7 +230,7 @@ SubsetLoadBalancer::removeMetadataFallbackList(LoadBalancerContext* context) {
   return {context, to_preserve};
 }
 
-const ProtobufWkt::Value*
+const Protobuf::Value*
 SubsetLoadBalancer::getMetadataFallbackList(LoadBalancerContext* context) const {
   if (context == nullptr) {
     return nullptr;
@@ -304,20 +250,35 @@ SubsetLoadBalancer::getMetadataFallbackList(LoadBalancerContext* context) const 
 
 HostConstSharedPtr SubsetLoadBalancer::chooseHostIteration(LoadBalancerContext* context) {
   if (context) {
+    LoadBalancerContext* actual_used_context = context;
+    std::unique_ptr<LoadBalancerContextWrapper> actual_used_context_wrapper;
+
+    if (allow_redundant_keys_) {
+      // If redundant keys are allowed then we can filter the metadata match criteria by the
+      // selectors first to reduce the redundant keys.
+      auto actual_used_criteria =
+          filterCriteriaBySelectors(subset_selectors_, context->metadataMatchCriteria());
+      if (actual_used_criteria != nullptr) {
+        actual_used_context_wrapper =
+            std::make_unique<LoadBalancerContextWrapper>(context, std::move(actual_used_criteria));
+        actual_used_context = actual_used_context_wrapper.get();
+      }
+    }
+
     bool host_chosen;
-    HostConstSharedPtr host = tryChooseHostFromContext(context, host_chosen);
+    HostConstSharedPtr host = tryChooseHostFromContext(actual_used_context, host_chosen);
     if (host_chosen) {
       // Subset lookup succeeded, return this result even if it's nullptr.
       return host;
     }
     // otherwise check if there is fallback policy configured for given route metadata
     absl::optional<SubsetSelectorFallbackParamsRef> selector_fallback_params =
-        tryFindSelectorFallbackParams(context);
+        tryFindSelectorFallbackParams(actual_used_context);
     if (selector_fallback_params &&
         selector_fallback_params->get().fallback_policy_ !=
             envoy::config::cluster::v3::Cluster::LbSubsetConfig::LbSubsetSelector::NOT_DEFINED) {
       // return result according to configured fallback policy
-      return chooseHostForSelectorFallbackPolicy(*selector_fallback_params, context);
+      return chooseHostForSelectorFallbackPolicy(*selector_fallback_params, actual_used_context);
     }
   }
 
@@ -325,17 +286,17 @@ HostConstSharedPtr SubsetLoadBalancer::chooseHostIteration(LoadBalancerContext* 
     return nullptr;
   }
 
-  HostConstSharedPtr host = fallback_subset_->lb_subset_->chooseHost(context);
-  if (host != nullptr) {
+  HostSelectionResponse host_response = fallback_subset_->lb_subset_->chooseHost(context);
+  if (host_response.host || host_response.cancelable) {
     stats_.lb_subsets_fallback_.inc();
-    return host;
+    return host_response.host;
   }
 
   if (panic_mode_subset_ != nullptr) {
-    HostConstSharedPtr host = panic_mode_subset_->lb_subset_->chooseHost(context);
-    if (host != nullptr) {
+    HostSelectionResponse host_response = panic_mode_subset_->lb_subset_->chooseHost(context);
+    if (host_response.host || host_response.cancelable) {
       stats_.lb_subsets_fallback_panic_.inc();
-      return host;
+      return host_response.host;
     }
   }
 
@@ -377,11 +338,13 @@ HostConstSharedPtr SubsetLoadBalancer::chooseHostForSelectorFallbackPolicy(
   if (fallback_policy ==
           envoy::config::cluster::v3::Cluster::LbSubsetConfig::LbSubsetSelector::ANY_ENDPOINT &&
       subset_any_ != nullptr) {
-    return subset_any_->lb_subset_->chooseHost(context);
+    return Upstream::LoadBalancer::onlyAllowSynchronousHostSelection(
+        subset_any_->lb_subset_->chooseHost(context));
   } else if (fallback_policy == envoy::config::cluster::v3::Cluster::LbSubsetConfig::
                                     LbSubsetSelector::DEFAULT_SUBSET &&
              subset_default_ != nullptr) {
-    return subset_default_->lb_subset_->chooseHost(context);
+    return Upstream::LoadBalancer::onlyAllowSynchronousHostSelection(
+        subset_default_->lb_subset_->chooseHost(context));
   } else if (fallback_policy ==
              envoy::config::cluster::v3::Cluster::LbSubsetConfig::LbSubsetSelector::KEYS_SUBSET) {
     ASSERT(fallback_params.fallback_keys_subset_);
@@ -390,7 +353,7 @@ HostConstSharedPtr SubsetLoadBalancer::chooseHostForSelectorFallbackPolicy(
     // Perform whole subset load balancing again with reduced metadata match criteria
     return chooseHostIteration(filtered_context.get());
   } else {
-    return nullptr;
+    return {nullptr};
   }
 }
 
@@ -403,19 +366,20 @@ HostConstSharedPtr SubsetLoadBalancer::tryChooseHostFromContext(LoadBalancerCont
   host_chosen = false;
   const Router::MetadataMatchCriteria* match_criteria = context->metadataMatchCriteria();
   if (!match_criteria) {
-    return nullptr;
+    return {nullptr};
   }
 
   // Route has metadata match criteria defined, see if we have a matching subset.
   LbSubsetEntryPtr entry = findSubset(match_criteria->metadataMatchCriteria());
   if (entry == nullptr || !entry->active()) {
     // No matching subset or subset not active: use fallback policy.
-    return nullptr;
+    return {nullptr};
   }
 
   host_chosen = true;
   stats_.lb_subsets_selected_.inc();
-  return entry->lb_subset_->chooseHost(context);
+  return Upstream::LoadBalancer::onlyAllowSynchronousHostSelection(
+      entry->lb_subset_->chooseHost(context));
 }
 
 // Iterates over the given metadata match criteria (which must be lexically sorted by key) and
@@ -591,7 +555,7 @@ SubsetLoadBalancer::extractSubsetMetadata(const std::set<std::string>& subset_ke
       break;
     }
 
-    if (list_as_any_ && it->second.kind_case() == ProtobufWkt::Value::kListValue) {
+    if (list_as_any_ && it->second.kind_case() == Protobuf::Value::kListValue) {
       // If the list of kvs is empty, we initialize one kvs for each value in the list.
       // Otherwise, we branch the list of kvs by generating one new kvs per old kvs per
       // new value.
@@ -645,7 +609,7 @@ std::string SubsetLoadBalancer::describeMetadata(const SubsetLoadBalancer::Subse
       first = false;
     }
 
-    const ProtobufWkt::Value& value = it.second;
+    const Protobuf::Value& value = it.second;
     buf << it.first << "=" << MessageUtil::getJsonStringFromMessageOrError(value);
   }
   return buf.str();
@@ -659,7 +623,7 @@ SubsetLoadBalancer::findOrCreateLbSubsetEntry(LbSubsetMap& subsets, const Subset
   ASSERT(idx < kvs.size());
 
   const std::string& name = kvs[idx].first;
-  const ProtobufWkt::Value& pb_value = kvs[idx].second;
+  const Protobuf::Value& pb_value = kvs[idx].second;
   const HashedValue value(pb_value);
 
   LbSubsetEntryPtr entry;
@@ -751,17 +715,12 @@ SubsetLoadBalancer::PrioritySubsetImpl::PrioritySubsetImpl(const SubsetLoadBalan
   // Create at least one host set.
   getOrCreateHostSet(0);
 
-  auto lb_pair = subset_lb.child_lb_creator_->createLoadBalancer(
-      *this, original_local_priority_set_, subset_lb.stats_, subset_lb.scope_, subset_lb.runtime_,
-      subset_lb.random_, subset_lb.time_source_);
-
-  if (lb_pair.first != nullptr) {
-    thread_aware_lb_ = std::move(lb_pair.first);
-    thread_aware_lb_->initialize();
-    lb_ = thread_aware_lb_->factory()->create({*this, original_local_priority_set_});
-  } else {
-    lb_ = std::move(lb_pair.second);
-  }
+  thread_aware_lb_ =
+      subset_lb.lb_config_.createLoadBalancer(subset_lb.cluster_info_, *this, subset_lb.runtime_,
+                                              subset_lb.random_, subset_lb.time_source_);
+  ASSERT(thread_aware_lb_ != nullptr);
+  THROW_IF_NOT_OK(thread_aware_lb_->initialize());
+  lb_ = thread_aware_lb_->factory()->create({*this, original_local_priority_set_});
 
   triggerCallbacks();
 }
@@ -832,7 +791,8 @@ void SubsetLoadBalancer::HostSubsetImpl::update(const HostHashSet& matching_host
       HostSetImpl::updateHostsParams(
           hosts, hosts_per_locality, healthy_hosts, healthy_hosts_per_locality, degraded_hosts,
           degraded_hosts_per_locality, excluded_hosts, excluded_hosts_per_locality),
-      determineLocalityWeights(*hosts_per_locality), hosts_added, hosts_removed, absl::nullopt);
+      determineLocalityWeights(*hosts_per_locality), hosts_added, hosts_removed,
+      original_host_set_.weightedPriorityHealth(), original_host_set_.overprovisioningFactor());
 }
 
 LocalityWeightsConstSharedPtr SubsetLoadBalancer::HostSubsetImpl::determineLocalityWeights(
@@ -870,7 +830,8 @@ LocalityWeightsConstSharedPtr SubsetLoadBalancer::HostSubsetImpl::determineLocal
 }
 
 HostSetImplPtr SubsetLoadBalancer::PrioritySubsetImpl::createHostSet(
-    uint32_t priority, absl::optional<uint32_t> overprovisioning_factor) {
+    uint32_t priority, absl::optional<bool> weighted_priority_health,
+    absl::optional<uint32_t> overprovisioning_factor) {
   // Use original hostset's overprovisioning_factor.
   RELEASE_ASSERT(priority < original_priority_set_.hostSetsPerPriority().size(), "");
 
@@ -878,6 +839,8 @@ HostSetImplPtr SubsetLoadBalancer::PrioritySubsetImpl::createHostSet(
 
   ASSERT(!overprovisioning_factor.has_value() ||
          overprovisioning_factor.value() == host_set->overprovisioningFactor());
+  ASSERT(!weighted_priority_health.has_value() ||
+         weighted_priority_health.value() == host_set->weightedPriorityHealth());
   return HostSetImplPtr{
       new HostSubsetImpl(*host_set, locality_weight_aware_, scale_locality_weight_)};
 }
@@ -899,9 +862,36 @@ void SubsetLoadBalancer::PrioritySubsetImpl::update(uint32_t priority,
   // Create a new worker local LB if needed.
   // TODO(mattklein123): See the PrioritySubsetImpl constructor for additional comments on how
   // we can do better here.
-  if (thread_aware_lb_ != nullptr) {
+  if (thread_aware_lb_ != nullptr && thread_aware_lb_->factory()->recreateOnHostChange()) {
     lb_ = thread_aware_lb_->factory()->create({*this, original_local_priority_set_});
   }
+}
+
+void SubsetLoadBalancer::PriorityLbSubset::finalize(uint32_t priority) {
+  while (host_sets_.size() <= priority) {
+    host_sets_.push_back({HostHashSet(), HostHashSet()});
+  }
+  auto& [old_hosts, new_hosts] = host_sets_[priority];
+
+  HostVector added;
+  HostVector removed;
+
+  for (const auto& host : old_hosts) {
+    if (new_hosts.count(host) == 0) {
+      removed.emplace_back(host);
+    }
+  }
+
+  for (const auto& host : new_hosts) {
+    if (old_hosts.count(host) == 0) {
+      added.emplace_back(host);
+    }
+  }
+
+  subset_.update(priority, new_hosts, added, removed);
+
+  old_hosts.swap(new_hosts);
+  new_hosts.clear();
 }
 
 SubsetLoadBalancer::LoadBalancerContextWrapper::LoadBalancerContextWrapper(
@@ -915,7 +905,7 @@ SubsetLoadBalancer::LoadBalancerContextWrapper::LoadBalancerContextWrapper(
 }
 
 SubsetLoadBalancer::LoadBalancerContextWrapper::LoadBalancerContextWrapper(
-    LoadBalancerContext* wrapped, const ProtobufWkt::Struct& metadata_match_criteria_override)
+    LoadBalancerContext* wrapped, const Protobuf::Struct& metadata_match_criteria_override)
     : wrapped_(wrapped) {
   ASSERT(wrapped->metadataMatchCriteria());
   metadata_match_ =

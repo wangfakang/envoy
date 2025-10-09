@@ -126,7 +126,7 @@ TEST_F(DnsFactoryTest, LegacyDnsResolverDataDnsCacheConfigNonDefault) {
 
 // Test checkDnsResolutionConfigExist() function with Bootstrap type,
 // and dns_resolution_config exists.
-TEST_F(DnsFactoryTest, CheckDnsResolutionConfigExistWithBoostrap) {
+TEST_F(DnsFactoryTest, CheckDnsResolutionConfigExistWithBootstrap) {
   envoy::config::bootstrap::v3::Bootstrap bootstrap_config;
   envoy::config::core::v3::TypedExtensionConfig typed_dns_resolver_config;
   envoy::extensions::network::dns_resolver::cares::v3::CaresDnsResolverConfig cares;
@@ -151,7 +151,7 @@ TEST_F(DnsFactoryTest, CheckDnsResolutionConfigExistWithBoostrap) {
 
 // Test checkTypedDnsResolverConfigExist() function with Bootstrap type,
 // and typed_dns_resolver_config exists.
-TEST_F(DnsFactoryTest, CheckTypedDnsResolverConfigExistWithBoostrap) {
+TEST_F(DnsFactoryTest, CheckTypedDnsResolverConfigExistWithBootstrap) {
   envoy::config::bootstrap::v3::Bootstrap bootstrap_config;
   envoy::config::core::v3::TypedExtensionConfig typed_dns_resolver_config;
   envoy::extensions::network::dns_resolver::cares::v3::CaresDnsResolverConfig cares;
@@ -180,7 +180,7 @@ TEST_F(DnsFactoryTest, CheckTypedDnsResolverConfigExistWithBoostrap) {
 // Test checkTypedDnsResolverConfigExist() function with Bootstrap type.
 // A garbage typed_dns_resolver_config type foo exists with dns_resolution_config.
 // In this case, the typed_dns_resolver_config is copied over.
-TEST_F(DnsFactoryTest, CheckBothTypedAndDnsResolutionConfigExistWithBoostrapWrongType) {
+TEST_F(DnsFactoryTest, CheckBothTypedAndDnsResolutionConfigExistWithBootstrapWrongType) {
   envoy::config::bootstrap::v3::Bootstrap bootstrap_config;
   envoy::config::core::v3::TypedExtensionConfig typed_dns_resolver_config;
 
@@ -211,7 +211,7 @@ TEST_F(DnsFactoryTest, CheckBothTypedAndDnsResolutionConfigExistWithBoostrapWron
   bootstrap_config.set_use_tcp_for_dns_lookups(false);
 
   EXPECT_TRUE(checkTypedDnsResolverConfigExist(bootstrap_config, typed_dns_resolver_config));
-  EXPECT_FALSE(checkUseAppleApiForDnsLookups(typed_dns_resolver_config));
+  EXPECT_FALSE(tryUseAppleApiForDnsLookups(typed_dns_resolver_config));
   typed_dns_resolver_config = makeDnsResolverConfig(bootstrap_config);
 
   // verify the typed_dns_resolver_config data matching DNS resolution config

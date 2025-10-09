@@ -2,6 +2,8 @@
 
 #include "envoy/config/cluster/v3/cluster.pb.h"
 
+#include "source/common/runtime/runtime_features.h"
+
 namespace Envoy {
 namespace Upstream {
 namespace {
@@ -10,6 +12,10 @@ bool shouldUseCompactTable(size_t num_hosts, uint64_t table_size) {
   if constexpr (!(ENVOY_BIT_ARRAY_SUPPORTED)) {
     return false;
   }
+
+#ifdef MAGLEV_LB_FORCE_ORIGINAL_IMPL
+  return false;
+#endif
 
   if (num_hosts > MaglevTable::MaxNumberOfHostsForCompactMaglev) {
     return false;
@@ -35,8 +41,7 @@ public:
                     bool use_hostname_for_hashing, MaglevLoadBalancerStats& stats) {
 
     MaglevTableSharedPtr maglev_table;
-    if (shouldUseCompactTable(normalized_host_weights.size(), table_size) &&
-        Runtime::runtimeFeatureEnabled("envoy.reloadable_features.allow_compact_maglev")) {
+    if (shouldUseCompactTable(normalized_host_weights.size(), table_size)) {
       maglev_table =
           std::make_shared<CompactMaglevTable>(normalized_host_weights, max_normalized_weight,
                                                table_size, use_hostname_for_hashing, stats);
@@ -55,6 +60,24 @@ public:
 };
 
 } // namespace
+
+TypedMaglevLbConfig::TypedMaglevLbConfig(const CommonLbConfigProto& common_lb_config,
+                                         const LegacyMaglevLbProto& lb_config) {
+  LoadBalancerConfigHelper::convertHashLbConfigTo(common_lb_config, lb_config_);
+  if (common_lb_config.has_locality_weighted_lb_config()) {
+    lb_config_.mutable_locality_weighted_lb_config();
+  }
+
+  if (lb_config.has_table_size()) {
+    *lb_config_.mutable_table_size() = lb_config.table_size();
+  }
+}
+
+TypedMaglevLbConfig::TypedMaglevLbConfig(const MaglevLbProto& lb_config,
+                                         Regex::Engine& regex_engine, absl::Status& creation_status)
+    : TypedHashLbConfigBase(lb_config.consistent_hashing_lb_config().hash_policy(), regex_engine,
+                            creation_status),
+      lb_config_(lb_config) {}
 
 ThreadAwareLoadBalancerBase::HashingLoadBalancerSharedPtr
 MaglevLoadBalancer::createLoadBalancer(const NormalizedHostWeightVector& normalized_host_weights,
@@ -81,16 +104,32 @@ void MaglevTable::constructMaglevTableInternal(
     return;
   }
 
-  // Implementation of pseudocode listing 1 in the paper (see header file for more info).
-  std::vector<TableBuildEntry> table_build_entries;
-  table_build_entries.reserve(normalized_host_weights.size());
+  // Prepare stable (sorted) vector of host_weight.
+  // Maglev requires stable order of table_build_entries because the hash table will be filled in
+  // the order. Unstable table_build_entries results the change of backend assignment.
+  std::vector<std::tuple<absl::string_view, HostConstSharedPtr, double>> sorted_host_weights;
+  sorted_host_weights.reserve(normalized_host_weights.size());
   for (const auto& host_weight : normalized_host_weights) {
     const auto& host = host_weight.first;
     const absl::string_view key_to_hash = hashKey(host, use_hostname_for_hashing);
     ASSERT(!key_to_hash.empty());
+
+    sorted_host_weights.emplace_back(key_to_hash, host_weight.first, host_weight.second);
+  }
+
+  std::sort(sorted_host_weights.begin(), sorted_host_weights.end());
+
+  // Implementation of pseudocode listing 1 in the paper (see header file for more info).
+  std::vector<TableBuildEntry> table_build_entries;
+  table_build_entries.reserve(normalized_host_weights.size());
+  for (const auto& sorted_host_weight : sorted_host_weights) {
+    const auto& key_to_hash = std::get<0>(sorted_host_weight);
+    const auto& host = std::get<1>(sorted_host_weight);
+    const auto& weight = std::get<2>(sorted_host_weight);
+
     table_build_entries.emplace_back(host, HashUtil::xxHash64(key_to_hash) % table_size_,
                                      (HashUtil::xxHash64(key_to_hash, 1) % (table_size_ - 1)) + 1,
-                                     host_weight.second);
+                                     weight);
   }
 
   constructImplementationInternals(table_build_entries, max_normalized_weight);
@@ -221,9 +260,9 @@ void CompactMaglevTable::logMaglevTable(bool use_hostname_for_hashing) const {
 MaglevTable::MaglevTable(uint64_t table_size, MaglevLoadBalancerStats& stats)
     : table_size_(table_size), stats_(stats) {}
 
-HostConstSharedPtr OriginalMaglevTable::chooseHost(uint64_t hash, uint32_t attempt) const {
+HostSelectionResponse OriginalMaglevTable::chooseHost(uint64_t hash, uint32_t attempt) const {
   if (table_.empty()) {
-    return nullptr;
+    return {nullptr};
   }
 
   if (attempt > 0) {
@@ -233,12 +272,12 @@ HostConstSharedPtr OriginalMaglevTable::chooseHost(uint64_t hash, uint32_t attem
     hash ^= ~0ULL - attempt + 1;
   }
 
-  return table_[hash % table_size_];
+  return {table_[hash % table_size_]};
 }
 
-HostConstSharedPtr CompactMaglevTable::chooseHost(uint64_t hash, uint32_t attempt) const {
+HostSelectionResponse CompactMaglevTable::chooseHost(uint64_t hash, uint32_t attempt) const {
   if (host_table_.empty()) {
-    return nullptr;
+    return {nullptr};
   }
 
   if (attempt > 0) {
@@ -250,45 +289,20 @@ HostConstSharedPtr CompactMaglevTable::chooseHost(uint64_t hash, uint32_t attemp
 
   const uint32_t index = table_.get(hash % table_size_);
   ASSERT(index < host_table_.size(), "Compact MaglevTable index into host table out of range");
-  return host_table_[index];
+  return {host_table_[index]};
 }
 
 uint64_t MaglevTable::permutation(const TableBuildEntry& entry) {
   return (entry.offset_ + (entry.skip_ * entry.next_)) % table_size_;
 }
 
-MaglevLoadBalancer::MaglevLoadBalancer(
-    const PrioritySet& priority_set, ClusterLbStats& stats, Stats::Scope& scope,
-    Runtime::Loader& runtime, Random::RandomGenerator& random,
-    OptRef<const envoy::config::cluster::v3::Cluster::MaglevLbConfig> config,
-    const envoy::config::cluster::v3::Cluster::CommonLbConfig& common_config)
-    : ThreadAwareLoadBalancerBase(priority_set, stats, runtime, random,
-                                  PROTOBUF_PERCENT_TO_ROUNDED_INTEGER_OR_DEFAULT(
-                                      common_config, healthy_panic_threshold, 100, 50),
-                                  common_config.has_locality_weighted_lb_config()),
-      scope_(scope.createScope("maglev_lb.")), stats_(generateStats(*scope_)),
-      table_size_(config ? PROTOBUF_GET_WRAPPED_OR_DEFAULT(config.ref(), table_size,
-                                                           MaglevTable::DefaultTableSize)
-                         : MaglevTable::DefaultTableSize),
-      use_hostname_for_hashing_(
-          common_config.has_consistent_hashing_lb_config()
-              ? common_config.consistent_hashing_lb_config().use_hostname_for_hashing()
-              : false),
-      hash_balance_factor_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(
-          common_config.consistent_hashing_lb_config(), hash_balance_factor, 0)) {
-  ENVOY_LOG(debug, "maglev table size: {}", table_size_);
-  // The table size must be prime number.
-  if (!Primes::isPrime(table_size_)) {
-    throw EnvoyException("The table size of maglev must be prime number");
-  }
-}
-
-MaglevLoadBalancer::MaglevLoadBalancer(
-    const PrioritySet& priority_set, ClusterLbStats& stats, Stats::Scope& scope,
-    Runtime::Loader& runtime, Random::RandomGenerator& random, uint32_t healthy_panic_threshold,
-    const envoy::extensions::load_balancing_policies::maglev::v3::Maglev& config)
+MaglevLoadBalancer::MaglevLoadBalancer(const PrioritySet& priority_set, ClusterLbStats& stats,
+                                       Stats::Scope& scope, Runtime::Loader& runtime,
+                                       Random::RandomGenerator& random,
+                                       uint32_t healthy_panic_threshold,
+                                       const MaglevLbProto& config, HashPolicySharedPtr hash_policy)
     : ThreadAwareLoadBalancerBase(priority_set, stats, runtime, random, healthy_panic_threshold,
-                                  config.has_locality_weighted_lb_config()),
+                                  config.has_locality_weighted_lb_config(), std::move(hash_policy)),
       scope_(scope.createScope("maglev_lb.")), stats_(generateStats(*scope_)),
       table_size_(
           PROTOBUF_GET_WRAPPED_OR_DEFAULT(config, table_size, MaglevTable::DefaultTableSize)),

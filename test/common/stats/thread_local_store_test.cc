@@ -18,10 +18,12 @@
 #include "source/common/stats/tag_producer_impl.h"
 #include "source/common/stats/thread_local_store.h"
 
+#include "test/common/memory/memory_test_utility.h"
 #include "test/common/stats/real_thread_test_base.h"
 #include "test/common/stats/stat_test_utility.h"
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/server/instance.h"
+#include "test/mocks/server/server_factory_context.h"
 #include "test/mocks/stats/mocks.h"
 #include "test/mocks/thread_local/mocks.h"
 #include "test/test_common/logging.h"
@@ -101,6 +103,7 @@ public:
     return num_tls_histograms;
   }
 
+  NiceMock<Server::Configuration::MockServerFactoryContext> context_;
   SymbolTableImpl symbol_table_;
   NiceMock<Event::MockDispatcher> main_thread_dispatcher_;
   NiceMock<ThreadLocal::MockInstance> tls_;
@@ -227,6 +230,7 @@ public:
     return *predicates;
   }
 
+  NiceMock<Server::Configuration::MockServerFactoryContext> context_;
   SymbolTableImpl symbol_table_;
   NiceMock<Event::MockDispatcher> main_thread_dispatcher_;
   NiceMock<ThreadLocal::MockInstance> tls_;
@@ -602,6 +606,86 @@ TEST_F(StatsThreadLocalStoreTest, ScopeDelete) {
   tls_.shutdownThread();
 }
 
+TEST_F(StatsThreadLocalStoreTest, Eviction) {
+  InSequence s;
+  store_->initializeThreading(main_thread_dispatcher_, tls_);
+
+  ScopeSharedPtr scope = store_->createScope("scope.", true);
+  ScopeSharedPtr scope1 = store_->createScope("scope.", true);
+  // References will become invalid, so we create a lexical scope.
+  {
+    Counter& c1 = scope->counterFromString("c1");
+    EXPECT_EQ(&c1, &scope1->counterFromString("c1"));
+    c1.add(1);
+    EXPECT_TRUE(c1.used());
+
+    Gauge& g1 = scope->gaugeFromString("g1", Gauge::ImportMode::Accumulate);
+    g1.set(5);
+    EXPECT_TRUE(g1.used());
+
+    TextReadout& t1 = scope->textReadoutFromString("t1");
+    t1.set("hello");
+    EXPECT_TRUE(t1.used());
+
+    Histogram& h1 = scope->histogramFromString("h1", Histogram::Unit::Unspecified);
+    EXPECT_CALL(sink_, onHistogramComplete(Ref(h1), 1));
+    h1.recordValue(1);
+    store_->mergeHistograms([]() -> void {});
+
+    // Eviction only marks unused but does not remove the counters.
+    store_->evictUnused();
+
+    EXPECT_EQ(&c1, &scope->counterFromString("c1"));
+    EXPECT_FALSE(c1.used());
+    EXPECT_EQ(1, c1.value());
+    EXPECT_EQ(1UL, store_->counters().size());
+
+    EXPECT_EQ(&g1, &scope->gaugeFromString("g1", Gauge::ImportMode::Accumulate));
+    EXPECT_EQ(&g1, &scope1->gaugeFromString("g1", Gauge::ImportMode::Accumulate));
+    EXPECT_FALSE(g1.used());
+    EXPECT_EQ(5, g1.value());
+    EXPECT_EQ(1UL, store_->gauges().size());
+
+    EXPECT_EQ(&t1, &scope->textReadoutFromString("t1"));
+    EXPECT_EQ(&t1, &scope1->textReadoutFromString("t1"));
+    EXPECT_FALSE(t1.used());
+    EXPECT_EQ("hello", t1.value());
+    EXPECT_EQ(1UL, store_->textReadouts().size());
+
+    EXPECT_EQ(&h1, &scope->histogramFromString("h1", Histogram::Unit::Unspecified));
+    EXPECT_EQ(&h1, &scope1->histogramFromString("h1", Histogram::Unit::Unspecified));
+    EXPECT_FALSE(h1.used());
+    EXPECT_EQ(1UL, store_->histograms().size());
+  }
+
+  // Eviction removes here.
+  EXPECT_CALL(tls_, runOnAllThreads(_, _)).Times(testing::AtLeast(1));
+  store_->evictUnused();
+  EXPECT_EQ(0UL, store_->counters().size());
+  EXPECT_EQ(0UL, store_->gauges().size());
+  EXPECT_EQ(0UL, store_->textReadouts().size());
+  EXPECT_EQ(0UL, store_->histograms().size());
+
+  // Make sure no dangling data is on caches and it is safe to use the same metrics.
+  {
+    scope->counterFromString("c1").add(1);
+    scope1->counterFromString("c1").add(1);
+    scope->gaugeFromString("g1", Gauge::ImportMode::Accumulate).set(5);
+    scope1->gaugeFromString("g1", Gauge::ImportMode::Accumulate).set(5);
+    scope->textReadoutFromString("t1").set("hello");
+    scope1->textReadoutFromString("t1").set("hello");
+    Histogram& h1 = scope->histogramFromString("h1", Histogram::Unit::Unspecified);
+    EXPECT_CALL(sink_, onHistogramComplete(Ref(h1), 1));
+    h1.recordValue(1);
+    Histogram& h2 = scope1->histogramFromString("h1", Histogram::Unit::Unspecified);
+    EXPECT_EQ(&h1, &h2);
+  }
+
+  tls_.shutdownGlobalThreading();
+  store_->shutdownThreading();
+  tls_.shutdownThread();
+}
+
 TEST_F(StatsThreadLocalStoreTest, NestedScopes) {
   InSequence s;
   store_->initializeThreading(main_thread_dispatcher_, tls_);
@@ -785,7 +869,8 @@ TEST_F(StatsThreadLocalStoreTest, ExtractAndAppendTagsFixedValue) {
   tag_specifier->set_tag_name("foo");
   tag_specifier->set_fixed_value("bar");
 
-  store_->setTagProducer(std::make_unique<TagProducerImpl>(stats_config));
+  const Stats::TagVector tags_vector;
+  store_->setTagProducer(TagProducerImpl::createTagProducer(stats_config, tags_vector).value());
 
   StatNamePool pool(symbol_table_);
   StatNameTagVector tags{{pool.add("a"), pool.add("b")}};
@@ -796,6 +881,7 @@ TEST_F(StatsThreadLocalStoreTest, ExtractAndAppendTagsFixedValue) {
   EXPECT_EQ("b", symbol_table_.toString(tags[0].second));
   EXPECT_EQ("foo", symbol_table_.toString(tags[1].first));
   EXPECT_EQ("bar", symbol_table_.toString(tags[1].second));
+  EXPECT_THAT(store_->fixedTags(), UnorderedElementsAre(Tag{"foo", "bar"}));
 }
 
 TEST_F(StatsThreadLocalStoreTest, ExtractAndAppendTagsRegexValueNoMatch) {
@@ -806,7 +892,8 @@ TEST_F(StatsThreadLocalStoreTest, ExtractAndAppendTagsRegexValueNoMatch) {
   tag_specifier->set_tag_name("foo");
   tag_specifier->set_regex("bar");
 
-  store_->setTagProducer(std::make_unique<TagProducerImpl>(stats_config));
+  const Stats::TagVector tags_vector;
+  store_->setTagProducer(TagProducerImpl::createTagProducer(stats_config, tags_vector).value());
 
   StatNamePool pool(symbol_table_);
   StatNameTagVector tags{{pool.add("a"), pool.add("b")}};
@@ -825,7 +912,8 @@ TEST_F(StatsThreadLocalStoreTest, ExtractAndAppendTagsRegexValueWithMatch) {
   tag_specifier->set_tag_name("foo_tag");
   tag_specifier->set_regex("^foo.(.+)");
 
-  store_->setTagProducer(std::make_unique<TagProducerImpl>(stats_config));
+  const Stats::TagVector tags_vector;
+  store_->setTagProducer(TagProducerImpl::createTagProducer(stats_config, tags_vector).value());
 
   StatNamePool pool(symbol_table_);
   StatNameTagVector tags{{pool.add("a"), pool.add("b")}};
@@ -842,7 +930,8 @@ TEST_F(StatsThreadLocalStoreTest, ExtractAndAppendTagsRegexBuiltinExpression) {
   store_->initializeThreading(main_thread_dispatcher_, tls_);
 
   envoy::config::metrics::v3::StatsConfig stats_config;
-  store_->setTagProducer(std::make_unique<TagProducerImpl>(stats_config));
+  const Stats::TagVector tags_vector;
+  store_->setTagProducer(TagProducerImpl::createTagProducer(stats_config, tags_vector).value());
 
   StatNamePool pool(symbol_table_);
   StatNameTagVector tags{{pool.add("a"), pool.add("b")}};
@@ -927,7 +1016,7 @@ public:
     });
 
     {
-      TestUtil::MemoryTest memory_test;
+      Memory::TestUtil::MemoryTest memory_test;
       for (StatName stat_name : stat_names) {
         scope_.counterFromStatName(stat_name);
       }
@@ -941,7 +1030,8 @@ TEST_F(StatsMatcherTLSTest, TestNoOpStatImpls) {
 
   stats_config_.mutable_stats_matcher()->mutable_exclusion_list()->add_patterns()->set_prefix(
       "noop");
-  store_->setStatsMatcher(std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_));
+  store_->setStatsMatcher(
+      std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_, context_));
 
   // Testing No-op counters, gauges, histograms which match the prefix "noop".
 
@@ -1018,7 +1108,8 @@ TEST_F(StatsMatcherTLSTest, TestExclusionRegex) {
   // Will block all stats containing any capital alphanumeric letter.
   stats_config_.mutable_stats_matcher()->mutable_exclusion_list()->add_patterns()->MergeFrom(
       TestUtility::createRegexMatcher(".*[A-Z].*"));
-  store_->setStatsMatcher(std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_));
+  store_->setStatsMatcher(
+      std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_, context_));
 
   // The creation of counters/gauges/histograms which have no uppercase letters should succeed.
   Counter& lowercase_counter = scope_.counterFromString("lowercase_counter");
@@ -1061,7 +1152,8 @@ TEST_F(StatsMatcherTLSTest, TestExclusionRegex) {
   // the string "invalid".
   stats_config_.mutable_stats_matcher()->mutable_exclusion_list()->add_patterns()->set_prefix(
       "invalid");
-  store_->setStatsMatcher(std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_));
+  store_->setStatsMatcher(
+      std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_, context_));
 
   Counter& valid_counter = scope_.counterFromString("valid_counter");
   valid_counter.inc();
@@ -1124,7 +1216,8 @@ TEST_F(StatsMatcherTLSTest, RejectPrefixDot) {
   store_->initializeThreading(main_thread_dispatcher_, tls_);
   stats_config_.mutable_stats_matcher()->mutable_exclusion_list()->add_patterns()->set_prefix(
       "cluster."); // Prefix match can be executed symbolically.
-  store_->setStatsMatcher(std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_));
+  store_->setStatsMatcher(
+      std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_, context_));
   uint64_t mem_consumed = memoryConsumedAddingClusterStats();
 
   // No memory is consumed at all while rejecting stats from "prefix."
@@ -1140,7 +1233,8 @@ TEST_F(StatsMatcherTLSTest, RejectPrefixNoDot) {
   store_->initializeThreading(main_thread_dispatcher_, tls_);
   stats_config_.mutable_stats_matcher()->mutable_exclusion_list()->add_patterns()->set_prefix(
       "cluster"); // No dot at the end means we have to compare as strings.
-  store_->setStatsMatcher(std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_));
+  store_->setStatsMatcher(
+      std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_, context_));
   uint64_t mem_consumed = memoryConsumedAddingClusterStats();
 
   // Memory is consumed at all while rejecting stats from "prefix" in proportion
@@ -1153,7 +1247,8 @@ TEST_F(StatsMatcherTLSTest, DoNotRejectHiddenPrefixExclusion) {
   envoy::config::metrics::v3::StatsConfig stats_config_;
   stats_config_.mutable_stats_matcher()->mutable_exclusion_list()->add_patterns()->set_prefix(
       "cluster.");
-  store_->setStatsMatcher(std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_));
+  store_->setStatsMatcher(
+      std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_, context_));
 
   Gauge& accumulate_gauge =
       scope_.gaugeFromString("cluster.accumulate_gauge", Gauge::ImportMode::Accumulate);
@@ -1167,7 +1262,8 @@ TEST_F(StatsMatcherTLSTest, DoNotRejectHiddenPrefixInclusive) {
   envoy::config::metrics::v3::StatsConfig stats_config_;
   stats_config_.mutable_stats_matcher()->mutable_inclusion_list()->add_patterns()->set_prefix(
       "cluster.");
-  store_->setStatsMatcher(std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_));
+  store_->setStatsMatcher(
+      std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_, context_));
 
   Gauge& accumulate_gauge =
       scope_.gaugeFromString("accumulate_gauge", Gauge::ImportMode::Accumulate);
@@ -1180,7 +1276,8 @@ TEST_F(StatsMatcherTLSTest, DoNotRejectHiddenExclusionRegex) {
   envoy::config::metrics::v3::StatsConfig stats_config_;
   stats_config_.mutable_stats_matcher()->mutable_exclusion_list()->add_patterns()->MergeFrom(
       TestUtility::createRegexMatcher(".*"));
-  store_->setStatsMatcher(std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_));
+  store_->setStatsMatcher(
+      std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_, context_));
 
   Gauge& accumulate_gauge =
       scope_.gaugeFromString("accumulate_gauge", Gauge::ImportMode::Accumulate);
@@ -1194,7 +1291,8 @@ TEST_F(StatsMatcherTLSTest, DoNotRejectHiddenInclusionRegex) {
   // Create inclusion list to only accept names that have at least one capital letter.
   stats_config_.mutable_stats_matcher()->mutable_inclusion_list()->add_patterns()->MergeFrom(
       TestUtility::createRegexMatcher(".*[A-Z].*"));
-  store_->setStatsMatcher(std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_));
+  store_->setStatsMatcher(
+      std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_, context_));
 
   Gauge& accumulate_gauge =
       scope_.gaugeFromString("accumulate_gauge", Gauge::ImportMode::Accumulate);
@@ -1206,7 +1304,8 @@ TEST_F(StatsMatcherTLSTest, DoNotRejectHiddenInclusionRegex) {
 TEST_F(StatsMatcherTLSTest, DoNotRejectAllHidden) {
   envoy::config::metrics::v3::StatsConfig stats_config_;
   stats_config_.mutable_stats_matcher()->set_reject_all(true);
-  store_->setStatsMatcher(std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_));
+  store_->setStatsMatcher(
+      std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_, context_));
 
   Gauge& accumulate_gauge =
       scope_.gaugeFromString("accumulate_gauge", Gauge::ImportMode::Accumulate);
@@ -1406,7 +1505,8 @@ TEST_F(StatsThreadLocalStoreTest, RemoveRejectedStats) {
   envoy::config::metrics::v3::StatsConfig stats_config;
   stats_config.mutable_stats_matcher()->mutable_inclusion_list()->add_patterns()->set_exact(
       "no-such-stat");
-  store_->setStatsMatcher(std::make_unique<StatsMatcherImpl>(stats_config, symbol_table_));
+  store_->setStatsMatcher(
+      std::make_unique<StatsMatcherImpl>(stats_config, symbol_table_, context_));
 
   // They can no longer be found.
   EXPECT_EQ(0, store_->counters().size());
@@ -1440,7 +1540,8 @@ TEST_F(StatsThreadLocalStoreTest, AskForRejectedStat) {
   envoy::config::metrics::v3::StatsConfig stats_config;
   stats_config.mutable_stats_matcher()->mutable_inclusion_list()->add_patterns()->set_exact(
       "no-such-stat");
-  store_->setStatsMatcher(std::make_unique<StatsMatcherImpl>(stats_config, symbol_table_));
+  store_->setStatsMatcher(
+      std::make_unique<StatsMatcherImpl>(stats_config, symbol_table_, context_));
 
   // They can no longer be found.
   EXPECT_EQ(0, store_->counters().size());
@@ -1492,7 +1593,8 @@ protected:
 
     // Use a tag producer that will produce tags.
     envoy::config::metrics::v3::StatsConfig stats_config;
-    store_.setTagProducer(std::make_unique<TagProducerImpl>(stats_config));
+    const Stats::TagVector tags_vector;
+    store_.setTagProducer(TagProducerImpl::createTagProducer(stats_config, tags_vector).value());
   }
 
   ~StatsThreadLocalStoreTestNoFixture() override {
@@ -1510,19 +1612,19 @@ protected:
 
   static constexpr size_t million_ = 1000 * 1000;
 
+  NiceMock<ThreadLocal::MockInstance> tls_;
   MockSink sink_;
   SymbolTableImpl symbol_table_;
   AllocatorImpl alloc_;
   ThreadLocalStoreImpl store_;
   Scope& scope_;
   NiceMock<Event::MockDispatcher> main_thread_dispatcher_;
-  NiceMock<ThreadLocal::MockInstance> tls_;
   bool threading_enabled_{false};
 };
 
 // Tests how much memory is consumed allocating 100k stats.
 TEST_F(StatsThreadLocalStoreTestNoFixture, MemoryWithoutTlsRealSymbolTable) {
-  TestUtil::MemoryTest memory_test;
+  Memory::TestUtil::MemoryTest memory_test;
   TestUtil::forEachSampleStat(
       100, true, [this](absl::string_view name) { scope_.counterFromString(std::string(name)); });
   EXPECT_MEMORY_EQ(memory_test.consumedBytes(), 688080); // July 2, 2020
@@ -1531,11 +1633,11 @@ TEST_F(StatsThreadLocalStoreTestNoFixture, MemoryWithoutTlsRealSymbolTable) {
 
 TEST_F(StatsThreadLocalStoreTestNoFixture, MemoryWithTlsRealSymbolTable) {
   initThreading();
-  TestUtil::MemoryTest memory_test;
+  Memory::TestUtil::MemoryTest memory_test;
   TestUtil::forEachSampleStat(
       100, true, [this](absl::string_view name) { scope_.counterFromString(std::string(name)); });
   EXPECT_MEMORY_EQ(memory_test.consumedBytes(), 827616); // Sep 25, 2020
-  EXPECT_MEMORY_LE(memory_test.consumedBytes(), 0.97 * million_);
+  EXPECT_MEMORY_LE(memory_test.consumedBytes(), 0.99 * million_);
 }
 
 TEST_F(StatsThreadLocalStoreTest, ShuttingDown) {
@@ -1819,7 +1921,8 @@ TEST_F(HistogramTest, ForEachHistogram) {
   // Verify that rejecting histograms removes them from the iteration set.
   envoy::config::metrics::v3::StatsConfig stats_config_;
   stats_config_.mutable_stats_matcher()->set_reject_all(true);
-  store_->setStatsMatcher(std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_));
+  store_->setStatsMatcher(
+      std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_, context_));
   num_histograms = 0;
   num_iterations = 0;
   store_->forEachHistogram([&num_histograms](std::size_t size) { num_histograms = size; },
@@ -1829,6 +1932,126 @@ TEST_F(HistogramTest, ForEachHistogram) {
 
   // Verify that we can access the local reference without a crash.
   EXPECT_EQ(deleted_histogram.unit(), Histogram::Unit::Unspecified);
+}
+
+TEST_F(HistogramTest, ForEachSinkedHistogram) {
+  std::unique_ptr<TestUtil::TestSinkPredicates> test_sink_predicates =
+      std::make_unique<TestUtil::TestSinkPredicates>();
+  std::vector<std::reference_wrapper<Histogram>> sinked_histograms;
+  std::vector<std::reference_wrapper<Histogram>> unsinked_histograms;
+  auto scope = store_->rootScope();
+
+  const size_t num_stats = 11;
+  // Create some histograms before setting the predicates.
+  for (size_t idx = 0; idx < num_stats / 2; ++idx) {
+    auto name = absl::StrCat("histogram.", idx);
+    StatName stat_name = pool_.add(name);
+    //  sink every 3rd stat
+    if ((idx + 1) % 3 == 0) {
+      test_sink_predicates->add(stat_name);
+      sinked_histograms.emplace_back(
+          scope->histogramFromStatName(stat_name, Histogram::Unit::Unspecified));
+    } else {
+      unsinked_histograms.emplace_back(
+          scope->histogramFromStatName(stat_name, Histogram::Unit::Unspecified));
+    }
+  }
+
+  store_->setSinkPredicates(std::move(test_sink_predicates));
+  auto& sink_predicates = testSinkPredicatesOrDie();
+
+  // Create some histograms after setting the predicates.
+  for (size_t idx = num_stats / 2; idx < num_stats; ++idx) {
+    auto name = absl::StrCat("histogram.", idx);
+    StatName stat_name = pool_.add(name);
+    // sink every 3rd stat
+    if ((idx + 1) % 3 == 0) {
+      sink_predicates.add(stat_name);
+      sinked_histograms.emplace_back(
+          scope->histogramFromStatName(stat_name, Histogram::Unit::Unspecified));
+    } else {
+      unsinked_histograms.emplace_back(
+          scope->histogramFromStatName(stat_name, Histogram::Unit::Unspecified));
+    }
+  }
+
+  EXPECT_EQ(sinked_histograms.size(), 3);
+  EXPECT_EQ(unsinked_histograms.size(), 8);
+
+  size_t num_sinked_histograms = 0;
+  size_t num_iterations = 0;
+  store_->forEachSinkedHistogram(
+      [&num_sinked_histograms](std::size_t size) { num_sinked_histograms = size; },
+      [&num_iterations, &sink_predicates](ParentHistogram& histogram) {
+        EXPECT_TRUE(sink_predicates.has(histogram.statName()));
+        ++num_iterations;
+      });
+  EXPECT_EQ(num_sinked_histograms, 3);
+  EXPECT_EQ(num_iterations, 3);
+  // Verify that rejecting histograms removes them from the sink set.
+  envoy::config::metrics::v3::StatsConfig stats_config_;
+  stats_config_.mutable_stats_matcher()->set_reject_all(true);
+  store_->setStatsMatcher(
+      std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_, context_));
+  num_sinked_histograms = 0;
+  num_iterations = 0;
+  store_->forEachSinkedHistogram(
+      [&num_sinked_histograms](std::size_t size) { num_sinked_histograms = size; },
+      [&num_iterations](ParentHistogram&) { ++num_iterations; });
+  EXPECT_EQ(num_sinked_histograms, 0);
+  EXPECT_EQ(num_iterations, 0);
+}
+
+// Verify that histograms that are not flushed to sinks are merged in the call
+// to mergeHistograms
+TEST_F(HistogramTest, UnsinkedHistogramsAreMerged) {
+  store_->setSinkPredicates(std::make_unique<TestUtil::TestSinkPredicates>());
+  auto& sink_predicates = testSinkPredicatesOrDie();
+  StatName stat_name = pool_.add("h1");
+  sink_predicates.add(stat_name);
+  auto scope = store_->rootScope();
+
+  auto& h1 = static_cast<ParentHistogramImpl&>(
+      scope->histogramFromStatName(stat_name, Histogram::Unit::Unspecified));
+  stat_name = pool_.add("h2");
+  auto& h2 = static_cast<ParentHistogramImpl&>(
+      scope->histogramFromStatName(stat_name, Histogram::Unit::Unspecified));
+
+  EXPECT_EQ("h1", h1.name());
+  EXPECT_EQ("h2", h2.name());
+  EXPECT_CALL(sink_, onHistogramComplete(Ref(h1), 5));
+  EXPECT_CALL(sink_, onHistogramComplete(Ref(h2), 5));
+
+  h1.recordValue(5);
+  h2.recordValue(5);
+
+  EXPECT_THAT(h1.cumulativeStatistics().bucketSummary(), HasSubstr(" B10: 0,"));
+  EXPECT_THAT(h2.cumulativeStatistics().bucketSummary(), HasSubstr(" B10: 0,"));
+
+  // Verify that all the histograms have not been merged yet.
+  EXPECT_EQ(h1.used(), false);
+  EXPECT_EQ(h2.used(), false);
+
+  store_->mergeHistograms([this, &sink_predicates]() -> void {
+    size_t num_iterations = 0;
+    size_t num_sinked_histograms = 0;
+    store_->forEachSinkedHistogram(
+        [&num_sinked_histograms](std::size_t size) { num_sinked_histograms = size; },
+        [&num_iterations, &sink_predicates](ParentHistogram& histogram) {
+          EXPECT_TRUE(sink_predicates.has(histogram.statName()));
+          ++num_iterations;
+        });
+    EXPECT_EQ(num_sinked_histograms, 1);
+    EXPECT_EQ(num_iterations, 1);
+  });
+
+  EXPECT_THAT(h1.cumulativeStatistics().bucketSummary(), HasSubstr(" B10: 1,"));
+  EXPECT_THAT(h2.cumulativeStatistics().bucketSummary(), HasSubstr(" B10: 1,"));
+  EXPECT_EQ(h1.cumulativeStatistics().bucketSummary(), h2.cumulativeStatistics().bucketSummary());
+
+  // Verify that all the histograms have been merged.
+  EXPECT_EQ(h1.used(), true);
+  EXPECT_EQ(h2.used(), true);
 }
 
 class OneWorkerThread : public ThreadLocalRealThreadsMixin, public testing::Test {
@@ -2129,189 +2352,5 @@ TEST_F(StatsThreadLocalStoreTest, SetSinkPredicates) {
   });
   EXPECT_EQ(expected_sinked_stats, num_sinked_text_readouts);
 }
-
-enum class EnableIncludeHistograms { No = 0, Yes };
-class HistogramParameterisedTest : public HistogramTest,
-                                   public ::testing::WithParamInterface<EnableIncludeHistograms> {
-public:
-  HistogramParameterisedTest() { local_info_.node_.set_cluster(""); }
-
-protected:
-  void SetUp() override {
-    HistogramTest::SetUp();
-
-    // Set the feature flag in SetUp as store_ is constructed in HistogramTest::SetUp.
-    api_ = Api::createApiForTest(*store_);
-    ProtobufWkt::Struct base = TestUtility::parseYaml<ProtobufWkt::Struct>(
-        GetParam() == EnableIncludeHistograms::Yes ? R"EOF(
-    envoy.reloadable_features.enable_include_histograms: true
-    )EOF"
-                                                   : R"EOF(
-    envoy.reloadable_features.enable_include_histograms: false
-    )EOF");
-    envoy::config::bootstrap::v3::LayeredRuntime layered_runtime;
-    {
-      auto* layer = layered_runtime.add_layers();
-      layer->set_name("base");
-      layer->mutable_static_layer()->MergeFrom(base);
-    }
-    {
-      auto* layer = layered_runtime.add_layers();
-      layer->set_name("admin");
-      layer->mutable_admin_layer();
-    }
-    loader_ =
-        std::make_unique<Runtime::LoaderImpl>(dispatcher_, tls_, layered_runtime, local_info_,
-                                              *store_, generator_, validation_visitor_, *api_);
-  }
-
-  Event::MockDispatcher dispatcher_;
-  Api::ApiPtr api_;
-  NiceMock<LocalInfo::MockLocalInfo> local_info_;
-  Random::MockRandomGenerator generator_;
-  NiceMock<ProtobufMessage::MockValidationVisitor> validation_visitor_;
-  std::unique_ptr<Runtime::LoaderImpl> loader_;
-};
-
-TEST_P(HistogramParameterisedTest, ForEachSinkedHistogram) {
-  std::unique_ptr<TestUtil::TestSinkPredicates> test_sink_predicates =
-      std::make_unique<TestUtil::TestSinkPredicates>();
-  std::vector<std::reference_wrapper<Histogram>> sinked_histograms;
-  std::vector<std::reference_wrapper<Histogram>> unsinked_histograms;
-  auto scope = store_->rootScope();
-
-  const size_t num_stats = 11;
-  // Create some histograms before setting the predicates.
-  for (size_t idx = 0; idx < num_stats / 2; ++idx) {
-    auto name = absl::StrCat("histogram.", idx);
-    StatName stat_name = pool_.add(name);
-    //  sink every 3rd stat
-    if ((idx + 1) % 3 == 0) {
-      test_sink_predicates->add(stat_name);
-      sinked_histograms.emplace_back(
-          scope->histogramFromStatName(stat_name, Histogram::Unit::Unspecified));
-    } else {
-      unsinked_histograms.emplace_back(
-          scope->histogramFromStatName(stat_name, Histogram::Unit::Unspecified));
-    }
-  }
-
-  store_->setSinkPredicates(std::move(test_sink_predicates));
-  auto& sink_predicates = testSinkPredicatesOrDie();
-
-  // Create some histograms after setting the predicates.
-  for (size_t idx = num_stats / 2; idx < num_stats; ++idx) {
-    auto name = absl::StrCat("histogram.", idx);
-    StatName stat_name = pool_.add(name);
-    // sink every 3rd stat
-    if ((idx + 1) % 3 == 0) {
-      sink_predicates.add(stat_name);
-      sinked_histograms.emplace_back(
-          scope->histogramFromStatName(stat_name, Histogram::Unit::Unspecified));
-    } else {
-      unsinked_histograms.emplace_back(
-          scope->histogramFromStatName(stat_name, Histogram::Unit::Unspecified));
-    }
-  }
-
-  EXPECT_EQ(sinked_histograms.size(), 3);
-  EXPECT_EQ(unsinked_histograms.size(), 8);
-
-  size_t num_sinked_histograms = 0;
-  size_t num_iterations = 0;
-  store_->forEachSinkedHistogram(
-      [&num_sinked_histograms](std::size_t size) { num_sinked_histograms = size; },
-      [&num_iterations, &sink_predicates](ParentHistogram& histogram) {
-        if (GetParam() == EnableIncludeHistograms::Yes) {
-          EXPECT_TRUE(sink_predicates.has(histogram.statName()));
-        }
-        ++num_iterations;
-      });
-  if (GetParam() == EnableIncludeHistograms::Yes) {
-    EXPECT_EQ(num_sinked_histograms, 3);
-    EXPECT_EQ(num_iterations, 3);
-  } else {
-    EXPECT_EQ(num_sinked_histograms, 11);
-    EXPECT_EQ(num_iterations, 11);
-  }
-  // Verify that rejecting histograms removes them from the sink set.
-  envoy::config::metrics::v3::StatsConfig stats_config_;
-  stats_config_.mutable_stats_matcher()->set_reject_all(true);
-  store_->setStatsMatcher(std::make_unique<StatsMatcherImpl>(stats_config_, symbol_table_));
-  num_sinked_histograms = 0;
-  num_iterations = 0;
-  store_->forEachSinkedHistogram(
-      [&num_sinked_histograms](std::size_t size) { num_sinked_histograms = size; },
-      [&num_iterations](ParentHistogram&) { ++num_iterations; });
-  EXPECT_EQ(num_sinked_histograms, 0);
-  EXPECT_EQ(num_iterations, 0);
-}
-
-// Verify that histograms that are not flushed to sinks are merged in the call
-// to mergeHistograms
-TEST_P(HistogramParameterisedTest, UnsinkedHistogramsAreMerged) {
-  store_->setSinkPredicates(std::make_unique<TestUtil::TestSinkPredicates>());
-  auto& sink_predicates = testSinkPredicatesOrDie();
-  StatName stat_name = pool_.add("h1");
-  sink_predicates.add(stat_name);
-  auto scope = store_->rootScope();
-
-  auto& h1 = static_cast<ParentHistogramImpl&>(
-      scope->histogramFromStatName(stat_name, Histogram::Unit::Unspecified));
-  stat_name = pool_.add("h2");
-  auto& h2 = static_cast<ParentHistogramImpl&>(
-      scope->histogramFromStatName(stat_name, Histogram::Unit::Unspecified));
-
-  EXPECT_EQ("h1", h1.name());
-  EXPECT_EQ("h2", h2.name());
-  EXPECT_CALL(sink_, onHistogramComplete(Ref(h1), 5));
-  EXPECT_CALL(sink_, onHistogramComplete(Ref(h2), 5));
-
-  h1.recordValue(5);
-  h2.recordValue(5);
-
-  EXPECT_THAT(h1.cumulativeStatistics().bucketSummary(), HasSubstr(" B10: 0,"));
-  EXPECT_THAT(h2.cumulativeStatistics().bucketSummary(), HasSubstr(" B10: 0,"));
-
-  // Verify that all the histograms have not been merged yet.
-  EXPECT_EQ(h1.used(), false);
-  EXPECT_EQ(h2.used(), false);
-
-  store_->mergeHistograms([this, &sink_predicates]() -> void {
-    size_t num_iterations = 0;
-    size_t num_sinked_histograms = 0;
-    store_->forEachSinkedHistogram(
-        [&num_sinked_histograms](std::size_t size) { num_sinked_histograms = size; },
-        [&num_iterations, &sink_predicates](ParentHistogram& histogram) {
-          if (GetParam() == EnableIncludeHistograms::Yes) {
-            EXPECT_TRUE(sink_predicates.has(histogram.statName()));
-          }
-          ++num_iterations;
-        });
-    if (GetParam() == EnableIncludeHistograms::Yes) {
-      EXPECT_EQ(num_sinked_histograms, 1);
-      EXPECT_EQ(num_iterations, 1);
-    } else {
-      EXPECT_EQ(num_sinked_histograms, 2);
-      EXPECT_EQ(num_iterations, 2);
-    }
-  });
-
-  EXPECT_THAT(h1.cumulativeStatistics().bucketSummary(), HasSubstr(" B10: 1,"));
-  EXPECT_THAT(h2.cumulativeStatistics().bucketSummary(), HasSubstr(" B10: 1,"));
-  EXPECT_EQ(h1.cumulativeStatistics().bucketSummary(), h2.cumulativeStatistics().bucketSummary());
-
-  // Verify that all the histograms have been merged.
-  EXPECT_EQ(h1.used(), true);
-  EXPECT_EQ(h2.used(), true);
-}
-
-INSTANTIATE_TEST_SUITE_P(HistogramParameterisedTestGroup, HistogramParameterisedTest,
-                         testing::Values(EnableIncludeHistograms::Yes, EnableIncludeHistograms::No),
-                         [](const testing::TestParamInfo<EnableIncludeHistograms>& info) {
-                           return info.param == EnableIncludeHistograms::No
-                                      ? "DisableIncludeHistograms"
-                                      : "EnableIncludeHistograms";
-                         });
 } // namespace Stats
 } // namespace Envoy

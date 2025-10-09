@@ -3,7 +3,6 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
-#include <list>
 #include <map>
 #include <memory>
 #include <string>
@@ -18,6 +17,7 @@
 #include "envoy/http/codes.h"
 #include "envoy/http/conn_pool.h"
 #include "envoy/http/hash_policy.h"
+#include "envoy/http/header_evaluator.h"
 #include "envoy/rds/config.h"
 #include "envoy/router/internal_redirect.h"
 #include "envoy/router/path_matcher.h"
@@ -58,6 +58,7 @@ public:
    * @param stream_info holds additional information about the request.
    */
   virtual void finalizeResponseHeaders(Http::ResponseHeaderMap& headers,
+                                       const Formatter::HttpFormatterContext& context,
                                        const StreamInfo::StreamInfo& stream_info) const PURE;
 
   /**
@@ -110,11 +111,6 @@ public:
    */
   virtual void rewritePathHeader(Http::RequestHeaderMap& headers,
                                  bool insert_envoy_original_path) const PURE;
-
-  /**
-   * @return std::string& the name of the route.
-   */
-  virtual const std::string& routeName() const PURE;
 };
 
 /**
@@ -127,6 +123,7 @@ public:
   virtual ~RouteSpecificFilterConfig() = default;
 };
 using RouteSpecificFilterConfigConstSharedPtr = std::shared_ptr<const RouteSpecificFilterConfig>;
+using RouteSpecificFilterConfigs = absl::InlinedVector<const RouteSpecificFilterConfig*, 4>;
 
 /**
  * CorsPolicy for Route and VirtualHost.
@@ -177,6 +174,12 @@ public:
    * @return bool Whether CORS policies are evaluated when filter is off.
    */
   virtual bool shadowEnabled() const PURE;
+
+  /**
+   * @return bool whether preflight requests with origin not matching
+   * configured allowed origins should be forwarded upstream.
+   */
+  virtual const absl::optional<bool>& forwardNotMatchingPreflights() const PURE;
 };
 
 /**
@@ -195,6 +198,9 @@ public:
 };
 
 using ResetHeaderParserSharedPtr = std::shared_ptr<ResetHeaderParser>;
+
+class RetryPolicy;
+using RetryPolicyConstSharedPtr = std::shared_ptr<const RetryPolicy>;
 
 /**
  * Route level retry policy.
@@ -217,6 +223,7 @@ public:
   static constexpr uint32_t RETRY_ON_RETRIABLE_HEADERS                  = 0x1000;
   static constexpr uint32_t RETRY_ON_ENVOY_RATE_LIMITED                 = 0x2000;
   static constexpr uint32_t RETRY_ON_HTTP3_POST_CONNECT_FAILURE         = 0x4000;
+  static constexpr uint32_t RETRY_ON_RESET_BEFORE_REQUEST               = 0x8000;
   // clang-format on
 
   virtual ~RetryPolicy() = default;
@@ -340,6 +347,11 @@ public:
   virtual std::vector<InternalRedirectPredicateSharedPtr> predicates() const PURE;
 
   /**
+   * @return a vector of response header names to preserve in the redirected request.
+   */
+  virtual const std::vector<Http::LowerCaseString>& responseHeadersToCopy() const PURE;
+
+  /**
    * @return the maximum number of allowed internal redirects on this route.
    */
   virtual uint32_t maxInternalRedirects() const PURE;
@@ -434,13 +446,17 @@ public:
    *                   not. nullopt means it wasn't sent at all before getting reset.
    * @param callback supplies the callback that will be invoked when the retry should take place.
    *                 This is used to add timed backoff, etc. The callback will never be called
-   * inline.
+   *                 inline.
+   * @param upstream_request_started indicates whether the first byte has been transmitted to the
+   *                                 upstream server.
+   *
    * @return RetryStatus if a retry should take place. @param callback will be called at some point
    *         in the future. Otherwise a retry should not take place and the callback will never be
    *         called. Calling code should proceed with error handling.
    */
   virtual RetryStatus shouldRetryReset(Http::StreamResetReason reset_reason, Http3Used http3_used,
-                                       DoRetryResetCallback callback) PURE;
+                                       DoRetryResetCallback callback,
+                                       bool upstream_request_started) PURE;
 
   /**
    * Determine whether a "hedged" retry should be sent after the per try
@@ -527,7 +543,22 @@ public:
   /**
    * @return true if the trace span should be sampled.
    */
-  virtual bool traceSampled() const PURE;
+  virtual absl::optional<bool> traceSampled() const PURE;
+
+  /**
+   * @return true if host name should be suffixed with "-shadow".
+   */
+  virtual bool disableShadowHostSuffixAppend() const PURE;
+
+  /**
+   * @return the header evaluator for manipulating headers in mirrored requests.
+   */
+  virtual const Http::HeaderEvaluator& headerEvaluator() const PURE;
+
+  /**
+   * @return the literal value to rewrite the host header with, or empty if no rewrite.
+   */
+  virtual absl::string_view hostRewriteLiteral() const PURE;
 };
 
 using ShadowPolicyPtr = std::shared_ptr<ShadowPolicy>;
@@ -604,7 +635,7 @@ public:
 
   static VirtualClusterStats generateStats(Stats::Scope& scope,
                                            const VirtualClusterStatNames& stat_names) {
-    return VirtualClusterStats(stat_names, scope);
+    return {stat_names, scope};
   }
 };
 
@@ -623,6 +654,11 @@ public:
    * @return const CorsPolicy* the CORS policy for this virtual host.
    */
   virtual const CorsPolicy* corsPolicy() const PURE;
+
+  /**
+   * @return const std::string& the name of the virtual host.
+   */
+  virtual const std::string& name() const PURE;
 
   /**
    * @return the stat-name of the virtual host.
@@ -656,33 +692,56 @@ public:
   virtual bool includeIsTimeoutRetryHeader() const PURE;
 
   /**
-   * @return uint32_t any route cap on bytes which should be buffered for shadowing or retries.
-   *         This is an upper bound so does not necessarily reflect the bytes which will be buffered
-   *         as other limits may apply.
-   *         If a per route limit exists, it takes precedence over this configuration.
-   *         Unlike some other buffer limits, 0 here indicates buffering should not be performed
-   *         rather than no limit applies.
+   * @return uint64_t the maximum bytes which should be buffered for request bodies. This enables
+   *         buffering larger request bodies beyond the connection buffer limit for use cases
+   *         with large payloads, shadowing, or retries.
+   *
+   *         This method consolidates the functionality of the previous
+   *         per_request_buffer_limit_bytes and request_body_buffer_limit fields. It supports both
+   *         legacy configurations using per_request_buffer_limit_bytes and new configurations using
+   *         request_body_buffer_limit.
+   *
+   *         If neither is set, falls back to connection buffer limits. Unlike some other buffer
+   *         limits, 0 here indicates buffering should not be performed rather than no limit
+   * applies.
    */
-  virtual uint32_t retryShadowBufferLimit() const PURE;
+  virtual uint64_t requestBodyBufferLimit() const PURE;
 
   /**
    * This is a helper to get the route's per-filter config if it exists, up along the config
    * hierarchy (Route --> VirtualHost --> RouteConfiguration). Or nullptr if none of them exist.
    */
   virtual const RouteSpecificFilterConfig*
-  mostSpecificPerFilterConfig(const std::string& name) const PURE;
+  mostSpecificPerFilterConfig(absl::string_view name) const PURE;
 
   /**
-   * Find all the available per route filter configs, invoking the callback with
-   * each config (if it is present). Iteration of the configs is in order of
-   * specificity. That means that the callback will be called first for a config on
-   * a route configuration, virtual host, route, and finally a route entry (weighted cluster). If
-   * a config is not present, the callback will not be invoked.
+   * Return all the available per route filter configs. The configs is in order of specificity.
+   * That means that the config from a route configuration will be first, then the config from a
+   * virtual host, then the config from a route.
    */
-  virtual void traversePerFilterConfig(
-      const std::string& filter_name,
-      std::function<void(const Router::RouteSpecificFilterConfig&)> cb) const PURE;
+  virtual Router::RouteSpecificFilterConfigs perFilterConfigs(absl::string_view name) const PURE;
+
+  /**
+   * @return const envoy::config::core::v3::Metadata& return the metadata provided in the config for
+   * this virtual host.
+   */
+  virtual const envoy::config::core::v3::Metadata& metadata() const PURE;
+
+  /**
+   * @return const Envoy::Config::TypedMetadata& return the typed metadata provided in the config
+   * for this virtual host.
+   */
+  virtual const Envoy::Config::TypedMetadata& typedMetadata() const PURE;
+
+  /**
+   * Determine whether a specific request path belongs to a virtual cluster for use in stats, etc.
+   * @param headers supplies the request headers.
+   * @return the virtual cluster or nullptr if there is no match.
+   */
+  virtual const VirtualCluster* virtualCluster(const Http::HeaderMap& headers) const PURE;
 };
+
+using VirtualHostConstSharedPtr = std::shared_ptr<const VirtualHost>;
 
 /**
  * Route level hedging policy.
@@ -746,12 +805,12 @@ public:
    * Creates a new MetadataMatchCriteria, merging existing
    * metadata criteria with the provided criteria. The result criteria is the
    * combination of both sets of criteria, with those from the metadata_matches
-   * ProtobufWkt::Struct taking precedence.
+   * Protobuf::Struct taking precedence.
    * @param metadata_matches supplies the new criteria.
    * @return MetadataMatchCriteriaConstPtr the result criteria.
    */
   virtual MetadataMatchCriteriaConstPtr
-  mergeMatchCriteria(const ProtobufWkt::Struct& metadata_matches) const PURE;
+  mergeMatchCriteria(const Protobuf::Struct& metadata_matches) const PURE;
 
   /**
    * Creates a new MetadataMatchCriteria with criteria vector reduced to given names
@@ -893,11 +952,13 @@ public:
    * immediately prior to forwarding. It is done this way vs. copying for performance reasons.
    * @param headers supplies the request headers, which may be modified during this call.
    * @param stream_info holds additional information about the request.
-   * @param insert_envoy_original_path insert x-envoy-original-path header if path rewritten?
+   * @param keep_original_host_or_path insert x-envoy-original-path header if path rewritten,
+   *        or x-envoy-original-host header if host rewritten.
    */
   virtual void finalizeRequestHeaders(Http::RequestHeaderMap& headers,
+                                      const Formatter::HttpFormatterContext& context,
                                       const StreamInfo::StreamInfo& stream_info,
-                                      bool insert_envoy_original_path) const PURE;
+                                      bool keep_original_host_or_path) const PURE;
 
   /**
    * Returns the request header transforms that would be applied if finalizeRequestHeaders were
@@ -936,7 +997,7 @@ public:
    * @return const RetryPolicy& the retry policy for the route. All routes have a retry policy even
    *         if it is empty and does not allow retries.
    */
-  virtual const RetryPolicy& retryPolicy() const PURE;
+  virtual const RetryPolicyConstSharedPtr& retryPolicy() const PURE;
 
   /**
    * @return const InternalRedirectPolicy& the internal redirect policy for the route. All routes
@@ -956,13 +1017,20 @@ public:
   virtual const PathRewriterSharedPtr& pathRewriter() const PURE;
 
   /**
-   * @return uint32_t any route cap on bytes which should be buffered for shadowing or retries.
-   *         This is an upper bound so does not necessarily reflect the bytes which will be buffered
-   *         as other limits may apply.
-   *         Unlike some other buffer limits, 0 here indicates buffering should not be performed
-   *         rather than no limit applies.
+   * @return uint64_t the maximum bytes which should be buffered for request bodies. This enables
+   *         buffering larger request bodies beyond the connection buffer limit for use cases
+   *         with large payloads, shadowing, or retries.
+   *
+   *         This method consolidates the functionality of the previous
+   *         per_request_buffer_limit_bytes and request_body_buffer_limit fields. It supports both
+   *         legacy configurations using per_request_buffer_limit_bytes and new configurations using
+   *         request_body_buffer_limit.
+   *
+   *         If neither is set, falls back to connection buffer limits. Unlike some other buffer
+   *         limits, 0 here indicates buffering should not be performed rather than no limit
+   * applies.
    */
-  virtual uint32_t retryShadowBufferLimit() const PURE;
+  virtual uint64_t requestBodyBufferLimit() const PURE;
 
   /**
    * @return const std::vector<ShadowPolicy>& the shadow policies for the route. The vector is empty
@@ -980,6 +1048,12 @@ public:
    *         disabled idle timeout, while nullopt indicates deference to the global timeout.
    */
   virtual absl::optional<std::chrono::milliseconds> idleTimeout() const PURE;
+
+  /**
+   * @return optional<std::chrono::milliseconds> the route's flush timeout. Zero indicates a
+   *         disabled idle timeout, while nullopt indicates deference to the global timeout.
+   */
+  virtual absl::optional<std::chrono::milliseconds> flushTimeout() const PURE;
 
   /**
    * @return true if new style max_stream_duration config should be used over the old style.
@@ -1015,18 +1089,6 @@ public:
    * be subtracted from the value provided by the header.
    */
   virtual absl::optional<std::chrono::milliseconds> grpcTimeoutOffset() const PURE;
-
-  /**
-   * Determine whether a specific request path belongs to a virtual cluster for use in stats, etc.
-   * @param headers supplies the request headers.
-   * @return the virtual cluster or nullptr if there is no match.
-   */
-  virtual const VirtualCluster* virtualCluster(const Http::HeaderMap& headers) const PURE;
-
-  /**
-   * @return const VirtualHost& the virtual host that owns the route.
-   */
-  virtual const VirtualHost& virtualHost() const PURE;
 
   /**
    * @return bool true if the :authority header should be overwritten with the upstream hostname.
@@ -1094,11 +1156,6 @@ public:
   virtual const ConnectConfigOptRef connectConfig() const PURE;
 
   /**
-   * @return std::string& the name of the route.
-   */
-  virtual const std::string& routeName() const PURE;
-
-  /**
    * @return RouteStatsContextOptRef the config needed to generate route level stats.
    */
   virtual const RouteStatsContextOptRef routeStatsContext() const PURE;
@@ -1107,6 +1164,12 @@ public:
    * @return EarlyDataPolicy& the configured early data option.
    */
   virtual const EarlyDataPolicy& earlyDataPolicy() const PURE;
+
+  /**
+   * Refresh the target cluster of the route with the request attributes if possible.
+   */
+  virtual void refreshRouteCluster(const Http::RequestHeaderMap& headers,
+                                   const StreamInfo::StreamInfo& stream_info) const PURE;
 };
 
 /**
@@ -1200,21 +1263,27 @@ public:
   virtual const RouteTracing* tracingConfig() const PURE;
 
   /**
+   * Check if the filter is disabled for this route.
+   * @param config_name supplies the name of the filter config in the HTTP filter chain. This name
+   * may be different from the filter extension qualified name.
+   * @return true if the filter is disabled for this route, false if the filter is enabled.
+   *         nullopt if no decision can be made explicitly for the filter.
+   */
+  virtual absl::optional<bool> filterDisabled(absl::string_view config_name) const PURE;
+
+  /**
    * This is a helper to get the route's per-filter config if it exists, up along the config
    * hierarchy(Route --> VirtualHost --> RouteConfiguration). Or nullptr if none of them exist.
    */
   virtual const RouteSpecificFilterConfig*
-  mostSpecificPerFilterConfig(const std::string& name) const PURE;
+  mostSpecificPerFilterConfig(absl::string_view name) const PURE;
 
   /**
-   * Find all the available per route filter configs, invoking the callback with each config (if
-   * it is present). Iteration of the configs is in order of specificity. That means that the
-   * callback will be called first for a config on a Virtual host, then a route, and finally a route
-   * entry (weighted cluster). If a config is not present, the callback will not be invoked.
+   * Return all the available per route filter configs. The configs is in order of specificity.
+   * That means that the config from a route configuration will be first, then the config from a
+   * virtual host, then the config from a route.
    */
-  virtual void traversePerFilterConfig(
-      const std::string& filter_name,
-      std::function<void(const Router::RouteSpecificFilterConfig&)> cb) const PURE;
+  virtual Router::RouteSpecificFilterConfigs perFilterConfigs(absl::string_view name) const PURE;
 
   /**
    * @return const envoy::config::core::v3::Metadata& return the metadata provided in the config for
@@ -1227,11 +1296,24 @@ public:
    * for this route.
    */
   virtual const Envoy::Config::TypedMetadata& typedMetadata() const PURE;
+
+  /**
+   * @return std::string& the name of the route.
+   */
+  virtual const std::string& routeName() const PURE;
+
+  /**
+   * @return const VirtualHostConstSharedPtr& the virtual host that owns the route.
+   *
+   * NOTE: This MUST not be null.
+   */
+  virtual const VirtualHostConstSharedPtr& virtualHost() const PURE;
 };
 
 using RouteConstSharedPtr = std::shared_ptr<const Route>;
 
 class RouteEntryAndRoute : public RouteEntry, public Route {};
+using RouteEntryAndRouteConstSharedPtr = std::shared_ptr<const RouteEntryAndRoute>;
 
 /**
  * RouteCallback, returns one of these enums to the route matcher to indicate
@@ -1275,7 +1357,7 @@ using RouteCallback = std::function<RouteMatchStatus(RouteConstSharedPtr, RouteE
  * Shared part of the route configuration. This class contains interfaces that needn't depend on
  * router matcher. Then every virtualhost could keep a reference to the CommonConfig. When the
  * entire route config is destroyed, the part of CommonConfig will still live until all
- * virtualhosts are destroyed.
+ * virtual hosts are destroyed.
  */
 class CommonConfig {
 public:
@@ -1285,7 +1367,7 @@ public:
    * Return a list of headers that will be cleaned from any requests that are not from an internal
    * (RFC1918) source.
    */
-  virtual const std::list<Http::LowerCaseString>& internalOnlyHeaders() const PURE;
+  virtual const std::vector<Http::LowerCaseString>& internalOnlyHeaders() const PURE;
 
   /**
    * @return const std::string the RouteConfiguration name.
@@ -1310,6 +1392,29 @@ public:
    * TODO(dio): To allow overrides at different levels (e.g. per-route, virtual host, etc).
    */
   virtual uint32_t maxDirectResponseBodySizeBytes() const PURE;
+
+  /**
+   * @return const envoy::config::core::v3::Metadata& return the metadata provided in the config for
+   * this route configuration.
+   */
+  virtual const envoy::config::core::v3::Metadata& metadata() const PURE;
+
+  /**
+   * @return const Envoy::Config::TypedMetadata& return the typed metadata provided in the config
+   * for this route configuration.
+   */
+  virtual const Envoy::Config::TypedMetadata& typedMetadata() const PURE;
+};
+
+struct VirtualHostRoute {
+  VirtualHostConstSharedPtr vhost;
+  RouteConstSharedPtr route;
+
+  // Override -> operator to access methods of route directly.
+  const Route* operator->() const { return route.get(); }
+
+  // Convert the VirtualHostRoute to RouteConstSharedPtr.
+  operator RouteConstSharedPtr() const { return route; }
 };
 
 /**
@@ -1323,11 +1428,11 @@ public:
    * @param headers supplies the request headers.
    * @param random_value supplies the random seed to use if a runtime choice is required. This
    *        allows stable choices between calls if desired.
-   * @return the route or nullptr if there is no matching route for the request.
+   * @return the route result or nullptr if there is no matching route for the request.
    */
-  virtual RouteConstSharedPtr route(const Http::RequestHeaderMap& headers,
-                                    const StreamInfo::StreamInfo& stream_info,
-                                    uint64_t random_value) const PURE;
+  virtual VirtualHostRoute route(const Http::RequestHeaderMap& headers,
+                                 const StreamInfo::StreamInfo& stream_info,
+                                 uint64_t random_value) const PURE;
 
   /**
    * Based on the incoming HTTP request headers, determine the target route (containing either a
@@ -1344,9 +1449,9 @@ public:
    * @return the route accepted by the callback or nullptr if no match found or none of route is
    * accepted by the callback.
    */
-  virtual RouteConstSharedPtr route(const RouteCallback& cb, const Http::RequestHeaderMap& headers,
-                                    const StreamInfo::StreamInfo& stream_info,
-                                    uint64_t random_value) const PURE;
+  virtual VirtualHostRoute route(const RouteCallback& cb, const Http::RequestHeaderMap& headers,
+                                 const StreamInfo::StreamInfo& stream_info,
+                                 uint64_t random_value) const PURE;
 };
 
 using ConfigConstSharedPtr = std::shared_ptr<const Config>;
@@ -1355,7 +1460,7 @@ class GenericConnectionPoolCallbacks;
 class GenericUpstream;
 
 /**
- * An API for wrapping either an HTTP or a TCP connection pool.
+ * An API for wrapping either an HTTP, TCP, or UDP connection pool.
  *
  * The GenericConnPool exists to create a GenericUpstream handle via a call to
  * newStream resulting in an eventual call to onPoolReady
@@ -1365,7 +1470,8 @@ public:
   virtual ~GenericConnPool() = default;
 
   /**
-   * Called to create a new HTTP stream or TCP connection for "CONNECT streams".
+   * Called to create a new HTTP stream, TCP connection for CONNECT streams, or UDP socket for
+   * CONNECT-UDP streams.
    *
    * The implementation of the GenericConnPool will either call
    * GenericConnectionPoolCallbacks::onPoolReady
@@ -1387,6 +1493,11 @@ public:
    * @return optionally returns the host for the connection pool.
    */
   virtual Upstream::HostDescriptionConstSharedPtr host() const PURE;
+
+  /**
+   * @return returns if the connection pool was initialized successfully.
+   */
+  virtual bool valid() const PURE;
 };
 
 /**
@@ -1410,7 +1521,7 @@ public:
 };
 
 /**
- * An API for wrapping callbacks from either an HTTP or a TCP connection pool.
+ * An API for wrapping callbacks from either an HTTP, TCP, or UDP connection pool.
  *
  * Just like the connection pool callbacks, the GenericConnectionPoolCallbacks
  * will either call onPoolReady when a GenericUpstream is ready, or
@@ -1456,7 +1567,7 @@ public:
 };
 
 /**
- * An API for sending information to either a TCP or HTTP upstream.
+ * An API for sending information to either a TCP, UDP, or HTTP upstream.
  *
  * It is similar logically to RequestEncoder, only without the getStream interface.
  */
@@ -1487,6 +1598,15 @@ public:
    * @param trailers supplies the trailers to encode.
    */
   virtual void encodeTrailers(const Http::RequestTrailerMap& trailers) PURE;
+
+  // TODO(vikaschoudhary16): Remove this api.
+  // This api is only used to enable TCP tunneling semantics in the upstream codec.
+  // TCP proxy extension uses this API when proxyingn TCP tunnel via HTTP CONNECT or POST.
+  /**
+   * Enable TCP tunneling semantics on the upstream codec. Reading a remote half-close
+   * will not fully close the connection. This is off by default.
+   */
+  virtual void enableTcpTunneling() PURE;
   /**
    * Enable/disable further data from this stream.
    */
@@ -1515,17 +1635,22 @@ using GenericConnPoolPtr = std::unique_ptr<GenericConnPool>;
  */
 class GenericConnPoolFactory : public Envoy::Config::TypedFactory {
 public:
+  /*
+   * Protocol used by the upstream sockets.
+   */
+  enum class UpstreamProtocol { HTTP, TCP, UDP };
+
   ~GenericConnPoolFactory() override = default;
 
   /*
    * @param options for creating the transport socket
    * @return may be null
    */
-  virtual GenericConnPoolPtr
-  createGenericConnPool(Upstream::ThreadLocalCluster& thread_local_cluster, bool is_connect,
-                        const RouteEntry& route_entry,
-                        absl::optional<Http::Protocol> downstream_protocol,
-                        Upstream::LoadBalancerContext* ctx) const PURE;
+  virtual GenericConnPoolPtr createGenericConnPool(
+      Upstream::HostConstSharedPtr host, Upstream::ThreadLocalCluster& thread_local_cluster,
+      GenericConnPoolFactory::UpstreamProtocol upstream_protocol,
+      Upstream::ResourcePriority priority, absl::optional<Http::Protocol> downstream_protocol,
+      Upstream::LoadBalancerContext* ctx, const Protobuf::Message& config) const PURE;
 };
 
 using GenericConnPoolFactoryPtr = std::unique_ptr<GenericConnPoolFactory>;

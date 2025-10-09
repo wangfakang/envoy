@@ -27,12 +27,12 @@ using DecodedResourceImplPtr = std::unique_ptr<DecodedResourceImpl>;
 
 class DecodedResourceImpl : public DecodedResource {
 public:
-  static DecodedResourceImplPtr fromResource(OpaqueResourceDecoder& resource_decoder,
-                                             const ProtobufWkt::Any& resource,
-                                             const std::string& version) {
+  static absl::StatusOr<DecodedResourceImplPtr>
+  fromResource(OpaqueResourceDecoder& resource_decoder, const Protobuf::Any& resource,
+               const std::string& version) {
     if (resource.Is<envoy::service::discovery::v3::Resource>()) {
       envoy::service::discovery::v3::Resource r;
-      MessageUtil::unpackTo(resource, r);
+      RETURN_IF_NOT_OK(MessageUtil::unpackTo(resource, r));
 
       r.set_version(version);
 
@@ -58,7 +58,7 @@ public:
             resource.has_ttl() ? absl::make_optional(std::chrono::milliseconds(
                                      DurationUtil::durationToMilliseconds(resource.ttl())))
                                : absl::nullopt,
-            resource.has_metadata() ? makeOptRef(resource.metadata()) : absl::nullopt) {}
+            resource.has_metadata() ? absl::make_optional(resource.metadata()) : absl::nullopt) {}
   DecodedResourceImpl(OpaqueResourceDecoder& resource_decoder,
                       const xds::core::v3::CollectionEntry::InlineEntry& inline_entry)
       : DecodedResourceImpl(resource_decoder, inline_entry.name(),
@@ -77,15 +77,15 @@ public:
   bool hasResource() const override { return has_resource_; }
   absl::optional<std::chrono::milliseconds> ttl() const override { return ttl_; }
   const OptRef<const envoy::config::core::v3::Metadata> metadata() const override {
-    return metadata_;
+    return metadata_.has_value() ? makeOptRef(metadata_.value()) : absl::nullopt;
   }
 
 private:
   DecodedResourceImpl(OpaqueResourceDecoder& resource_decoder, absl::optional<std::string> name,
                       const Protobuf::RepeatedPtrField<std::string>& aliases,
-                      const ProtobufWkt::Any& resource, bool has_resource,
-                      const std::string& version, absl::optional<std::chrono::milliseconds> ttl,
-                      const OptRef<const envoy::config::core::v3::Metadata> metadata)
+                      const Protobuf::Any& resource, bool has_resource, const std::string& version,
+                      absl::optional<std::chrono::milliseconds> ttl,
+                      const absl::optional<envoy::config::core::v3::Metadata>& metadata)
       : resource_(resource_decoder.decodeResource(resource)), has_resource_(has_resource),
         name_(name ? *name : resource_decoder.resourceName(*resource_)),
         aliases_(repeatedPtrFieldToVector(aliases)), version_(version), ttl_(ttl),
@@ -101,17 +101,22 @@ private:
 
   // This is the metadata info under the Resource wrapper.
   // It is intended to be consumed in the xds_config_tracker extension.
-  const OptRef<const envoy::config::core::v3::Metadata> metadata_;
+  const absl::optional<envoy::config::core::v3::Metadata> metadata_;
 };
 
 struct DecodedResourcesWrapper {
   DecodedResourcesWrapper() = default;
-  DecodedResourcesWrapper(OpaqueResourceDecoder& resource_decoder,
-                          const Protobuf::RepeatedPtrField<ProtobufWkt::Any>& resources,
-                          const std::string& version) {
+  static absl::StatusOr<std::unique_ptr<DecodedResourcesWrapper>>
+  create(OpaqueResourceDecoder& resource_decoder,
+         const Protobuf::RepeatedPtrField<Protobuf::Any>& resources, const std::string& version) {
+    std::unique_ptr<DecodedResourcesWrapper> ret = std::make_unique<DecodedResourcesWrapper>();
     for (const auto& resource : resources) {
-      pushBack((DecodedResourceImpl::fromResource(resource_decoder, resource, version)));
+      absl::StatusOr<DecodedResourceImplPtr> resource_or_error =
+          DecodedResourceImpl::fromResource(resource_decoder, resource, version);
+      RETURN_IF_NOT_OK_REF(resource_or_error.status());
+      ret->pushBack(std::move(resource_or_error.value()));
     }
+    return ret;
   }
 
   void pushBack(Config::DecodedResourcePtr&& resource) {

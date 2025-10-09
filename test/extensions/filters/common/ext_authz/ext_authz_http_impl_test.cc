@@ -10,6 +10,7 @@
 
 #include "test/extensions/filters/common/ext_authz/mocks.h"
 #include "test/extensions/filters/common/ext_authz/test_common.h"
+#include "test/mocks/server/server_factory_context.h"
 #include "test/mocks/stream_info/mocks.h"
 #include "test/mocks/upstream/cluster_manager.h"
 
@@ -31,6 +32,12 @@ namespace Filters {
 namespace Common {
 namespace ExtAuthz {
 namespace {
+
+struct SendRequestOpts {
+  const std::string body_content = EMPTY_STRING;
+  bool use_raw_body = false;
+  bool encode_raw_headers = false;
+};
 
 class ExtAuthzHttpClientTest : public testing::Test {
 public:
@@ -90,7 +97,7 @@ public:
     }
 
     cm_.initializeThreadLocalClusters({"ext_authz"});
-    return std::make_shared<ClientConfig>(proto_config, timeout, path_prefix);
+    return std::make_shared<ClientConfig>(proto_config, timeout, path_prefix, factory_context_);
   }
 
   void dynamicMetadataTest(CheckStatus status, const std::string& http_status) {
@@ -112,7 +119,7 @@ public:
     envoy::service::auth::v3::CheckRequest request;
     client_->check(request_callbacks_, request, parent_span_, stream_info_);
 
-    ProtobufWkt::Struct expected_dynamic_metadata;
+    Protobuf::Struct expected_dynamic_metadata;
     auto* metadata_fields = expected_dynamic_metadata.mutable_fields();
     (*metadata_fields)["x-metadata-header-0"] = ValueUtil::stringValue("zero");
     (*metadata_fields)["x-metadata-header-1"] = ValueUtil::stringValue("2");
@@ -140,21 +147,33 @@ public:
   }
 
   Http::RequestMessagePtr sendRequest(absl::node_hash_map<std::string, std::string>&& headers,
-                                      const std::string body_content = EMPTY_STRING,
-                                      bool use_raw_body = false) {
+                                      SendRequestOpts opts = {}) {
     envoy::service::auth::v3::CheckRequest request{};
-    auto mutable_headers =
-        request.mutable_attributes()->mutable_request()->mutable_http()->mutable_headers();
-    for (const auto& header : headers) {
-      (*mutable_headers)[header.first] = header.second;
+    if (opts.encode_raw_headers) {
+      auto mutable_headers = request.mutable_attributes()
+                                 ->mutable_request()
+                                 ->mutable_http()
+                                 ->mutable_header_map()
+                                 ->mutable_headers();
+      for (const auto& header : headers) {
+        auto* new_header = mutable_headers->Add();
+        new_header->set_key(header.first);
+        new_header->set_raw_value(header.second);
+      }
+    } else {
+      auto mutable_headers =
+          request.mutable_attributes()->mutable_request()->mutable_http()->mutable_headers();
+      for (const auto& header : headers) {
+        (*mutable_headers)[header.first] = header.second;
+      }
     }
 
-    if (use_raw_body) {
+    if (opts.use_raw_body) {
       *request.mutable_attributes()->mutable_request()->mutable_http()->mutable_raw_body() =
-          body_content;
+          opts.body_content;
     } else {
       *request.mutable_attributes()->mutable_request()->mutable_http()->mutable_body() =
-          body_content;
+          opts.body_content;
     }
 
     Http::RequestMessagePtr message_ptr;
@@ -178,6 +197,7 @@ public:
     return message_ptr;
   }
 
+  NiceMock<Server::Configuration::MockServerFactoryContext> factory_context_;
   NiceMock<Upstream::MockClusterManager> cm_;
   NiceMock<Http::MockAsyncClient> async_client_;
   NiceMock<Http::MockAsyncClientRequest> async_request_;
@@ -188,6 +208,37 @@ public:
   Tracing::MockSpan child_span_;
   NiceMock<StreamInfo::MockStreamInfo> stream_info_;
 };
+
+// Verify ClientConfig could be built directly from HttpService and that the
+// fields get wired correctly.
+TEST_F(ExtAuthzHttpClientTest, ClientConfigFromHttpService) {
+  envoy::extensions::filters::http::ext_authz::v3::HttpService http_service;
+  http_service.mutable_server_uri()->set_uri("ext_authz:9000");
+  http_service.mutable_server_uri()->set_cluster("ext_authz");
+  http_service.mutable_server_uri()->mutable_timeout()->set_seconds(0);
+  http_service.set_path_prefix("/prefix");
+  // Add one header to add to request to exercise header parser creation.
+  auto* add = http_service.mutable_authorization_request()->add_headers_to_add();
+  add->set_key("x-added");
+  add->set_value("v");
+
+  auto cfg = std::make_shared<ClientConfig>(http_service, /*encode_raw_headers=*/true,
+                                            /*timeout_ms=*/123, factory_context_);
+  EXPECT_EQ(cfg->cluster(), "ext_authz");
+  EXPECT_EQ(cfg->pathPrefix(), "/prefix");
+  EXPECT_EQ(cfg->timeout(), std::chrono::milliseconds{123});
+  EXPECT_TRUE(cfg->encodeRawHeaders());
+}
+
+TEST_F(ExtAuthzHttpClientTest, StreamInfo) {
+  envoy::service::auth::v3::CheckRequest request;
+  client_->check(request_callbacks_, request, parent_span_, stream_info_);
+  EXPECT_EQ(client_->streamInfo(), nullptr);
+  auto check_response = TestCommon::makeMessageResponse(
+      TestCommon::makeHeaderValueOption({{":status", "200", false}}));
+  EXPECT_CALL(request_callbacks_, onComplete_(_));
+  client_->onSuccess(async_request_, std::move(check_response));
+}
 
 // Test HTTP client config default values.
 TEST_F(ExtAuthzHttpClientTest, ClientConfig) {
@@ -239,6 +290,17 @@ TEST_F(ExtAuthzHttpClientTest, TestDefaultAllowedClientAndUpstreamHeaders) {
       config_->upstreamHeaderMatchers()->matches(Http::Headers::get().ContentLength.get()));
 }
 
+TEST_F(ExtAuthzHttpClientTest, PathPrefixShouldBeSanitized) {
+  auto empty_config = createConfig(EMPTY_STRING, 250, "");
+  EXPECT_TRUE(empty_config->pathPrefix().empty());
+
+  auto slash_prefix_config = createConfig(EMPTY_STRING, 250, "/the_prefix");
+  EXPECT_EQ(slash_prefix_config->pathPrefix(), "/the_prefix");
+
+  EXPECT_THROW_WITH_MESSAGE(createConfig(EMPTY_STRING, 250, "the_prefix"), EnvoyException,
+                            "path_prefix should start with \"/\".");
+}
+
 // Verify client response when the authorization server returns a 200 OK and path_prefix is
 // configured.
 TEST_F(ExtAuthzHttpClientTest, AuthorizationOkWithPathRewrite) {
@@ -249,16 +311,16 @@ TEST_F(ExtAuthzHttpClientTest, AuthorizationOkWithPathRewrite) {
 
 // Verify request body is set correctly when the normal body is empty and raw body is set.
 TEST_F(ExtAuthzHttpClientTest, AuthorizationOkWithRawBody) {
-  Http::RequestMessagePtr message_ptr =
-      sendRequest({{":path", "/foo"}, {"foo", "bar"}}, "raw_body", true);
+  Http::RequestMessagePtr message_ptr = sendRequest(
+      {{":path", "/foo"}, {"foo", "bar"}}, {/*body_content=*/"raw_body", /*use_raw_body=*/true});
 
   EXPECT_EQ(message_ptr->bodyAsString(), "raw_body");
 }
 
 // Verify request body is set correctly when the normal body is set and raw body is empty.
 TEST_F(ExtAuthzHttpClientTest, AuthorizationOkWithBody) {
-  Http::RequestMessagePtr message_ptr =
-      sendRequest({{":path", "/foo"}, {"foo", "bar"}}, "body", false);
+  Http::RequestMessagePtr message_ptr = sendRequest(
+      {{":path", "/foo"}, {"foo", "bar"}}, {/*body_content=*/"body", /*use_raw_body=*/false});
 
   EXPECT_EQ(message_ptr->bodyAsString(), "body");
 }
@@ -293,6 +355,31 @@ TEST_F(ExtAuthzHttpClientTest, ContentLengthEqualZeroWithAllowedHeaders) {
   Http::RequestMessagePtr message_ptr =
       sendRequest({{Http::Headers::get().ContentLength.get(), std::string{"47"}},
                    {Http::Headers::get().Method.get(), std::string{"POST"}}});
+
+  EXPECT_EQ(message_ptr->headers().getContentLengthValue(), "0");
+  EXPECT_EQ(message_ptr->headers().getMethodValue(), "POST");
+}
+
+// Test the client when the config has raw headers enabled. Should read from request's header_map
+// instead of header.
+TEST_F(ExtAuthzHttpClientTest, EncodeRawHeaders) {
+  const std::string yaml = R"EOF(
+  http_service:
+    server_uri:
+      uri: "ext_authz:9000"
+      cluster: "ext_authz"
+      timeout: 0.25s
+  encode_raw_headers: true
+  )EOF";
+
+  initialize(yaml);
+
+  SendRequestOpts opts;
+  opts.encode_raw_headers = true;
+  Http::RequestMessagePtr message_ptr =
+      sendRequest({{Http::Headers::get().ContentLength.get(), std::string{"47"}},
+                   {Http::Headers::get().Method.get(), std::string{"POST"}}},
+                  opts);
 
   EXPECT_EQ(message_ptr->headers().getContentLengthValue(), "0");
   EXPECT_EQ(message_ptr->headers().getMethodValue(), "POST");
@@ -374,7 +461,7 @@ TEST_F(ExtAuthzHttpClientTest, AuthorizationOkWithAddedAuthzHeadersFromStreamInf
                           expected_header.second);
 
   StreamInfo::MockStreamInfo stream_info;
-  EXPECT_CALL(stream_info, getRequestHeaders()).Times(2).WillRepeatedly(Return(&request_headers));
+  EXPECT_CALL(stream_info, getRequestHeaders()).WillOnce(Return(&request_headers));
 
   envoy::service::auth::v3::CheckRequest request;
   client_->check(request_callbacks_, request, parent_span_, stream_info);
@@ -421,9 +508,10 @@ TEST_F(ExtAuthzHttpClientTest, AuthorizationOkWithHeadersToRemove) {
   // and inserted into the authz Response just below.
   Response authz_response;
   authz_response.status = CheckStatus::OK;
-  authz_response.headers_to_remove.emplace_back(Http::LowerCaseString{"remove-me"});
-  authz_response.headers_to_remove.emplace_back(Http::LowerCaseString{"remove-me-too"});
-  authz_response.headers_to_remove.emplace_back(Http::LowerCaseString{"remove-me-also"});
+  authz_response.headers_to_remove.emplace_back("remove-me");
+  authz_response.headers_to_remove.emplace_back("remove-me-too");
+  authz_response.headers_to_remove.emplace_back("remove-me-also");
+  authz_response.headers_to_remove.emplace_back("this is a valid header value but invalid name");
   EXPECT_CALL(request_callbacks_,
               onComplete_(WhenDynamicCastTo<ResponsePtr&>(AuthzOkResponse(authz_response))));
 
@@ -431,6 +519,9 @@ TEST_F(ExtAuthzHttpClientTest, AuthorizationOkWithHeadersToRemove) {
       {":status", "200", false},
       {"x-envoy-auth-headers-to-remove", " ,remove-me,, ,  remove-me-too , ", false},
       {"x-envoy-auth-headers-to-remove", " remove-me-also ", false},
+      // This should not cause an error in the HTTP client. It should transparently pass it through
+      // to the filter (which will then SKIP the header later).
+      {"x-envoy-auth-headers-to-remove", "this is a valid header value but invalid name", false},
   });
   Http::ResponseMessagePtr http_response = TestCommon::makeMessageResponse(http_response_headers);
   client_->onSuccess(async_request_, std::move(http_response));
@@ -509,10 +600,13 @@ TEST_F(ExtAuthzHttpClientTest, AuthorizationDeniedAndAllowedClientHeaders) {
 TEST_F(ExtAuthzHttpClientTest, AuthorizationRequestError) {
   envoy::service::auth::v3::CheckRequest request;
 
+  auto authz_response = Response{};
+  authz_response.status = CheckStatus::Error;
+
   client_->check(request_callbacks_, request, parent_span_, stream_info_);
 
   EXPECT_CALL(request_callbacks_,
-              onComplete_(WhenDynamicCastTo<ResponsePtr&>(AuthzErrorResponse(CheckStatus::Error))));
+              onComplete_(WhenDynamicCastTo<ResponsePtr&>(AuthzErrorResponse(authz_response))));
   client_->onFailure(async_request_, Http::AsyncClient::FailureReason::Reset);
 }
 
@@ -522,10 +616,13 @@ TEST_F(ExtAuthzHttpClientTest, AuthorizationRequest5xxError) {
       Http::ResponseHeaderMapPtr{new Http::TestResponseHeaderMapImpl{{":status", "503"}}}));
   envoy::service::auth::v3::CheckRequest request;
 
+  auto authz_response = Response{};
+  authz_response.status = CheckStatus::Error;
+
   client_->check(request_callbacks_, request, parent_span_, stream_info_);
 
   EXPECT_CALL(request_callbacks_,
-              onComplete_(WhenDynamicCastTo<ResponsePtr&>(AuthzErrorResponse(CheckStatus::Error))));
+              onComplete_(WhenDynamicCastTo<ResponsePtr&>(AuthzErrorResponse(authz_response))));
   client_->onSuccess(async_request_, std::move(check_response));
 }
 
@@ -544,10 +641,13 @@ TEST_F(ExtAuthzHttpClientTest, CancelledAuthorizationRequest) {
 TEST_F(ExtAuthzHttpClientTest, NoCluster) {
   InSequence s;
 
+  auto authz_response = Response{};
+  authz_response.status = CheckStatus::Error;
+
   EXPECT_CALL(cm_, getThreadLocalCluster(Eq("ext_authz"))).WillOnce(Return(nullptr));
   EXPECT_CALL(cm_.thread_local_cluster_, httpAsyncClient()).Times(0);
   EXPECT_CALL(request_callbacks_,
-              onComplete_(WhenDynamicCastTo<ResponsePtr&>(AuthzErrorResponse(CheckStatus::Error))));
+              onComplete_(WhenDynamicCastTo<ResponsePtr&>(AuthzErrorResponse(authz_response))));
   client_->check(request_callbacks_, envoy::service::auth::v3::CheckRequest{}, parent_span_,
                  stream_info_);
 }

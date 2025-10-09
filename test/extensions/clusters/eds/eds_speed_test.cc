@@ -52,23 +52,26 @@ public:
     auto backoff_strategy = std::make_unique<JitteredExponentialBackOffStrategy>(
         Config::SubscriptionFactory::RetryInitialDelayMs,
         Config::SubscriptionFactory::RetryMaxDelayMs, random_);
+    Config::GrpcMuxContext grpc_mux_context{
+        /*async_client_=*/std::unique_ptr<Grpc::MockAsyncClient>(async_client_),
+        /*failover_async_client_=*/nullptr,
+        /*dispatcher_=*/server_context_.dispatcher_,
+        /*service_method_=*/
+        *Protobuf::DescriptorPool::generated_pool()->FindMethodByName(
+            "envoy.service.endpoint.v3.EndpointDiscoveryService.StreamEndpoints"),
+        /*local_info_=*/local_info_,
+        /*rate_limit_settings_=*/{},
+        /*scope_=*/scope_,
+        /*config_validators_=*/std::move(config_validators_),
+        /*xds_resources_delegate_=*/Config::XdsResourcesDelegateOptRef(),
+        /*xds_config_tracker_=*/Config::XdsConfigTrackerOptRef(),
+        /*backoff_strategy_=*/std::move(backoff_strategy),
+        /*target_xds_authority_=*/"",
+        /*eds_resources_cache_=*/nullptr};
     if (use_unified_mux_) {
-      grpc_mux_.reset(new Config::XdsMux::GrpcMuxSotw(
-          std::unique_ptr<Grpc::MockAsyncClient>(async_client_), server_context_.dispatcher_,
-          *Protobuf::DescriptorPool::generated_pool()->FindMethodByName(
-              "envoy.service.endpoint.v3.EndpointDiscoveryService.StreamEndpoints"),
-          scope_, {}, local_info_, true, std::move(config_validators_), std::move(backoff_strategy),
-          /*xds_config_tracker=*/Config::XdsConfigTrackerOptRef()));
+      grpc_mux_ = std::make_shared<Config::XdsMux::GrpcMuxSotw>(grpc_mux_context, true);
     } else {
-      grpc_mux_.reset(new Config::GrpcMuxImpl(
-          local_info_, std::unique_ptr<Grpc::MockAsyncClient>(async_client_),
-          server_context_.dispatcher_,
-          *Protobuf::DescriptorPool::generated_pool()->FindMethodByName(
-              "envoy.service.endpoint.v3.EndpointDiscoveryService.StreamEndpoints"),
-          scope_, {}, true, std::move(config_validators_), std::move(backoff_strategy),
-          /*xds_config_tracker=*/Config::XdsConfigTrackerOptRef(),
-          /*xds_resources_delegate=*/Config::XdsResourcesDelegateOptRef(),
-          /*target_xds_authority=*/""));
+      grpc_mux_ = std::make_shared<Config::GrpcMuxImpl>(grpc_mux_context, true);
     }
     resetCluster(R"EOF(
       name: name
@@ -85,7 +88,10 @@ public:
                  Envoy::Upstream::Cluster::InitializePhase::Secondary);
 
     EXPECT_CALL(*server_context_.cluster_manager_.subscription_factory_.subscription_, start(_));
-    cluster_->initialize([this] { initialized_ = true; });
+    cluster_->initialize([this] {
+      initialized_ = true;
+      return absl::OkStatus();
+    });
     EXPECT_CALL(*async_client_, startRaw(_, _, _, _)).WillOnce(testing::Return(&async_stream_));
     subscription_->start({"fare"});
   }
@@ -94,11 +100,10 @@ public:
     local_info_.node_.mutable_locality()->set_zone("us-east-1a");
     eds_cluster_ = parseClusterFromV3Yaml(yaml_config);
 
-    Envoy::Upstream::ClusterFactoryContextImpl factory_context(
-        server_context_, server_context_.cluster_manager_, nullptr, ssl_context_manager_, nullptr,
-        false);
+    Envoy::Upstream::ClusterFactoryContextImpl factory_context(server_context_, nullptr, nullptr,
+                                                               false);
 
-    cluster_ = std::make_shared<EdsClusterImpl>(eds_cluster_, factory_context);
+    cluster_ = *EdsClusterImpl::create(eds_cluster_, factory_context);
     EXPECT_EQ(initialize_phase, cluster_->initializePhase());
     eds_callbacks_ = server_context_.cluster_manager_.subscription_factory_.callbacks_;
     subscription_ = std::make_unique<Config::GrpcSubscriptionImpl>(
@@ -171,7 +176,6 @@ public:
   bool initialized_{};
   Stats::Scope& scope_{*stats_.rootScope()};
   Config::SubscriptionStats subscription_stats_;
-  Ssl::MockContextManager ssl_context_manager_;
   envoy::config::cluster::v3::Cluster eds_cluster_;
   EdsClusterImplSharedPtr cluster_;
   Config::SubscriptionCallbacks* eds_callbacks_{};

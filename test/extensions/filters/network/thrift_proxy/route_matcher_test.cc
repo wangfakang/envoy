@@ -8,6 +8,7 @@
 #include "source/extensions/filters/network/thrift_proxy/router/router_impl.h"
 
 #include "test/extensions/filters/network/thrift_proxy/utility.h"
+#include "test/mocks/server/server_factory_context.h"
 #include "test/test_common/utility.h"
 
 #include "gtest/gtest.h"
@@ -21,12 +22,12 @@ namespace {
 
 class ThriftRouteMatcherTest : public testing::Test {
 public:
-  ThriftRouteMatcherTest() : engine_(std::make_unique<Regex::GoogleReEngine>()) {}
+  ThriftRouteMatcherTest() = default;
 
 protected:
   RouteMatcher createMatcher(
       const envoy::extensions::filters::network::thrift_proxy::v3::RouteConfiguration& route) {
-    return RouteMatcher(route, absl::nullopt);
+    return {route, absl::nullopt, context_};
   }
 
   RouteMatcher createMatcher(const std::string& yaml) {
@@ -34,9 +35,9 @@ protected:
     return createMatcher(config);
   }
 
-private:
-  ScopedInjectableLoader<Regex::Engine> engine_;
+  NiceMock<Server::Configuration::MockServerFactoryContext> context_;
 
+private:
   envoy::extensions::filters::network::thrift_proxy::v3::RouteConfiguration
   parseRouteConfigurationFromV3Yaml(const std::string& yaml) {
     envoy::extensions::filters::network::thrift_proxy::v3::RouteConfiguration route_config;
@@ -646,7 +647,7 @@ routes:
         criteria->metadataMatchCriteria();
     EXPECT_EQ(2, mmc.size());
 
-    ProtobufWkt::Value v1, v2;
+    Protobuf::Value v1, v2;
     v1.set_string_value("v1");
     v2.set_string_value("v2");
     HashedValue hv1(v1), hv2(v2);
@@ -702,7 +703,7 @@ routes:
   auto matcher = createMatcher(yaml);
   MessageMetadata metadata;
   metadata.setMethodName("method1");
-  ProtobufWkt::Value v1, v2, v3;
+  Protobuf::Value v1, v2, v3;
   v1.set_string_value("v1");
   v2.set_string_value("v2");
   v3.set_string_value("v3");
@@ -789,7 +790,7 @@ routes:
   auto matcher = createMatcher(yaml);
   MessageMetadata metadata;
   metadata.setMethodName("method1");
-  ProtobufWkt::Value v1, v2, v3;
+  Protobuf::Value v1, v2, v3;
   v1.set_string_value("v1");
   v2.set_string_value("v2");
   v3.set_string_value("v3");
@@ -900,7 +901,7 @@ TEST_F(ThriftRouteMatcherTest, ClusterHeaderMetadataMatch) {
         criteria->metadataMatchCriteria();
     EXPECT_EQ(2, mmc.size());
 
-    ProtobufWkt::Value v1, v2;
+    Protobuf::Value v1, v2;
     v1.set_string_value("v1");
     v2.set_string_value("v2");
     HashedValue hv1(v1), hv2(v2);

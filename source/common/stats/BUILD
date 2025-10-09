@@ -15,12 +15,25 @@ envoy_cc_library(
     deps = [
         ":metric_impl_lib",
         ":stat_merger_lib",
+        "//envoy/stats:sink_interface",
         "//source/common/common:assert_lib",
         "//source/common/common:hash_lib",
         "//source/common/common:thread_annotations",
         "//source/common/common:thread_lib",
         "//source/common/common:thread_synchronizer_lib",
         "//source/common/common:utility_lib",
+    ],
+)
+
+envoy_cc_library(
+    name = "stat_match_input_lib",
+    srcs = ["stat_match_input.cc"],
+    hdrs = ["stat_match_input.h"],
+    deps = [
+        ":stats_matcher_lib",
+        "//envoy/registry",
+        "//envoy/stats:stats_interface",
+        "@envoy_api//envoy/extensions/matching/common_inputs/stats/v3:pkg_cc_proto",
     ],
 )
 
@@ -33,6 +46,19 @@ envoy_cc_library(
         "//source/common/common:assert_lib",
         "//source/common/common:macros",
         "//source/common/common:thread_lib",
+        "@com_google_absl//absl/container:flat_hash_set",
+    ],
+)
+
+envoy_cc_library(
+    name = "deferred_creation",
+    hdrs = ["deferred_creation.h"],
+    deps = [
+        "//envoy/stats:stats_interface",
+        "//source/common/common:cleanup_lib",
+        "//source/common/common:thread_lib",
+        "//source/common/stats:symbol_table_lib",
+        "//source/common/stats:utility_lib",
     ],
 )
 
@@ -40,15 +66,14 @@ envoy_cc_library(
     name = "histogram_lib",
     srcs = ["histogram_impl.cc"],
     hdrs = ["histogram_impl.h"],
-    external_deps = [
-        "libcircllhist",
-    ],
     deps = [
         ":metric_impl_lib",
         "//source/common/common:assert_lib",
         "//source/common/common:hash_lib",
         "//source/common/common:matchers_lib",
         "//source/common/common:utility_lib",
+        "//source/common/protobuf:utility_lib",
+        "@com_github_openhistogram_libcircllhist//:libcircllhist",
         "@envoy_api//envoy/config/metrics/v3:pkg_cc_proto",
     ],
 )
@@ -167,10 +192,6 @@ envoy_cc_library(
     name = "symbol_table_lib",
     srcs = ["symbol_table.cc"],
     hdrs = ["symbol_table.h"],
-    external_deps = [
-        "abseil_base",
-        "abseil_inlined_vector",
-    ],
     deps = [
         ":recent_lookups_lib",
         "//source/common/common:assert_lib",
@@ -178,6 +199,8 @@ envoy_cc_library(
         "//source/common/common:minimal_logger_lib",
         "//source/common/common:thread_lib",
         "//source/common/common:utility_lib",
+        "@com_google_absl//absl/base",
+        "@com_google_absl//absl/container:inlined_vector",
     ],
 )
 
@@ -197,7 +220,6 @@ envoy_cc_library(
     name = "tag_producer_lib",
     srcs = ["tag_producer_impl.cc"],
     hdrs = ["tag_producer_impl.h"],
-    external_deps = ["abseil_node_hash_set"],
     deps = [
         ":symbol_table_lib",
         ":tag_extractor_lib",
@@ -206,6 +228,7 @@ envoy_cc_library(
         "//source/common/common:perf_annotation_lib",
         "//source/common/config:well_known_names",
         "//source/common/protobuf",
+        "@com_google_absl//absl/container:node_hash_set",
         "@envoy_api//envoy/config/metrics/v3:pkg_cc_proto",
     ],
 )

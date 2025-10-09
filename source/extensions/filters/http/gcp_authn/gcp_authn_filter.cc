@@ -6,6 +6,7 @@
 #include "source/common/common/enum_to_int.h"
 #include "source/common/http/header_map_impl.h"
 #include "source/common/http/utility.h"
+#include "source/common/runtime/runtime_features.h"
 
 #include "absl/strings/str_replace.h"
 
@@ -42,7 +43,8 @@ Http::FilterHeadersStatus GcpAuthnFilter::decodeHeaders(Http::RequestHeaderMap& 
   initiating_call_ = true;
 
   Envoy::Upstream::ThreadLocalCluster* cluster =
-      context_.clusterManager().getThreadLocalCluster(route->routeEntry()->clusterName());
+      context_.serverFactoryContext().clusterManager().getThreadLocalCluster(
+          route->routeEntry()->clusterName());
 
   if (cluster != nullptr) {
     // The `audience` is passed to filter through cluster metadata.
@@ -50,7 +52,7 @@ Http::FilterHeadersStatus GcpAuthnFilter::decodeHeaders(Http::RequestHeaderMap& 
     const auto filter_it = filter_metadata.find(std::string(FilterName));
     if (filter_it != filter_metadata.end()) {
       envoy::extensions::filters::http::gcp_authn::v3::Audience audience;
-      MessageUtil::unpackTo(filter_it->second, audience);
+      THROW_IF_NOT_OK(MessageUtil::unpackTo(filter_it->second, audience));
       audience_str_ = audience.url();
     }
   }
@@ -73,8 +75,8 @@ Http::FilterHeadersStatus GcpAuthnFilter::decodeHeaders(Http::RequestHeaderMap& 
     // "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=[AUDIENCE]"
     // So, we add the audience from the config to the final url by substituting the `[AUDIENCE]`
     // with real audience string from the config.
-    std::string final_url =
-        absl::StrReplaceAll(filter_config_->http_uri().uri(), {{"[AUDIENCE]", audience_str_}});
+
+    std::string final_url = absl::StrReplaceAll(UrlString, {{"[AUDIENCE]", audience_str_}});
     client_->fetchToken(*this, buildRequest(final_url));
     initiating_call_ = false;
   } else {

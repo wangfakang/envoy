@@ -29,7 +29,7 @@ public:
     EXPECT_CALL(*dispatcher_, createFileEvent_(42, _, _, _)).WillOnce(Return(file_event_));
     io_handle_.setBlocking(false);
     io_handle_.initializeFileEvent(
-        *dispatcher_, [](uint32_t) -> void {}, Event::PlatformDefaultTriggerType,
+        *dispatcher_, [](uint32_t) { return absl::OkStatus(); }, Event::PlatformDefaultTriggerType,
         Event::FileReadyType::Read | Event::FileReadyType::Closed);
   }
 
@@ -153,9 +153,8 @@ TEST_F(Win32SocketHandleImplTest, RecvWithPeekFlagReturnsFinalError) {
 
   EXPECT_CALL(os_sys_calls, recv(_, _, _, _))
       .Times(2)
-      .WillOnce(Invoke([&](os_fd_t, void*, size_t, int) {
-        return Api::SysCallSizeResult{data_length / 2, 0};
-      }))
+      .WillOnce(Invoke(
+          [&](os_fd_t, void*, size_t, int) { return Api::SysCallSizeResult{data_length / 2, 0}; }))
       .WillOnce(Return(Api::SysCallSizeResult{-1, SOCKET_ERROR_CONNRESET}));
 
   absl::FixedArray<char> buf(data_length);

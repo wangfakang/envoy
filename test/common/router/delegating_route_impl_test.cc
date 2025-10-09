@@ -28,32 +28,37 @@ TEST(DelegatingRoute, DelegatingRouteTest) {
   TEST_METHOD(tracingConfig);
   TEST_METHOD(metadata);
   TEST_METHOD(typedMetadata);
+  TEST_METHOD(routeName);
+  TEST_METHOD(virtualHost);
 
   std::string name;
   TEST_METHOD(mostSpecificPerFilterConfig, name);
 
-  std::function<void(const Router::RouteSpecificFilterConfig&)> cb;
-  TEST_METHOD(traversePerFilterConfig, name, cb);
+  TEST_METHOD(perFilterConfigs, name);
 }
 
 // Verify that DelegatingRouteEntry class forwards all calls to internal base route.
 TEST(DelegatingRouteEntry, DelegatingRouteEntryTest) {
-  const std::shared_ptr<MockRoute> base_route_ptr = std::make_shared<MockRoute>();
-  const std::shared_ptr<MockRouteEntry> inner_object_ptr = std::make_shared<MockRouteEntry>();
+  const std::shared_ptr<MockRoute> base_route_ptr = std::make_shared<NiceMock<MockRoute>>();
+  const std::shared_ptr<MockRouteEntry> inner_object_ptr =
+      std::make_shared<NiceMock<MockRouteEntry>>();
+  ON_CALL(*base_route_ptr, directResponseEntry()).WillByDefault(Return(nullptr));
+  EXPECT_CALL(*base_route_ptr, routeEntry).WillOnce(Return(inner_object_ptr.get()));
+
   DelegatingRouteEntry wrapper_object(base_route_ptr);
-  EXPECT_CALL(*base_route_ptr, routeEntry).WillRepeatedly(Return(inner_object_ptr.get()));
 
   Http::TestRequestHeaderMapImpl request_headers;
   Http::TestResponseHeaderMapImpl response_headers;
   StreamInfo::MockStreamInfo stream_info;
+  const Formatter::HttpFormatterContext formatter_context(&request_headers, &response_headers);
 
-  TEST_METHOD(finalizeResponseHeaders, response_headers, stream_info);
+  TEST_METHOD(finalizeResponseHeaders, response_headers, formatter_context, stream_info);
   TEST_METHOD(responseHeaderTransforms, stream_info);
   TEST_METHOD(clusterName);
   TEST_METHOD(clusterNotFoundResponseCode);
   TEST_METHOD(corsPolicy);
   TEST_METHOD(currentUrlPathAfterRewrite, request_headers);
-  TEST_METHOD(finalizeRequestHeaders, request_headers, stream_info, true);
+  TEST_METHOD(finalizeRequestHeaders, request_headers, formatter_context, stream_info, true);
   TEST_METHOD(requestHeaderTransforms, stream_info);
   TEST_METHOD(hashPolicy);
   TEST_METHOD(hedgePolicy);
@@ -63,7 +68,7 @@ TEST(DelegatingRouteEntry, DelegatingRouteEntryTest) {
   TEST_METHOD(pathMatcher);
   TEST_METHOD(pathRewriter);
   TEST_METHOD(internalRedirectPolicy);
-  TEST_METHOD(retryShadowBufferLimit);
+  TEST_METHOD(requestBodyBufferLimit);
   TEST_METHOD(shadowPolicies);
   TEST_METHOD(timeout);
   TEST_METHOD(idleTimeout);
@@ -73,8 +78,6 @@ TEST(DelegatingRouteEntry, DelegatingRouteEntryTest) {
   TEST_METHOD(grpcTimeoutHeaderOffset);
   TEST_METHOD(maxGrpcTimeout);
   TEST_METHOD(grpcTimeoutOffset);
-  TEST_METHOD(virtualCluster, request_headers);
-  TEST_METHOD(virtualHost);
   TEST_METHOD(autoHostRewrite);
   TEST_METHOD(appendXfh);
   TEST_METHOD(metadataMatchCriteria);
@@ -86,7 +89,6 @@ TEST(DelegatingRouteEntry, DelegatingRouteEntryTest) {
   TEST_METHOD(includeAttemptCountInResponse);
   TEST_METHOD(upgradeMap);
   TEST_METHOD(connectConfig);
-  TEST_METHOD(routeName);
   TEST_METHOD(earlyDataPolicy);
   TEST_METHOD(routeStatsContext);
 }

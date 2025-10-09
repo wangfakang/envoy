@@ -27,20 +27,20 @@ public:
     }
     return xds::core::v3::ContextParams::default_instance();
   };
-  void setDynamicContextParam(absl::string_view resource_type_url, absl::string_view key,
-                              absl::string_view value) override {
+  absl::Status setDynamicContextParam(absl::string_view resource_type_url, absl::string_view key,
+                                      absl::string_view value) override {
     ASSERT_IS_MAIN_OR_TEST_THREAD();
     (*dynamic_context_[resource_type_url]
           .mutable_params())[toStdStringView(key)] = // NOLINT(std::string_view)
         toStdStringView(value);                      // NOLINT(std::string_view)
-    update_cb_helper_.runCallbacks(resource_type_url);
+    return update_cb_helper_.runCallbacks(resource_type_url);
   }
-  void unsetDynamicContextParam(absl::string_view resource_type_url,
-                                absl::string_view key) override {
+  absl::Status unsetDynamicContextParam(absl::string_view resource_type_url,
+                                        absl::string_view key) override {
     ASSERT_IS_MAIN_OR_TEST_THREAD();
     dynamic_context_[resource_type_url].mutable_params()->erase(
         toStdStringView(key)); // NOLINT(std::string_view)
-    update_cb_helper_.runCallbacks(resource_type_url);
+    return update_cb_helper_.runCallbacks(resource_type_url);
   }
   ABSL_MUST_USE_RESULT Common::CallbackHandlePtr
   addDynamicContextUpdateCallback(UpdateNotificationCb callback) const override {
@@ -52,7 +52,7 @@ private:
   const xds::core::v3::ContextParams node_context_;
   // Map from resource type URL to dynamic context parameters.
   absl::flat_hash_map<std::string, xds::core::v3::ContextParams> dynamic_context_;
-  mutable Common::CallbackManager<absl::string_view> update_cb_helper_;
+  mutable Common::CallbackManager<absl::Status, absl::string_view> update_cb_helper_;
 };
 
 } // namespace Config

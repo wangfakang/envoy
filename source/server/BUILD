@@ -14,14 +14,12 @@ envoy_cc_library(
     name = "backtrace_lib",
     srcs = ["backtrace.cc"],
     hdrs = ["backtrace.h"],
-    external_deps = [
-        "abseil_stacktrace",
-        "abseil_symbolize",
-    ],
     tags = ["backtrace"],
     deps = [
         "//source/common/common:minimal_logger_lib",
         "//source/common/version:version_lib",
+        "@com_google_absl//absl/debugging:stacktrace",
+        "@com_google_absl//absl/debugging:symbolize",
     ],
 )
 
@@ -54,10 +52,10 @@ envoy_cc_library(
         "//source/common/network:socket_option_lib",
         "//source/common/network:utility_lib",
         "//source/common/protobuf:utility_lib",
-        "//source/extensions/access_loggers/common:file_access_log_lib",
         "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
         "@envoy_api//envoy/config/metrics/v3:pkg_cc_proto",
         "@envoy_api//envoy/config/trace/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/access_loggers/file/v3:pkg_cc_proto",
     ],
 )
 
@@ -99,6 +97,7 @@ envoy_cc_library(
         "//envoy/network:listen_socket_interface",
         "//envoy/network:listener_interface",
         "//envoy/server:listener_manager_interface",
+        "//source/common/network:listener_lib",
         "//source/common/network:utility_lib",
         "//source/server:active_listener_base",
     ],
@@ -127,7 +126,6 @@ envoy_cc_library(
     name = "guarddog_lib",
     srcs = ["guarddog_impl.cc"],
     hdrs = ["guarddog_impl.h"],
-    external_deps = ["abseil_optional"],
     deps = [
         ":watchdog_lib",
         "//envoy/api:api_interface",
@@ -148,6 +146,7 @@ envoy_cc_library(
         "//source/common/protobuf:utility_lib",
         "//source/common/stats:symbol_table_lib",
         "//source/common/watchdog:abort_action_config",
+        "@com_google_absl//absl/types:optional",
         "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
         "@envoy_api//envoy/watchdog/v3:pkg_cc_proto",
     ],
@@ -186,6 +185,7 @@ envoy_cc_library(
     hdrs = envoy_select_hot_restart(["hot_restarting_child.h"]),
     deps = [
         ":hot_restarting_base",
+        "//envoy/network:parent_drained_callback_registrar_interface",
         "//source/common/stats:stat_merger_lib",
     ],
 )
@@ -232,27 +232,26 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
-    name = "options_lib",
-    srcs = ["options_impl.cc"] + select({
+    name = "options_base",
+    srcs = ["options_impl_base.cc"] + select({
         "//bazel:linux_x86_64": ["options_impl_platform_linux.cc"],
         "//bazel:linux_aarch64": ["options_impl_platform_linux.cc"],
         "//bazel:linux_ppc": ["options_impl_platform_linux.cc"],
+        "//bazel:linux_s390x": ["options_impl_platform_linux.cc"],
         "//bazel:linux_mips64": ["options_impl_platform_linux.cc"],
         "//conditions:default": ["options_impl_platform_default.cc"],
     }),
     hdrs = [
-        "options_impl.h",
+        "options_impl_base.h",
         "options_impl_platform.h",
     ] + select({
         "//bazel:linux_x86_64": ["options_impl_platform_linux.h"],
         "//bazel:linux_aarch64": ["options_impl_platform_linux.h"],
         "//bazel:linux_ppc": ["options_impl_platform_linux.h"],
+        "//bazel:linux_s390x": ["options_impl_platform_linux.h"],
         "//bazel:linux_mips64": ["options_impl_platform_linux.h"],
         "//conditions:default": [],
     }),
-    # TCLAP command line parser needs this to support int64_t/uint64_t in several build environments.
-    copts = ["-DHAVE_LONG_LONG"],
-    external_deps = ["tclap"],
     deps = [
         "//envoy/network:address_interface",
         "//envoy/registry",
@@ -269,6 +268,40 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "options_lib",
+    srcs = ["options_impl.cc"],
+    hdrs = ["options_impl.h"],
+    # TCLAP command line parser needs this to support int64_t/uint64_t in several build environments.
+    copts = ["-DHAVE_LONG_LONG"],
+    deps = [
+        ":options_base",
+        "//envoy/network:address_interface",
+        "//envoy/registry",
+        "//envoy/server:options_interface",
+        "//envoy/stats:stats_interface",
+        "//source/common/api:os_sys_calls_lib",
+        "//source/common/common:logger_lib",
+        "//source/common/common:macros",
+        "//source/common/protobuf:utility_lib",
+        "//source/common/stats:stats_lib",
+        "//source/common/stats:tag_utility_lib",
+        "//source/common/version:version_lib",
+        "@com_github_mirror_tclap//:tclap",
+        "@envoy_api//envoy/admin/v3:pkg_cc_proto",
+        "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_library(
+    name = "null_overload_manager_lib",
+    hdrs = ["null_overload_manager.h"],
+    deps = [
+        "//envoy/server/overload:overload_manager_interface",
+        "//source/common/event:scaled_range_timer_manager_lib",
+    ],
+)
+
+envoy_cc_library(
     name = "overload_manager_lib",
     srcs = ["overload_manager_impl.cc"],
     hdrs = ["overload_manager_impl.h"],
@@ -281,43 +314,9 @@ envoy_cc_library(
         "//source/common/event:scaled_range_timer_manager_lib",
         "//source/common/stats:symbol_table_lib",
         "//source/server:resource_monitor_config_lib",
+        "@com_google_absl//absl/container:node_hash_set",
         "@envoy_api//envoy/config/overload/v3:pkg_cc_proto",
     ],
-)
-
-envoy_cc_library(
-    name = "api_listener_lib",
-    srcs = [
-        "api_listener_impl.cc",
-    ],
-    hdrs = [
-        "api_listener_impl.h",
-    ],
-    deps = [
-        ":configuration_lib",
-        ":factory_context_lib",
-        ":transport_socket_config_lib",
-        "//envoy/network:connection_interface",
-        "//envoy/network:listener_interface",
-        "//envoy/server:filter_config_interface",
-        "//envoy/server:instance_interface",
-        "//envoy/server:listener_manager_interface",
-        "//envoy/server:transport_socket_config_interface",
-        "//source/common/common:basic_resource_lib",
-        "//source/common/common:empty_string",
-        "//source/common/config:metadata_lib",
-        "//source/common/config:utility_lib",
-        "//source/common/init:manager_lib",
-        "//source/common/init:target_lib",
-        "//source/common/network:utility_lib",
-        "//source/common/stream_info:stream_info_lib",
-        "//source/extensions/filters/network/http_connection_manager:config",
-        "//source/extensions/udp_packet_writer/default:config",
-        "//source/extensions/upstreams/http/generic:config",
-        "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
-        "@envoy_api//envoy/config/listener/v3:pkg_cc_proto",
-    ],
-    alwayslink = True,
 )
 
 envoy_cc_library(
@@ -327,6 +326,8 @@ envoy_cc_library(
     deps = [
         "//envoy/server:factory_context_interface",
         "//envoy/server:instance_interface",
+        "//source/common/config:metadata_lib",
+        "//source/common/listener_manager:listener_info_lib",
     ],
 )
 
@@ -356,18 +357,11 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
-    name = "factory_context_base_impl_lib",
-    hdrs = ["factory_context_base_impl.h"],
-    deps = [
-        "//envoy/server:factory_context_interface",
-    ],
-)
-
-envoy_cc_library(
     name = "listener_manager_factory_lib",
     hdrs = ["listener_manager_factory.h"],
     deps = [
         "//envoy/server:factory_context_interface",
+        "//envoy/server:instance_interface",
         "//envoy/server:listener_manager_interface",
         "//envoy/server:worker_interface",
         "//source/common/quic:quic_stat_names_lib",
@@ -375,21 +369,15 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
-    name = "server_lib",
+    name = "server_base_lib",
     srcs = ["server.cc"],
     hdrs = ["server.h"],
-    external_deps = [
-        "abseil_node_hash_map",
-        "abseil_optional",
-    ],
+    rbe_pool = "6gig",
     deps = [
-        ":api_listener_lib",
         ":configuration_lib",
-        ":guarddog_lib",
         ":listener_hooks_lib",
         ":listener_manager_factory_lib",
         ":regex_engine_lib",
-        ":ssl_context_manager_lib",
         ":utils_lib",
         ":worker_lib",
         "//envoy/event:dispatcher_interface",
@@ -412,9 +400,11 @@ envoy_cc_library(
         "//source/common/common:cleanup_lib",
         "//source/common/common:logger_lib",
         "//source/common/common:mutex_tracer_lib",
+        "//source/common/common:notification_lib",
         "//source/common/common:perf_tracing_lib",
         "//source/common/common:utility_lib",
         "//source/common/config:utility_lib",
+        "//source/common/config:xds_manager_lib",
         "//source/common/config:xds_resource_lib",
         "//source/common/grpc:async_client_manager_lib",
         "//source/common/grpc:context_lib",
@@ -423,33 +413,39 @@ envoy_cc_library(
         "//source/common/http:headers_lib",
         "//source/common/init:manager_lib",
         "//source/common/local_info:local_info_lib",
-        "//source/common/memory:heap_shrinker_lib",
         "//source/common/memory:stats_lib",
         "//source/common/protobuf:utility_lib",
         "//source/common/quic:quic_stat_names_lib",
-        "//source/common/router:rds_lib",
+        "//source/common/runtime:runtime_keys_lib",
         "//source/common/runtime:runtime_lib",
         "//source/common/secret:secret_manager_impl_lib",
         "//source/common/signal:fatal_error_handler_lib",
         "//source/common/singleton:manager_impl_lib",
+        "//source/common/stats:tag_producer_lib",
         "//source/common/stats:thread_local_store_lib",
+        "//source/common/tls:context_lib",
         "//source/common/upstream:cluster_manager_lib",
-        "//source/common/upstream:health_discovery_service_lib",
         "//source/common/version:version_lib",
-        "//source/server:overload_manager_lib",
         "//source/server/admin:admin_lib",
+        "@com_google_absl//absl/container:node_hash_map",
+        "@com_google_absl//absl/types:optional",
         "@envoy_api//envoy/admin/v3:pkg_cc_proto",
         "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
     ],
 )
 
 envoy_cc_library(
-    name = "ssl_context_manager_lib",
-    srcs = ["ssl_context_manager.cc"],
-    hdrs = ["ssl_context_manager.h"],
+    name = "server_lib",
+    srcs = ["instance_impl.cc"],
+    hdrs = ["instance_impl.h"],
     deps = [
-        "//envoy/registry",
-        "//envoy/ssl:context_manager_interface",
+        ":guarddog_lib",
+        ":server_base_lib",
+        "//source/common/memory:heap_shrinker_lib",
+        "//source/common/upstream:health_discovery_service_lib",
+        "//source/common/upstream:prod_cluster_info_factory_lib",
+        "//source/server:null_overload_manager_lib",
+        "//source/server:overload_manager_lib",
     ],
 )
 
@@ -493,6 +489,7 @@ envoy_cc_library(
     name = "transport_socket_config_lib",
     hdrs = ["transport_socket_config_impl.h"],
     deps = [
+        ":generic_factory_context_lib",
         "//envoy/server:transport_socket_config_interface",
     ],
 )
@@ -512,10 +509,20 @@ envoy_cc_library(
     srcs = ["utils.cc"],
     hdrs = ["utils.h"],
     deps = [
+        "//envoy/common:exception_lib",
         "//envoy/init:manager_interface",
         "//envoy/server:options_interface",
         "//source/common/common:assert_lib",
         "@envoy_api//envoy/admin/v3:pkg_cc_proto",
         "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_library(
+    name = "generic_factory_context_lib",
+    srcs = ["generic_factory_context.cc"],
+    hdrs = ["generic_factory_context.h"],
+    deps = [
+        "//envoy/server:factory_context_interface",
     ],
 )

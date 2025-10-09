@@ -2,8 +2,10 @@
 
 #include <cstdint>
 
+#include "envoy/extensions/filters/network/redis_proxy/v3/redis_proxy.pb.h"
 #include "envoy/upstream/cluster_manager.h"
 
+#include "source/extensions/filters/network/common/redis/aws_iam_authenticator_impl.h"
 #include "source/extensions/filters/network/common/redis/codec_impl.h"
 #include "source/extensions/filters/network/common/redis/redis_command_stats.h"
 
@@ -104,6 +106,10 @@ public:
    * @param auth password for upstream host.
    */
   virtual void initialize(const std::string& auth_username, const std::string& auth_password) PURE;
+
+  virtual void sendAwsIamAuth(
+      const std::string& auth_username,
+      const envoy::extensions::filters::network::redis_proxy::v3::AwsIam& aws_iam_config) PURE;
 };
 
 using ClientPtr = std::unique_ptr<Client>;
@@ -186,7 +192,7 @@ public:
   virtual uint32_t connectionRateLimitPerSec() const PURE;
 };
 
-using ConfigSharedPtr = std::shared_ptr<Config>;
+using ConfigSharedPtr = std::shared_ptr<const Config>;
 
 /**
  * A factory for individual redis client connections.
@@ -204,13 +210,18 @@ public:
    * @param scope supplies the stats scope.
    * @param auth password for upstream host.
    * @param is_transaction_client true if this client was created to relay a transaction.
+   * @param aws_iam_config supplies the AWS IAM configuration from protobuf
+   * @param aws_iam_authenticator supplies the AWS IAM authenticator created during config
    * @return ClientPtr a new connection pool client.
    */
-  virtual ClientPtr create(Upstream::HostConstSharedPtr host, Event::Dispatcher& dispatcher,
-                           const Config& config,
-                           const RedisCommandStatsSharedPtr& redis_command_stats,
-                           Stats::Scope& scope, const std::string& auth_username,
-                           const std::string& auth_password, bool is_transaction_client) PURE;
+  virtual ClientPtr create(
+      Upstream::HostConstSharedPtr host, Event::Dispatcher& dispatcher,
+      const ConfigSharedPtr& config, const RedisCommandStatsSharedPtr& redis_command_stats,
+      Stats::Scope& scope, const std::string& auth_username, const std::string& auth_password,
+      bool is_transaction_client,
+      absl::optional<envoy::extensions::filters::network::redis_proxy::v3::AwsIam> aws_iam_config,
+      absl::optional<Common::Redis::AwsIamAuthenticator::AwsIamAuthenticatorSharedPtr>
+          aws_iam_authenticator) PURE;
 };
 
 // A MULTI command sent when starting a transaction.
@@ -236,14 +247,10 @@ public:
 };
 
 // A struct representing a Redis transaction.
+
 struct Transaction {
   Transaction(Network::ConnectionCallbacks* connection_cb) : connection_cb_(connection_cb) {}
-  ~Transaction() {
-    if (connection_established_) {
-      client_->close();
-      connection_established_ = false;
-    }
-  }
+  ~Transaction() { close(); }
 
   void start() { active_ = true; }
 
@@ -251,7 +258,9 @@ struct Transaction {
     active_ = false;
     key_.clear();
     if (connection_established_) {
-      client_->close();
+      for (auto& client : clients_) {
+        client->close();
+      }
       connection_established_ = false;
     }
     should_close_ = false;
@@ -260,9 +269,18 @@ struct Transaction {
   bool active_{false};
   bool connection_established_{false};
   bool should_close_{false};
+
+  // The key which represents the transaction hash slot.
   std::string key_;
-  ClientPtr client_;
+  // clients_[0] represents the main connection, clients_[1..n] are for
+  // the mirroring policies.
+  std::vector<ClientPtr> clients_;
   Network::ConnectionCallbacks* connection_cb_;
+
+  // This index represents the current client on which traffic is being sent to.
+  // When sending to the main redis server it will be 0, and when sending to one of
+  // the mirror servers it will be 1..n.
+  uint32_t current_client_idx_{0};
 };
 
 class NoOpTransaction : public Transaction {

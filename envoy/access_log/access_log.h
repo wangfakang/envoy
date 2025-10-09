@@ -6,6 +6,7 @@
 #include "envoy/common/pure.h"
 #include "envoy/data/accesslog/v3/accesslog.pb.h"
 #include "envoy/filesystem/filesystem.h"
+#include "envoy/formatter/http_formatter_context.h"
 #include "envoy/http/header_map.h"
 #include "envoy/stream_info/stream_info.h"
 
@@ -13,6 +14,8 @@
 
 namespace Envoy {
 namespace AccessLog {
+
+using LogContext = Formatter::Context;
 
 class AccessLogFile {
 public:
@@ -48,9 +51,9 @@ public:
   /**
    * Create a new access log file managed by the access log manager.
    * @param file_info specifies the file to create/open.
-   * @return the opened file.
+   * @return the opened file or an error status.
    */
-  virtual AccessLogFileSharedPtr
+  virtual absl::StatusOr<AccessLogFileSharedPtr>
   createAccessLog(const Envoy::Filesystem::FilePathAndType& file_info) PURE;
 };
 
@@ -68,17 +71,12 @@ public:
    * Evaluate whether an access log should be written based on request and response data.
    * @return TRUE if the log should be written.
    */
-  virtual bool evaluate(const StreamInfo::StreamInfo& info,
-                        const Http::RequestHeaderMap& request_headers,
-                        const Http::ResponseHeaderMap& response_headers,
-                        const Http::ResponseTrailerMap& response_trailers,
-                        AccessLogType access_log_type) const PURE;
+  virtual bool evaluate(const LogContext& context, const StreamInfo::StreamInfo& info) const PURE;
 };
-
 using FilterPtr = std::unique_ptr<Filter>;
 
 /**
- * Abstract access logger for requests and connections.
+ * Interface for access log instances.
  */
 class Instance {
 public:
@@ -86,21 +84,14 @@ public:
 
   /**
    * Log a completed request.
-   * @param request_headers supplies the incoming request headers after filtering.
-   * @param response_headers supplies response headers.
-   * @param response_trailers supplies response trailers.
+   * @param context supplies the context for the log.
    * @param stream_info supplies additional information about the request not
    * contained in the request headers.
-   * @param access_log_type supplies additional information about the type of the
-   * log record, i.e the location in the code which recorded the log.
    */
-  virtual void log(const Http::RequestHeaderMap* request_headers,
-                   const Http::ResponseHeaderMap* response_headers,
-                   const Http::ResponseTrailerMap* response_trailers,
-                   const StreamInfo::StreamInfo& stream_info, AccessLogType access_log_type) PURE;
+  virtual void log(const LogContext& context, const StreamInfo::StreamInfo& stream_info) PURE;
 };
-
 using InstanceSharedPtr = std::shared_ptr<Instance>;
+using InstanceSharedPtrVector = std::vector<InstanceSharedPtr>;
 
 } // namespace AccessLog
 } // namespace Envoy

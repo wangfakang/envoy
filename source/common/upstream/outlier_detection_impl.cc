@@ -23,7 +23,7 @@ namespace Envoy {
 namespace Upstream {
 namespace Outlier {
 
-DetectorSharedPtr DetectorImplFactory::createForCluster(
+absl::StatusOr<DetectorSharedPtr> DetectorImplFactory::createForCluster(
     Cluster& cluster, const envoy::config::cluster::v3::Cluster& cluster_config,
     Event::Dispatcher& dispatcher, Runtime::Loader& runtime, EventLoggerSharedPtr event_logger,
     Random::RandomGenerator& random) {
@@ -144,7 +144,7 @@ void DetectorHostMonitorImpl::putResultNoLocalExternalSplit(Result result,
 // are treated separately. Local origin errors have separate counters and
 // separate success rate monitor.
 void DetectorHostMonitorImpl::putResultWithLocalExternalSplit(Result result,
-                                                              absl::optional<uint64_t>) {
+                                                              absl::optional<uint64_t> code) {
   switch (result) {
   // SUCCESS is used to report success for connection level. Server may still respond with
   // error, but connection to server was OK.
@@ -156,17 +156,17 @@ void DetectorHostMonitorImpl::putResultWithLocalExternalSplit(Result result,
   case Result::LocalOriginConnectFailed:
     return localOriginFailure();
   // EXT_ORIGIN_REQUEST_FAILED is used when connection to server was successful, but transaction on
-  // server level failed. Since it it similar to HTTP 5xx, map it to 5xx handler.
+  // server level failed. Since it it similar to HTTP 5xx, map it to 5xx if HTTP code is not
+  // provided.
   case Result::ExtOriginRequestFailed:
     // map it to http code and call http handler.
-    return putHttpResponseCode(enumToInt(Http::Code::ServiceUnavailable));
-  // EXT_ORIGIN_REQUEST_SUCCESS is used to report that transaction with non-http server was
+    putHttpResponseCode(code.value_or(enumToInt(Http::Code::ServiceUnavailable)));
+    break;
+  // EXT_ORIGIN_REQUEST_SUCCESS is used to report that transaction with upstream server was
   // completed successfully. This means that connection and server level transactions were
-  // successful. Map it to http code 200 OK and indicate that there was no errors on connection
-  // level.
+  // successful. Map it to http code 200 OK if HTTP code is not provided.
   case Result::ExtOriginRequestSuccess:
-    putHttpResponseCode(enumToInt(Http::Code::OK));
-    localOriginNoFailure();
+    putHttpResponseCode(code.value_or(enumToInt(Http::Code::OK)));
     break;
   }
 }
@@ -218,6 +218,8 @@ DetectorConfig::DetectorConfig(const envoy::config::cluster::v3::OutlierDetectio
           config, consecutive_gateway_failure, DEFAULT_CONSECUTIVE_GATEWAY_FAILURE))),
       max_ejection_percent_(static_cast<uint64_t>(PROTOBUF_GET_WRAPPED_OR_DEFAULT(
           config, max_ejection_percent, DEFAULT_MAX_EJECTION_PERCENT))),
+      always_eject_one_host_(
+          static_cast<bool>(PROTOBUF_GET_WRAPPED_OR_DEFAULT(config, always_eject_one_host, false))),
       success_rate_minimum_hosts_(static_cast<uint64_t>(PROTOBUF_GET_WRAPPED_OR_DEFAULT(
           config, success_rate_minimum_hosts, DEFAULT_SUCCESS_RATE_MINIMUM_HOSTS))),
       success_rate_request_volume_(static_cast<uint64_t>(PROTOBUF_GET_WRAPPED_OR_DEFAULT(
@@ -257,7 +259,9 @@ DetectorConfig::DetectorConfig(const envoy::config::cluster::v3::OutlierDetectio
           config, max_ejection_time,
           std::max(DEFAULT_MAX_EJECTION_TIME_MS, base_ejection_time_ms_)))),
       max_ejection_time_jitter_ms_(static_cast<uint64_t>(PROTOBUF_GET_MS_OR_DEFAULT(
-          config, max_ejection_time_jitter, DEFAULT_MAX_EJECTION_TIME_JITTER_MS))) {}
+          config, max_ejection_time_jitter, DEFAULT_MAX_EJECTION_TIME_JITTER_MS))),
+      successful_active_health_check_uneject_host_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(
+          config, successful_active_health_check_uneject_host, true)) {}
 
 DetectorImpl::DetectorImpl(const Cluster& cluster,
                            const envoy::config::cluster::v3::OutlierDetection& config,
@@ -282,7 +286,7 @@ DetectorImpl::~DetectorImpl() {
   }
 }
 
-std::shared_ptr<DetectorImpl>
+absl::StatusOr<std::shared_ptr<DetectorImpl>>
 DetectorImpl::create(Cluster& cluster, const envoy::config::cluster::v3::OutlierDetection& config,
                      Event::Dispatcher& dispatcher, Runtime::Loader& runtime,
                      TimeSource& time_source, EventLoggerSharedPtr event_logger,
@@ -291,7 +295,7 @@ DetectorImpl::create(Cluster& cluster, const envoy::config::cluster::v3::Outlier
       new DetectorImpl(cluster, config, dispatcher, runtime, time_source, event_logger, random));
 
   if (detector->config().maxEjectionTimeMs() < detector->config().baseEjectionTimeMs()) {
-    throw EnvoyException(
+    return absl::InvalidArgumentError(
         "outlier detector's max_ejection_time cannot be smaller than base_ejection_time");
   }
   detector->initialize(cluster);
@@ -306,21 +310,21 @@ void DetectorImpl::initialize(Cluster& cluster) {
     }
   }
 
-  if (cluster.healthChecker() != nullptr) {
-    cluster.healthChecker()->addHostCheckCompleteCb([this](HostSharedPtr host, HealthTransition) {
-      // If the host is ejected by outlier detection and active health check succeeds,
-      // we should treat this host as healthy.
-      if (Runtime::runtimeFeatureEnabled(
-              "envoy.reloadable_features.successful_active_health_check_uneject_host") &&
-          !host->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC) &&
-          host->healthFlagGet(Host::HealthFlag::FAILED_OUTLIER_CHECK)) {
-        host->healthFlagClear(Host::HealthFlag::FAILED_OUTLIER_CHECK);
-        unejectHost(host);
-      }
-    });
+  if (config_.successfulActiveHealthCheckUnejectHost() && cluster.healthChecker() != nullptr) {
+    cluster.healthChecker()->addHostCheckCompleteCb(
+        [this](HostSharedPtr host, HealthTransition, HealthState current_check_result) {
+          // If the host is ejected by outlier detection and active health check succeeds,
+          // we should treat this host as healthy.
+          if (current_check_result == HealthState::Healthy &&
+              !host->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC) &&
+              host->healthFlagGet(Host::HealthFlag::FAILED_OUTLIER_CHECK)) {
+            host->healthFlagClear(Host::HealthFlag::FAILED_OUTLIER_CHECK);
+            unejectHost(host);
+          }
+        });
   }
   member_update_cb_ = cluster.prioritySet().addMemberUpdateCb(
-      [this](const HostVector& hosts_added, const HostVector& hosts_removed) -> void {
+      [this](const HostVector& hosts_added, const HostVector& hosts_removed) {
         for (const HostSharedPtr& host : hosts_added) {
           addHostMonitor(host);
         }
@@ -354,10 +358,6 @@ void DetectorImpl::armIntervalTimer() {
 void DetectorImpl::checkHostForUneject(HostSharedPtr host, DetectorHostMonitorImpl* monitor,
                                        MonotonicTime now) {
   if (!host->healthFlagGet(Host::HealthFlag::FAILED_OUTLIER_CHECK)) {
-    // Node seems to be healthy and was not ejected since the last check.
-    if (monitor->ejectTimeBackoff() != 0) {
-      monitor->ejectTimeBackoff()--;
-    }
     return;
   }
 
@@ -477,10 +477,14 @@ void DetectorImpl::ejectHost(HostSharedPtr host,
                              envoy::data::cluster::v3::OutlierEjectionType type) {
   uint64_t max_ejection_percent = std::min<uint64_t>(
       100, runtime_.snapshot().getInteger(MaxEjectionPercentRuntime, config_.maxEjectionPercent()));
-  double ejected_percent = 100.0 * ejections_active_helper_.value() / host_monitors_.size();
+  double ejected_percent = 100.0 * (ejections_active_helper_.value() + 1) / host_monitors_.size();
   // Note this is not currently checked per-priority level, so it is possible
   // for outlier detection to eject all hosts at any given priority level.
-  if (ejected_percent < max_ejection_percent) {
+  bool should_eject = (ejected_percent <= max_ejection_percent);
+  if (config_.alwaysEjectOneHost()) {
+    should_eject = (ejections_active_helper_.value() == 0) || should_eject;
+  }
+  if (should_eject) {
     if (type == envoy::data::cluster::v3::CONSECUTIVE_5XX ||
         type == envoy::data::cluster::v3::SUCCESS_RATE) {
       // Deprecated counter, preserving old behaviour until it's removed.
@@ -593,7 +597,7 @@ void DetectorImpl::onConsecutiveErrorWorker(HostSharedPtr host,
   case envoy::data::cluster::v3::FAILURE_PERCENTAGE:
     FALLTHRU;
   case envoy::data::cluster::v3::FAILURE_PERCENTAGE_LOCAL_ORIGIN:
-    IS_ENVOY_BUG("unexpected non-consecutive errorr");
+    IS_ENVOY_BUG("unexpected non-consecutive error");
     return;
   case envoy::data::cluster::v3::CONSECUTIVE_5XX:
     stats_.ejections_consecutive_5xx_.inc(); // Deprecated
@@ -755,6 +759,22 @@ void DetectorImpl::onIntervalTimer() {
 
   processSuccessRateEjections(DetectorHostMonitor::SuccessRateMonitorType::ExternalOrigin);
   processSuccessRateEjections(DetectorHostMonitor::SuccessRateMonitorType::LocalOrigin);
+
+  // Decrement time backoff for all hosts which have not been ejected.
+  for (auto host : host_monitors_) {
+    if (!host.first->healthFlagGet(Host::HealthFlag::FAILED_OUTLIER_CHECK)) {
+      auto& monitor = host.second;
+      // Node is healthy and was not ejected since the last check.
+      if (monitor->lastUnejectionTime().has_value() &&
+          ((now - monitor->lastUnejectionTime().value()) >=
+           std::chrono::milliseconds(
+               runtime_.snapshot().getInteger(IntervalMsRuntime, config_.intervalMs())))) {
+        if (monitor->ejectTimeBackoff() != 0) {
+          monitor->ejectTimeBackoff()--;
+        }
+      }
+    }
+  }
 
   armIntervalTimer();
 }

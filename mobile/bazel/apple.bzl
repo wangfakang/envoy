@@ -8,7 +8,7 @@ def envoy_objc_library(name, hdrs = [], visibility = [], data = [], deps = [], m
         name = name,
         srcs = srcs,
         hdrs = hdrs,
-        copts = ["-ObjC++", "-std=c++17", "-Wno-shorten-64-to-32"],
+        copts = ["-ObjC++", "-std=c++20", "-Wno-shorten-64-to-32"],
         defines = envoy_mobile_defines("@envoy"),
         module_name = module_name,
         sdk_frameworks = sdk_frameworks,
@@ -34,7 +34,7 @@ def envoy_objc_library(name, hdrs = [], visibility = [], data = [], deps = [], m
 #     ],
 # )
 #
-def envoy_mobile_swift_test(name, srcs, data = [], deps = [], tags = [], repository = "", visibility = [], flaky = False):
+def envoy_mobile_swift_test(name, srcs, size = None, data = [], deps = [], tags = [], repository = "", visibility = [], flaky = False, exec_properties = {}):
     test_lib_name = name + "_lib"
     swift_library(
         name = test_lib_name,
@@ -53,9 +53,11 @@ def envoy_mobile_swift_test(name, srcs, data = [], deps = [], tags = [], reposit
         data = data,
         deps = [test_lib_name],
         minimum_os_version = MINIMUM_IOS_VERSION,
+        size = size,
         tags = tags,
         visibility = visibility,
         flaky = flaky,
+        exec_properties = exec_properties,
     )
 
 def envoy_mobile_objc_test(name, srcs, data = [], deps = [], tags = [], visibility = [], flaky = False):
@@ -77,15 +79,3 @@ def envoy_mobile_objc_test(name, srcs, data = [], deps = [], tags = [], visibili
         visibility = visibility,
         flaky = flaky,
     )
-
-def envoy_mobile_swift_copts(enable_cxx_interop):
-    if enable_cxx_interop:
-        return [
-            "-enable-experimental-cxx-interop",
-            "-Xcc",
-            "-std=c++17",
-            "-Xcc",
-            "-Wno-deprecated-declarations",
-        ]
-    else:
-        return []

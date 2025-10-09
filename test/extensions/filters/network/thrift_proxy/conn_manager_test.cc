@@ -90,9 +90,9 @@ class ThriftConnectionManagerTest : public testing::Test {
 public:
   ThriftConnectionManagerTest()
       : stats_(ThriftFilterStats::generateStats("test.", *store_.rootScope())) {
-    route_config_provider_manager_ =
-        std::make_unique<Router::RouteConfigProviderManagerImpl>(context_.admin_);
-    ON_CALL(*context_.access_log_manager_.file_, write(_))
+    route_config_provider_manager_ = std::make_unique<Router::RouteConfigProviderManagerImpl>(
+        context_.server_factory_context_.admin_);
+    ON_CALL(*context_.server_factory_context_.access_log_manager_.file_, write(_))
         .WillByDefault(SaveArg<0>(&access_log_data_));
   }
   ~ThriftConnectionManagerTest() override {
@@ -191,7 +191,7 @@ stat_prefix: test
     encoder_filter_ = std::make_shared<NiceMock<ThriftFilters::MockEncoderFilter>>();
     bidirectional_filter_ = std::make_shared<NiceMock<ThriftFilters::MockBidirectionalFilter>>();
 
-    config_ = std::make_unique<TestConfigImpl>(proto_config_, context_,
+    config_ = std::make_shared<TestConfigImpl>(proto_config_, context_,
                                                *route_config_provider_manager_, decoder_filter_,
                                                encoder_filter_, bidirectional_filter_, stats_);
     if (custom_transport_) {
@@ -209,10 +209,10 @@ stat_prefix: test
 
     ON_CALL(random_, random()).WillByDefault(Return(42));
     filter_ = std::make_unique<ConnectionManager>(
-        *config_, random_, filter_callbacks_.connection_.dispatcher_.timeSource(), drain_decision_);
+        config_, random_, filter_callbacks_.connection_.dispatcher_.timeSource(), drain_decision_);
     filter_->initializeReadFilterCallbacks(filter_callbacks_);
     ON_CALL(filter_callbacks_.connection_.stream_info_, setDynamicMetadata(_, _))
-        .WillByDefault(Invoke([this](const std::string& key, const ProtobufWkt::Struct& obj) {
+        .WillByDefault(Invoke([this](const std::string& key, const Protobuf::Struct& obj) {
           (*filter_callbacks_.connection_.stream_info_.metadata_.mutable_filter_metadata())[key]
               .MergeFrom(obj);
         }));
@@ -451,7 +451,7 @@ stat_prefix: test
     TestScopedRuntime scoped_runtime;
 
     if (draining) {
-      EXPECT_CALL(drain_decision_, drainClose()).WillOnce(Return(true));
+      EXPECT_CALL(drain_decision_, drainClose(Network::DrainDirection::All)).WillOnce(Return(true));
     }
 
     initializeFilter(defaultYamlConfig(true));
@@ -686,7 +686,7 @@ stat_prefix: test
   envoy::extensions::filters::network::thrift_proxy::v3::ThriftProxy proto_config_;
 
   std::unique_ptr<Router::RouteConfigProviderManagerImpl> route_config_provider_manager_;
-  std::unique_ptr<TestConfigImpl> config_;
+  std::shared_ptr<TestConfigImpl> config_;
 
   Buffer::OwnedImpl buffer_;
   Buffer::OwnedImpl write_buffer_;
@@ -1433,6 +1433,37 @@ TEST_F(ThriftConnectionManagerTest, BadFunctionCallExceptionHandling) {
   EXPECT_EQ(access_log_data_, "");
 }
 
+TEST_F(ThriftConnectionManagerTest,
+       BadFunctionCallExceptionHandlingWithClosingDownstreamConnection) {
+  initializeFilter();
+
+  writeFramedBinaryMessage(buffer_, MessageType::Oneway, 0x0F);
+
+  ThriftFilters::DecoderFilterCallbacks* callbacks{};
+  EXPECT_CALL(*decoder_filter_, setDecoderFilterCallbacks(_))
+      .WillOnce(
+          Invoke([&](ThriftFilters::DecoderFilterCallbacks& cb) -> void { callbacks = &cb; }));
+  EXPECT_CALL(*decoder_filter_, messageBegin(_))
+      .WillOnce(Invoke([&](MessageMetadataSharedPtr) -> FilterStatus {
+        // mock that downstream connection is closing
+        filter_callbacks_.connection_.state_ = Network::Connection::State::Closing;
+
+        std::function<int()> func;
+        func(); // throw bad_function_call
+        return FilterStatus::Continue;
+      }));
+
+  // A local exception is sent by error handling.
+  EXPECT_CALL(*decoder_filter_, onLocalReply(_, _));
+  EXPECT_EQ(filter_->onData(buffer_, false), Network::FilterStatus::StopIteration);
+
+  EXPECT_EQ(1U, store_.counter("test.request_decoding_error").value());
+  // Won't increase this counter as it's expected.
+  EXPECT_EQ(0U, store_.counter("test.request_internal_error").value());
+
+  EXPECT_EQ(access_log_data_, "");
+}
+
 // Tests that a request is routed and a non-thrift response is handled.
 TEST_F(ThriftConnectionManagerTest, RequestAndGarbageResponse) {
   initializeFilter();
@@ -1680,7 +1711,7 @@ TEST_F(ThriftConnectionManagerTest, RequestWithMaxRequestsLimitAndReachedRepeate
 
     ON_CALL(random_, random()).WillByDefault(Return(42));
     filter_ = std::make_unique<ConnectionManager>(
-        *config_, random_, filter_callbacks_.connection_.dispatcher_.timeSource(), drain_decision_);
+        config_, random_, filter_callbacks_.connection_.dispatcher_.timeSource(), drain_decision_);
     filter_->initializeReadFilterCallbacks(filter_callbacks_);
     filter_->onNewConnection();
 
@@ -2176,7 +2207,7 @@ TEST_F(ThriftConnectionManagerTest, TransportEndWhenRemoteClose) {
   TestScopedRuntime scoped_runtime;
 
   // We want the Drain header to be set by RemoteClose which triggers end downstream in local reply.
-  EXPECT_CALL(drain_decision_, drainClose()).WillOnce(Return(false));
+  EXPECT_CALL(drain_decision_, drainClose(Network::DrainDirection::All)).WillOnce(Return(false));
 
   initializeFilter();
   writeComplexFramedBinaryMessage(buffer_, MessageType::Call, 0x0F);

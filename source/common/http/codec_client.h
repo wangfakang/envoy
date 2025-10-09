@@ -118,6 +118,16 @@ public:
    */
   RequestEncoder& newStream(ResponseDecoder& response_decoder);
 
+  /**
+   * Create a new stream. Note: The CodecClient will NOT buffer multiple requests for HTTP1
+   * connections. Thus, calling newStream() before the previous request has been fully encoded
+   * is an error. Pipelining is supported however.
+   * @param response_decoder_handle supplies the decoder to use for response callbacks if it's still
+   * alive.
+   * @return StreamEncoder& the encoder to use for encoding the request.
+   */
+  RequestEncoder& newStream(ResponseDecoderHandlePtr response_decoder_handle);
+
   void setConnectionStats(const Network::Connection::ConnectionStats& stats) {
     connection_->setConnectionStats(stats);
   }
@@ -142,6 +152,8 @@ public:
    * Needs to be called after codec_ is instantiated.
    */
   void connect();
+
+  bool connectCalled() const { return connect_called_; }
 
 protected:
   /**
@@ -246,6 +258,23 @@ private:
       }
     }
 
+    ActiveRequest(CodecClient& parent, ResponseDecoderHandlePtr inner_handle)
+        : ResponseDecoderWrapper(std::move(inner_handle)), RequestEncoderWrapper(nullptr),
+          parent_(parent), header_validator_(parent.host_->cluster().makeHeaderValidator(
+                               parent.codec_->protocol())) {
+      switch (parent.protocol()) {
+      case Protocol::Http10:
+      case Protocol::Http11:
+        // HTTP/1.1 codec does not support half-close on the response completion.
+        wait_encode_complete_ = false;
+        break;
+      case Protocol::Http2:
+      case Protocol::Http3:
+        wait_encode_complete_ = true;
+        break;
+      }
+    }
+
     void decodeHeaders(ResponseHeaderMapPtr&& headers, bool end_stream) override;
 
     // StreamCallbacks
@@ -303,6 +332,7 @@ private:
   void onBelowWriteBufferLowWatermark() override {
     codec_->onUnderlyingConnectionBelowWriteBufferLowWatermark();
   }
+  RequestEncoder& enlistAndCreateEncoder(ActiveRequestPtr request);
 
   std::list<ActiveRequestPtr> active_requests_;
   Http::ConnectionCallbacks* codec_callbacks_{};
@@ -316,27 +346,15 @@ private:
 using CodecClientPtr = std::unique_ptr<CodecClient>;
 
 /**
- * Production implementation that installs a real codec without automatically connecting.
- * TODO(danzh) deprecate this class and make CodecClientProd to have the option to defer connect
- * once "envoy.reloadable_features.postpone_h3_client_connect_to_next_loop" is deprecated.
- */
-class NoConnectCodecClientProd : public CodecClient {
-public:
-  NoConnectCodecClientProd(CodecType type, Network::ClientConnectionPtr&& connection,
-                           Upstream::HostDescriptionConstSharedPtr host,
-                           Event::Dispatcher& dispatcher, Random::RandomGenerator& random_generator,
-                           const Network::TransportSocketOptionsConstSharedPtr& options);
-};
-
-/**
  * Production implementation that installs a real codec.
  */
-class CodecClientProd : public NoConnectCodecClientProd {
+class CodecClientProd : public CodecClient {
 public:
   CodecClientProd(CodecType type, Network::ClientConnectionPtr&& connection,
                   Upstream::HostDescriptionConstSharedPtr host, Event::Dispatcher& dispatcher,
                   Random::RandomGenerator& random_generator,
-                  const Network::TransportSocketOptionsConstSharedPtr& options);
+                  const Network::TransportSocketOptionsConstSharedPtr& options,
+                  bool should_connect_on_creation = true);
 };
 
 } // namespace Http

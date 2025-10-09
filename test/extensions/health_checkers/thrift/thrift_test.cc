@@ -15,7 +15,6 @@
 #include "test/mocks/upstream/host.h"
 #include "test/mocks/upstream/host_set.h"
 #include "test/mocks/upstream/priority_set.h"
-#include "test/test_common/test_runtime.h"
 
 using testing::_;
 using testing::InSequence;
@@ -41,7 +40,7 @@ public:
         health_check_config, ProtobufMessage::getStrictValidationVisitor());
 
     cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-        Upstream::makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+        Upstream::makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
 
     health_checker_ = std::make_shared<ThriftHealthChecker>(
         *cluster_, health_check_config, thrift_config, dispatcher_, runtime_,

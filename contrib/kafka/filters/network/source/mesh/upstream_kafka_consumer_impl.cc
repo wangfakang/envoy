@@ -14,7 +14,7 @@ RichKafkaConsumer::RichKafkaConsumer(InboundRecordProcessor& record_processor,
                                      const std::string& topic, const int32_t partition_count,
                                      const RawKafkaConfig& configuration)
     : RichKafkaConsumer(record_processor, thread_factory, topic, partition_count, configuration,
-                        LibRdKafkaUtilsImpl::getDefaultInstance()){};
+                        LibRdKafkaUtilsImpl::getDefaultInstance()) {};
 
 RichKafkaConsumer::RichKafkaConsumer(InboundRecordProcessor& record_processor,
                                      Thread::ThreadFactory& thread_factory,
@@ -133,13 +133,13 @@ std::vector<InboundRecordSharedPtr> RichKafkaConsumer::receiveRecordBatch() {
 
     // XXX (adam.kotwasinski) There could be something more present in the consumer,
     // and we could drain it (at least a little) in the next commits.
-    // See: https://github.com/edenhill/librdkafka/discussions/3897
+    // See: https://github.com/confluentinc/librdkafka/discussions/3897
     return {inbound_record};
   } else {
     // Nothing extraordinary (timeout because there is nothing upstream),
     // or upstream connectivity failure.
-    ENVOY_LOG(trace, "No message received in consumer [{}]: {}/{}", topic_, message->err(),
-              RdKafka::err2str(message->err()));
+    ENVOY_LOG(trace, "No message received in consumer [{}]: {}/{}", topic_,
+              static_cast<int>(message->err()), RdKafka::err2str(message->err()));
     return {};
   }
 }

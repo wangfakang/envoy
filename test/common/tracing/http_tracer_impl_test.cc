@@ -59,17 +59,27 @@ protected:
     for (const CustomTagCase& cas : cases) {
       envoy::type::tracing::v3::CustomTag custom_tag;
       TestUtility::loadFromYaml(cas.custom_tag, custom_tag);
-      config.custom_tags_.emplace(custom_tag.tag(), CustomTagUtility::createCustomTag(custom_tag));
+      custom_tags_.emplace(custom_tag.tag(), CustomTagUtility::createCustomTag(custom_tag));
       if (cas.set) {
         EXPECT_CALL(span, setTag(Eq(custom_tag.tag()), Eq(cas.value)));
       } else {
         EXPECT_CALL(span, setTag(Eq(custom_tag.tag()), _)).Times(0);
       }
     }
+
+    EXPECT_CALL(config, modifySpan(_)).WillOnce(Invoke([this](Span& span) {
+      HttpTraceContext trace_context{request_headers_};
+      const CustomTagContext ctx{trace_context, stream_info};
+      for (const auto& [_, custom_tag] : custom_tags_) {
+        custom_tag->applySpan(span, ctx);
+      }
+    }));
   }
 
   NiceMock<MockSpan> span;
   NiceMock<MockConfig> config;
+  Tracing::CustomTagMap custom_tags_;
+  Http::TestRequestHeaderMapImpl request_headers_;
   NiceMock<StreamInfo::MockStreamInfo> stream_info;
   std::shared_ptr<NiceMock<Upstream::MockClusterInfo>> cluster_info_{
       std::make_shared<NiceMock<Upstream::MockClusterInfo>>()};
@@ -84,11 +94,12 @@ TEST_F(HttpConnManFinalizerImplTest, OriginalAndLongPath) {
   const auto remote_address = Network::Address::InstanceConstSharedPtr{
       new Network::Address::Ipv4Instance(expected_ip, 0, nullptr)};
 
-  Http::TestRequestHeaderMapImpl request_headers{{"x-request-id", "id"},
-                                                 {"x-envoy-original-path", path},
-                                                 {":method", "GET"},
-                                                 {":path", ""},
-                                                 {":scheme", "http"}};
+  request_headers_ = Http::TestRequestHeaderMapImpl{{"x-request-id", "id"},
+                                                    {"x-envoy-original-path", path},
+                                                    {":method", "GET"},
+                                                    {":path", ""},
+                                                    {":scheme", "http"}};
+
   Http::TestResponseHeaderMapImpl response_headers;
   Http::TestResponseTrailerMapImpl response_trailers;
 
@@ -106,7 +117,9 @@ TEST_F(HttpConnManFinalizerImplTest, OriginalAndLongPath) {
   EXPECT_CALL(span, setTag(Eq(Tracing::Tags::get().HttpProtocol), Eq("HTTP/2")));
   EXPECT_CALL(span, setTag(Eq(Tracing::Tags::get().PeerAddress), Eq(expected_ip)));
 
-  HttpTracerUtility::finalizeDownstreamSpan(span, &request_headers, &response_headers,
+  expectSetCustomTags({});
+
+  HttpTracerUtility::finalizeDownstreamSpan(span, &request_headers_, &response_headers,
                                             &response_trailers, stream_info, config);
 }
 
@@ -118,7 +131,7 @@ TEST_F(HttpConnManFinalizerImplTest, NoGeneratedId) {
   const auto remote_address = Network::Address::InstanceConstSharedPtr{
       new Network::Address::Ipv4Instance(expected_ip, 0, nullptr)};
 
-  Http::TestRequestHeaderMapImpl request_headers{
+  request_headers_ = Http::TestRequestHeaderMapImpl{
       {":path", ""}, {"x-envoy-original-path", path}, {":method", "GET"}, {":scheme", "http"}};
   Http::TestResponseHeaderMapImpl response_headers;
   Http::TestResponseTrailerMapImpl response_trailers;
@@ -137,7 +150,9 @@ TEST_F(HttpConnManFinalizerImplTest, NoGeneratedId) {
   EXPECT_CALL(span, setTag(Eq(Tracing::Tags::get().HttpProtocol), Eq("HTTP/2")));
   EXPECT_CALL(span, setTag(Eq(Tracing::Tags::get().PeerAddress), Eq(expected_ip)));
 
-  HttpTracerUtility::finalizeDownstreamSpan(span, &request_headers, &response_headers,
+  expectSetCustomTags({});
+
+  HttpTracerUtility::finalizeDownstreamSpan(span, &request_headers_, &response_headers,
                                             &response_trailers, stream_info, config);
 }
 
@@ -166,6 +181,8 @@ TEST_F(HttpConnManFinalizerImplTest, Connect) {
   EXPECT_CALL(span, setTag(Eq(Tracing::Tags::get().HttpMethod), Eq("CONNECT")));
   EXPECT_CALL(span, setTag(Eq(Tracing::Tags::get().HttpProtocol), Eq("HTTP/2")));
   EXPECT_CALL(span, setTag(Eq(Tracing::Tags::get().PeerAddress), Eq(expected_ip)));
+
+  expectSetCustomTags({});
 
   HttpTracerUtility::finalizeDownstreamSpan(span, &request_headers, &response_headers,
                                             &response_trailers, stream_info, config);
@@ -350,7 +367,7 @@ TEST_F(HttpConnManFinalizerImplTest, UnixDomainSocketPeerAddressTag) {
   Http::TestResponseHeaderMapImpl response_headers;
   Http::TestResponseTrailerMapImpl response_trailers;
   const std::string path_{TestEnvironment::unixDomainSocketPath("foo")};
-  const auto remote_address = Network::Utility::resolveUrl("unix://" + path_);
+  const auto remote_address = *Network::Utility::resolveUrl("unix://" + path_);
 
   stream_info.downstream_connection_info_provider_->setDirectRemoteAddressForTest(remote_address);
 
@@ -366,13 +383,13 @@ TEST_F(HttpConnManFinalizerImplTest, UnixDomainSocketPeerAddressTag) {
 TEST_F(HttpConnManFinalizerImplTest, SpanCustomTags) {
   TestEnvironment::setEnvVar("E_CC", "c", 1);
 
-  Http::TestRequestHeaderMapImpl request_headers{{"x-request-id", "id"},
-                                                 {":path", "/test"},
-                                                 {":method", "GET"},
-                                                 {":scheme", "https"},
-                                                 {"x-bb", "b"}};
+  request_headers_ = Http::TestRequestHeaderMapImpl{{"x-request-id", "id"},
+                                                    {":path", "/test"},
+                                                    {":method", "GET"},
+                                                    {":scheme", "https"},
+                                                    {"x-bb", "b"}};
 
-  ProtobufWkt::Struct fake_struct;
+  Protobuf::Struct fake_struct;
   std::string yaml = R"EOF(
 ree:
   foo: bar
@@ -400,7 +417,6 @@ ree:
   EXPECT_CALL(stream_info, bytesSent()).WillOnce(Return(100));
   EXPECT_CALL(*host_, metadata()).WillRepeatedly(Return(host_metadata));
 
-  EXPECT_CALL(config, customTags());
   EXPECT_CALL(span, setTag(_, _)).Times(testing::AnyNumber());
 
   expectSetCustomTags(
@@ -477,9 +493,9 @@ metadata:
   metadata_key: { key: m.host, path: [ { key: not-found } ] })EOF",
         false, ""}});
 
-  ON_CALL(stream_info, getRequestHeaders()).WillByDefault(Return(&request_headers));
+  ON_CALL(stream_info, getRequestHeaders()).WillByDefault(Return(&request_headers_));
 
-  HttpTracerUtility::finalizeDownstreamSpan(span, &request_headers, nullptr, nullptr, stream_info,
+  HttpTracerUtility::finalizeDownstreamSpan(span, &request_headers_, nullptr, nullptr, stream_info,
                                             config);
 }
 
@@ -519,9 +535,7 @@ TEST_F(HttpConnManFinalizerImplTest, SpanPopulatedFailureResponse) {
   absl::optional<uint32_t> response_code(503);
   EXPECT_CALL(stream_info, responseCode()).WillRepeatedly(ReturnPointee(&response_code));
   EXPECT_CALL(stream_info, bytesSent()).WillOnce(Return(100));
-  ON_CALL(stream_info, hasResponseFlag(StreamInfo::ResponseFlag::UpstreamRequestTimeout))
-      .WillByDefault(Return(true));
-  stream_info.upstreamInfo()->setUpstreamHost(nullptr);
+  stream_info.setResponseFlag(StreamInfo::CoreResponseFlag::UpstreamRequestTimeout);
 
   EXPECT_CALL(span, setTag(Eq(Tracing::Tags::get().Error), Eq(Tracing::Tags::get().True)));
   EXPECT_CALL(span, setTag(Eq(Tracing::Tags::get().HttpStatusCode), Eq("503")));
@@ -690,12 +704,10 @@ TEST_F(HttpConnManFinalizerImplTest, CustomTagOverwritesCommonTag) {
   EXPECT_CALL(stream_info, responseCode()).WillRepeatedly(ReturnPointee(&response_code));
   EXPECT_CALL(stream_info, bytesSent()).WillOnce(Return(100));
 
-  EXPECT_CALL(config, customTags());
-
   std::string custom_tag_str = "{ tag: component, literal: { value: override_component } }";
   envoy::type::tracing::v3::CustomTag custom_tag;
   TestUtility::loadFromYaml(custom_tag_str, custom_tag);
-  config.custom_tags_.emplace(custom_tag.tag(), CustomTagUtility::createCustomTag(custom_tag));
+  custom_tags_.emplace(custom_tag.tag(), CustomTagUtility::createCustomTag(custom_tag));
   EXPECT_CALL(span, setTag(_, _)).Times(testing::AnyNumber());
 
   {
@@ -705,8 +717,86 @@ TEST_F(HttpConnManFinalizerImplTest, CustomTagOverwritesCommonTag) {
     EXPECT_CALL(span, setTag(Eq(custom_tag.tag()), "override_component"));
   }
 
+  expectSetCustomTags({});
+
   HttpTracerUtility::finalizeDownstreamSpan(span, &request_headers, nullptr, nullptr, stream_info,
                                             config);
+}
+
+TEST(HttpTraceContextTest, HttpTraceContextTest) {
+  {
+    Http::TestRequestHeaderMapImpl request_headers;
+    HttpTraceContext trace_context(request_headers);
+
+    // Protocol.
+    EXPECT_EQ(trace_context.protocol(), "");
+    request_headers.addCopy(Http::Headers::get().Protocol, "HTTP/x");
+    EXPECT_EQ(trace_context.protocol(), "HTTP/x");
+
+    // Host.
+    EXPECT_EQ(trace_context.host(), "");
+    request_headers.addCopy(Http::Headers::get().Host, "test.com:233");
+    EXPECT_EQ(trace_context.host(), "test.com:233");
+
+    // Path.
+    EXPECT_EQ(trace_context.path(), "");
+    request_headers.addCopy(Http::Headers::get().Path, "/anything");
+    EXPECT_EQ(trace_context.path(), "/anything");
+
+    // Method.
+    EXPECT_EQ(trace_context.method(), "");
+    request_headers.addCopy(Http::Headers::get().Method, Http::Headers::get().MethodValues.Options);
+    EXPECT_EQ(trace_context.method(), Http::Headers::get().MethodValues.Options);
+
+    // Set.
+    trace_context.set("foo", "bar");
+    EXPECT_EQ(request_headers.get_("foo"), "bar");
+
+    // Get.
+    EXPECT_EQ(trace_context.get("foo").value(), "bar");
+
+    // Remove.
+    trace_context.remove("foo");
+    EXPECT_EQ(request_headers.get_("foo"), "");
+    EXPECT_EQ(trace_context.get("foo"), absl::nullopt);
+  }
+
+  {
+    size_t size = 0;
+    Http::TestRequestHeaderMapImpl request_headers{{"host", "foo"}, {"bar", "var"}, {"ok", "no"}};
+    HttpTraceContext trace_context(request_headers);
+    trace_context.forEach([&size](absl::string_view key, absl::string_view val) {
+      size += key.size();
+      size += val.size();
+      return true;
+    });
+    // 'host' will be converted to ':authority'.
+    EXPECT_EQ(23, size);
+  }
+
+  {
+    size_t size = 0;
+    Http::TestRequestHeaderMapImpl request_headers{{"host", "foo"}, {"bar", "var"}, {"ok", "no"}};
+    HttpTraceContext trace_context(request_headers);
+    trace_context.forEach([&size](absl::string_view key, absl::string_view val) {
+      size += key.size();
+      size += val.size();
+      return false;
+    });
+    // 'host' will be converted to ':authority'.
+    EXPECT_EQ(13, size);
+  }
+
+  {
+    Http::TestRequestHeaderMapImpl request_headers;
+    ReadOnlyHttpTraceContext trace_context(request_headers);
+
+    // No operations for ReadOnlyHttpTraceContext.
+    trace_context.set("key", "value");
+    trace_context.remove("key");
+    trace_context.requestHeaders();
+    const_cast<const ReadOnlyHttpTraceContext&>(trace_context).requestHeaders();
+  }
 }
 
 } // namespace

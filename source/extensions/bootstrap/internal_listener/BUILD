@@ -11,8 +11,10 @@ envoy_extension_package()
 
 envoy_cc_extension(
     name = "config",
-    # for integration tests
-    visibility = ["//visibility:public"],
+    extra_visibility = [
+        "//test/common:__subpackages__",
+        "//test/integration:__subpackages__",
+    ],
     deps = [
         ":client_connection_factory",
         ":internal_listener_registry",
@@ -30,7 +32,7 @@ envoy_cc_extension(
     deps = [
         ":thread_local_registry",
         "//envoy/server:bootstrap_extension_config_interface",
-        "//source/extensions/listener_managers/listener_manager:listener_manager_lib",
+        "//source/common/listener_manager:listener_manager_lib",
         "@envoy_api//envoy/extensions/bootstrap/internal_listener/v3:pkg_cc_proto",
     ],
     alwayslink = 1,
@@ -93,12 +95,12 @@ envoy_cc_library(
         "//source/common/common:linked_object",
         "//source/common/common:non_copyable",
         "//source/common/event:deferred_task",
+        "//source/common/listener_manager:active_stream_listener_base",
+        "//source/common/listener_manager:active_tcp_listener",
         "//source/common/network:connection_lib",
         "//source/common/network:listener_filter_buffer_lib",
         "//source/common/stats:timespan_lib",
         "//source/common/stream_info:stream_info_lib",
         "//source/extensions/io_socket/user_space:config",
-        "//source/extensions/listener_managers/listener_manager:active_stream_listener_base",
-        "//source/extensions/listener_managers/listener_manager:active_tcp_listener",
     ],
 )

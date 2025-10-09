@@ -142,6 +142,7 @@ public:
   MOCK_METHOD(uint64_t, latch, ());
   MOCK_METHOD(void, reset, ());
   MOCK_METHOD(bool, used, (), (const));
+  MOCK_METHOD(void, markUnused, ());
   MOCK_METHOD(bool, hidden, (), (const));
   MOCK_METHOD(uint64_t, value, (), (const));
 
@@ -164,6 +165,7 @@ public:
   MOCK_METHOD(void, sub, (uint64_t amount));
   MOCK_METHOD(void, mergeImportMode, (ImportMode));
   MOCK_METHOD(bool, used, (), (const));
+  MOCK_METHOD(void, markUnused, ());
   MOCK_METHOD(bool, hidden, (), (const));
   MOCK_METHOD(uint64_t, value, (), (const));
   MOCK_METHOD(absl::optional<bool>, cachedShouldImport, (), (const));
@@ -181,6 +183,7 @@ public:
   ~MockHistogram() override;
 
   MOCK_METHOD(bool, used, (), (const));
+  MOCK_METHOD(void, markUnused, ());
   MOCK_METHOD(bool, hidden, (), (const));
   MOCK_METHOD(Histogram::Unit, unit, (), (const));
   MOCK_METHOD(void, recordValue, (uint64_t value));
@@ -206,6 +209,7 @@ public:
   std::string quantileSummary() const override { return ""; };
   std::string bucketSummary() const override { return ""; };
   MOCK_METHOD(bool, used, (), (const));
+  MOCK_METHOD(void, markUnused, ());
   MOCK_METHOD(bool, hidden, (), (const));
   MOCK_METHOD(Histogram::Unit, unit, (), (const));
   MOCK_METHOD(void, recordValue, (uint64_t value));
@@ -254,12 +258,16 @@ public:
   MOCK_METHOD(const std::vector<std::reference_wrapper<const Gauge>>&, gauges, ());
   MOCK_METHOD(const std::vector<std::reference_wrapper<const ParentHistogram>>&, histograms, ());
   MOCK_METHOD(const std::vector<std::reference_wrapper<const TextReadout>>&, textReadouts, ());
+  MOCK_METHOD(const std::vector<Stats::PrimitiveCounterSnapshot>&, hostCounters, ());
+  MOCK_METHOD(const std::vector<Stats::PrimitiveGaugeSnapshot>&, hostGauges, ());
   MOCK_METHOD(SystemTime, snapshotTime, (), (const));
 
   std::vector<CounterSnapshot> counters_;
   std::vector<std::reference_wrapper<const Gauge>> gauges_;
   std::vector<std::reference_wrapper<const ParentHistogram>> histograms_;
   std::vector<std::reference_wrapper<const TextReadout>> text_readouts_;
+  std::vector<Stats::PrimitiveCounterSnapshot> host_counters_;
+  std::vector<Stats::PrimitiveGaugeSnapshot> host_gauges_;
   SystemTime snapshot_time_;
 };
 
@@ -288,10 +296,10 @@ class MockScope : public TestUtil::TestScope {
 public:
   MockScope(StatName prefix, MockStore& store);
 
-  ScopeSharedPtr createScope(const std::string& name) override {
+  ScopeSharedPtr createScope(const std::string& name, bool) override {
     return ScopeSharedPtr(createScope_(name));
   }
-  ScopeSharedPtr scopeFromStatName(StatName name) override {
+  ScopeSharedPtr scopeFromStatName(StatName name, bool) override {
     return createScope_(symbolTable().toString(name));
   }
 
@@ -356,6 +364,7 @@ public:
   ~MockIsolatedStatsStore() override;
 
   MOCK_METHOD(void, deliverHistogramToSinks, (const Histogram& histogram, uint64_t value));
+  MOCK_METHOD(const TagVector&, fixedTags, ());
 };
 
 class MockStatsMatcher : public StatsMatcher {

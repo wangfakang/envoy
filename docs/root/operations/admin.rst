@@ -177,7 +177,7 @@ modify different aspects of the server:
 .. http:get:: /config_dump?mask={}
 
   Specify a subset of fields that you would like to be returned. The mask is parsed as a
-  ``ProtobufWkt::FieldMask`` and applied to each top level dump such as
+  ``Protobuf::FieldMask`` and applied to each top level dump such as
   :ref:`BootstrapConfigDump <envoy_v3_api_msg_admin.v3.BootstrapConfigDump>` and
   :ref:`ClustersConfigDump <envoy_v3_api_msg_admin.v3.ClustersConfigDump>`.
   This behavior changes if both resource and mask query parameters are specified. See
@@ -225,7 +225,7 @@ modify different aspects of the server:
 
   When both resource and mask query parameters are specified, the mask is applied to every element
   in the desired repeated field so that only a subset of fields are returned. The mask is parsed
-  as a ``ProtobufWkt::FieldMask``.
+  as a ``Protobuf::FieldMask``.
 
   For example, get the names of all active dynamic clusters with
   ``/config_dump?resource=dynamic_active_clusters&mask=cluster.name``
@@ -248,6 +248,11 @@ modify different aspects of the server:
 .. http:get:: /heap_dump
 
   Dump current heap profile of Envoy process. The output content is parsable binary by the ``pprof`` tool.
+  Requires compiling with tcmalloc (default).
+
+.. http:post:: /allocprofiler
+
+  Enable or disable the allocation profiler. The output content is parsable binary by the ``pprof`` tool.
   Requires compiling with tcmalloc (default).
 
 .. _operations_admin_interface_healthcheck_fail:
@@ -283,7 +288,7 @@ modify different aspects of the server:
 .. http:get:: /init_dump?mask={}
 
   When mask query parameters is specified, the mask value is the desired component to dump unready targets.
-  The mask is parsed as a ``ProtobufWkt::FieldMask``.
+  The mask is parsed as a ``Protobuf::FieldMask``.
 
   For example, get the unready targets of all listeners with
   ``/init_dump?mask=listener``
@@ -307,16 +312,32 @@ modify different aspects of the server:
 
   Enable/disable logging levels for different loggers.
 
-  - To change the logging level across all loggers, set the query parameter as level=<desired_level>.
-  - To change a particular logger's level, set the query parameter like so, <logger_name>=<desired_level>.
-  - To change multiple logging levels at once, set the query parameter as paths=<logger_name1>=<desired_level1>,<logger_name2>=<desired_level2>.
-  - To list the loggers, send a POST request to the /logging endpoint without a query parameter.
+  If the default component logger is used, the logger name should be exactlly the component name.
 
-  .. note::
+  - To change the logging level across all loggers, set the query parameter as ``level=<desired_level>``.
+  - To change a particular logger's level, set the query parameter like so, ``<logger_name>=<desired_level>``.
+  - To change multiple logging levels at once, set the query parameter as ``paths=<logger_name1>:<desired_level1>,<logger_name2>:<desired_level2>``.
+  - To list the loggers, send a POST request to the ``/logging`` endpoint without a query parameter.
 
-    Generally only used during development. With ``--enable-fine-grain-logging`` being set, the logger is represented
-    by the path of the file it belongs to (to be specific, the path determined by ``__FILE__``), so the logger list
-    will show a list of file paths, and the specific path should be used as <logger_name> to change the log level.
+  If ``--enable-fine-grain-logging`` is set, the logger is represented by the path of the file it belongs to (to be specific, the path determined by ``__FILE__``),
+  so the logger list will show a list of file paths, and the specific path should be used as ``<logger_name>`` to change the log level.
+
+  We also added the file basename, glob ``*`` and ``?`` support for fine-grain loggers. For example, we have the following active loggers with trace level.
+
+  .. code-block:: text
+
+    source/server/admin/admin_filter.cc: trace
+    source/common/event/dispatcher_impl.cc: trace
+    source/common/network/tcp_listener_impl.cc: trace
+    source/common/network/udp_listener_impl.cc: trace
+
+  - ``/logging?paths=source/common/event/dispatcher_impl.cc:debug`` will make the level of ``source/common/event/dispatcher_impl.cc`` be debug.
+  - ``/logging?admin_filter=info`` will make the level of ``source/server/admin/admin_filter.cc`` be info, and other unmatched loggers will be the default trace.
+  - ``/logging?paths=source/common*:warning`` will make the level of ``source/common/event/dispatcher_impl.cc:``, ``source/common/network/tcp_listener_impl.cc`` be warning.
+    Other unmatched loggers will be the default trace, e.g., `admin_filter.cc`, even it was updated to info from the previous post update.
+  - ``/logging?paths=???_listener_impl:info`` will make the level of ``source/common/network/tcp_listener_impl.cc``, ``source/common/network/udp_listener_impl.cc`` be info.
+  - ``/logging?paths=???_listener_impl:info,tcp_listener_impl:warning``, the level of ``source/common/network/tcp_listener_impl.cc`` will be info, since the first match will take effect.
+  - ``/logging?level=info`` will change the default verbosity level to info. All the unmatched loggers in the following update will be this default level.
 
 .. http:get:: /memory
 
@@ -342,13 +363,18 @@ modify different aspects of the server:
 
    :ref:`Drains <arch_overview_draining>` all inbound listeners. ``traffic_direction`` field in
    :ref:`Listener <envoy_v3_api_msg_config.listener.v3.Listener>` is used to determine whether a listener
-   is inbound or outbound.
+   is inbound or outbound. May not be effective for network filters like :ref:`Redis <config_network_filters_redis_proxy>`,
+   :ref:`Mongo <config_network_filters_mongo_proxy>`, or :ref:`Thrift <config_network_filters_thrift_proxy>`.
 
    .. http:post:: /drain_listeners?graceful
 
    When draining listeners, enter a graceful drain period prior to closing listeners.
    This behaviour and duration is configurable via server options or CLI
    (:option:`--drain-time-s` and :option:`--drain-strategy`).
+
+   .. http:post:: /drain_listeners?graceful&skip_exit
+
+   When draining listeners, do not exit after the drain period. This must be used with `graceful`.
 
 .. attention::
 
@@ -749,6 +775,59 @@ modify different aspects of the server:
     in Prometheus, which can dramatically increase the amount of data stored.
     Text readout stats create a new label value every time the value
     of the text readout stat changes, which could create an unbounded number of time series.
+
+  .. http:get:: /stats?format=prometheus&histogram_buckets=summary
+
+  Optional ``histogram_buckets`` query parameter is used to control how histogram metrics get reported.
+  If unset, histograms get reported as the "histogram" prometheus metric type, but can also be used to
+  emit prometheus "summary" metrics if set to ``summary``. Each emitted summary is over the interval
+  of the last :ref:`stats_flush_interval <envoy_v3_api_field_config.bootstrap.v3.Bootstrap.stats_flush_interval>`.
+
+  Example histogram output:
+
+  .. code-block:: text
+
+    # TYPE envoy_server_initialization_time_ms histogram
+    envoy_server_initialization_time_ms_bucket{le="0.5"} 0
+    envoy_server_initialization_time_ms_bucket{le="1"} 0
+    envoy_server_initialization_time_ms_bucket{le="5"} 0
+    envoy_server_initialization_time_ms_bucket{le="10"} 0
+    envoy_server_initialization_time_ms_bucket{le="25"} 0
+    envoy_server_initialization_time_ms_bucket{le="50"} 0
+    envoy_server_initialization_time_ms_bucket{le="100"} 0
+    envoy_server_initialization_time_ms_bucket{le="250"} 1
+    envoy_server_initialization_time_ms_bucket{le="500"} 1
+    envoy_server_initialization_time_ms_bucket{le="1000"} 1
+    envoy_server_initialization_time_ms_bucket{le="2500"} 1
+    envoy_server_initialization_time_ms_bucket{le="5000"} 1
+    envoy_server_initialization_time_ms_bucket{le="10000"} 1
+    envoy_server_initialization_time_ms_bucket{le="30000"} 1
+    envoy_server_initialization_time_ms_bucket{le="60000"} 1
+    envoy_server_initialization_time_ms_bucket{le="300000"} 1
+    envoy_server_initialization_time_ms_bucket{le="600000"} 1
+    envoy_server_initialization_time_ms_bucket{le="1800000"} 1
+    envoy_server_initialization_time_ms_bucket{le="3600000"} 1
+    envoy_server_initialization_time_ms_bucket{le="+Inf"} 1
+    envoy_server_initialization_time_ms_sum{} 115.000000000000014210854715202
+    envoy_server_initialization_time_ms_count{} 1
+
+  Example summary output:
+
+  .. code-block:: text
+
+    # TYPE envoy_server_initialization_time_ms summary
+    envoy_server_initialization_time_ms{quantile="0"} 110.00000000000001
+    envoy_server_initialization_time_ms{quantile="0.25"} 112.50000000000001
+    envoy_server_initialization_time_ms{quantile="0.5"} 115.00000000000001
+    envoy_server_initialization_time_ms{quantile="0.75"} 117.50000000000001
+    envoy_server_initialization_time_ms{quantile="0.9"} 119.00000000000001
+    envoy_server_initialization_time_ms{quantile="0.95"} 119.50000000000001
+    envoy_server_initialization_time_ms{quantile="0.99"} 119.90000000000002
+    envoy_server_initialization_time_ms{quantile="0.995"} 119.95000000000002
+    envoy_server_initialization_time_ms{quantile="0.999"} 119.99000000000001
+    envoy_server_initialization_time_ms{quantile="1"} 120.00000000000001
+    envoy_server_initialization_time_ms_sum{} 115.000000000000014210854715202
+    envoy_server_initialization_time_ms_count{} 1
 
 .. http:get:: /stats/recentlookups
 

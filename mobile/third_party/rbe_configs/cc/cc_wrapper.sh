@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Copyright 2015 The Bazel Authors. All rights reserved.
 #
@@ -22,4 +22,4 @@ set -eu
 
 
 # Call the C++ compiler
-/opt/llvm/bin/clang-14 "$@"
+/opt/llvm/bin/clang "$@"

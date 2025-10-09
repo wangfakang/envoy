@@ -42,42 +42,41 @@ public:
    * @param metadata reference.
    * @param filter name.
    * @param key for filter metadata.
-   * @return const ProtobufWkt::Value& value if found, empty if not found.
+   * @return const Protobuf::Value& value if found, empty if not found.
    */
-  static const ProtobufWkt::Value& metadataValue(const envoy::config::core::v3::Metadata* metadata,
-                                                 const std::string& filter, const std::string& key);
+  static const Protobuf::Value& metadataValue(const envoy::config::core::v3::Metadata* metadata,
+                                              const std::string& filter, const std::string& key);
   /**
    * Lookup value by a multi-key path for a given filter in Metadata. If path is empty
    * will return the empty struct.
    * @param metadata reference.
    * @param filter name.
    * @param path multi-key path.
-   * @return const ProtobufWkt::Value& value if found, empty if not found.
+   * @return const Protobuf::Value& value if found, empty if not found.
    */
-  static const ProtobufWkt::Value& metadataValue(const envoy::config::core::v3::Metadata* metadata,
-                                                 const std::string& filter,
-                                                 const std::vector<std::string>& path);
+  static const Protobuf::Value& metadataValue(const envoy::config::core::v3::Metadata* metadata,
+                                              const std::string& filter,
+                                              const std::vector<std::string>& path);
   /**
    * Lookup the value by a metadata key from a Metadata.
    * @param metadata reference.
    * @param metadata_key with key name and path to retrieve the value.
-   * @return const ProtobufWkt::Value& value if found, empty if not found.
+   * @return const Protobuf::Value& value if found, empty if not found.
    */
-  static const ProtobufWkt::Value& metadataValue(const envoy::config::core::v3::Metadata* metadata,
-                                                 const MetadataKey& metadata_key);
+  static const Protobuf::Value& metadataValue(const envoy::config::core::v3::Metadata* metadata,
+                                              const MetadataKey& metadata_key);
 
   /**
    * Obtain mutable reference to metadata value for a given filter and key.
    * @param metadata reference.
    * @param filter name.
    * @param key for filter metadata.
-   * @return ProtobufWkt::Value&. A Value message is created if not found.
+   * @return Protobuf::Value&. A Value message is created if not found.
    */
-  static ProtobufWkt::Value& mutableMetadataValue(envoy::config::core::v3::Metadata& metadata,
-                                                  const std::string& filter,
-                                                  const std::string& key);
+  static Protobuf::Value& mutableMetadataValue(envoy::config::core::v3::Metadata& metadata,
+                                               const std::string& filter, const std::string& key);
 
-  using LabelSet = std::vector<std::pair<std::string, ProtobufWkt::Value>>;
+  using LabelSet = std::vector<std::pair<std::string, Protobuf::Value>>;
 
   /**
    * Returns whether a set of the labels match a particular host's metadata.
@@ -140,6 +139,20 @@ protected:
 
   absl::node_hash_map<std::string, std::unique_ptr<const TypedMetadata::Object>> data_;
 };
+
+// MetadataPack is struct that contains both the proto and typed metadata.
+template <class FactoryClass> struct MetadataPack {
+  MetadataPack(const envoy::config::core::v3::Metadata& metadata)
+      : proto_metadata_(metadata), typed_metadata_(proto_metadata_) {}
+  MetadataPack() : proto_metadata_(), typed_metadata_(proto_metadata_) {}
+
+  const envoy::config::core::v3::Metadata proto_metadata_;
+  const TypedMetadataImpl<FactoryClass> typed_metadata_;
+};
+
+template <class FactoryClass> using MetadataPackPtr = std::unique_ptr<MetadataPack<FactoryClass>>;
+template <class FactoryClass>
+using MetadataPackSharedPtr = std::shared_ptr<MetadataPack<FactoryClass>>;
 
 } // namespace Config
 } // namespace Envoy

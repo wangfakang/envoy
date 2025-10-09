@@ -7,37 +7,24 @@
 
 // A test class for testing HTTP/1.1 upstream and downstreams
 namespace Envoy {
-class IntegrationTest
-    : public testing::TestWithParam<std::tuple<Network::Address::IpVersion, Http1ParserImpl>>,
-      public HttpIntegrationTest {
+// TODO(#28841) parameterize to run with and without UHV
+class IntegrationTest : public testing::TestWithParam<Network::Address::IpVersion>,
+                        public HttpIntegrationTest {
 public:
-  IntegrationTest()
-      : HttpIntegrationTest(Http::CodecType::HTTP1, std::get<0>(GetParam())),
-        http1_implementation_(std::get<1>(GetParam())) {
-    setupHttp1ImplOverrides(http1_implementation_);
-  }
-
-protected:
-  const Http1ParserImpl http1_implementation_;
+  IntegrationTest() : HttpIntegrationTest(Http::CodecType::HTTP1, GetParam()) {}
 };
 
-class UpstreamEndpointIntegrationTest
-    : public testing::TestWithParam<std::tuple<Network::Address::IpVersion, Http1ParserImpl>>,
-      public HttpIntegrationTest {
+// TODO(#28841) parameterize to run with and without UHV
+class UpstreamEndpointIntegrationTest : public testing::TestWithParam<Network::Address::IpVersion>,
+                                        public HttpIntegrationTest {
 public:
   UpstreamEndpointIntegrationTest()
       : HttpIntegrationTest(
             Http::CodecType::HTTP1,
             [](int) {
-              return Network::Utility::parseInternetAddress(
-                  Network::Test::getLoopbackAddressString(std::get<0>(GetParam())), 0);
+              return Network::Utility::parseInternetAddressNoThrow(
+                  Network::Test::getLoopbackAddressString(GetParam()), 0);
             },
-            std::get<0>(GetParam())),
-        http1_implementation_(std::get<1>(GetParam())) {
-    setupHttp1ImplOverrides(http1_implementation_);
-  }
-
-protected:
-  const Http1ParserImpl http1_implementation_;
+            GetParam()) {}
 };
 } // namespace Envoy

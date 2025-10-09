@@ -27,6 +27,8 @@ namespace Envoy {
 namespace Router {
 class Route;
 using RouteConstSharedPtr = std::shared_ptr<const Route>;
+class VirtualHost;
+using VirtualHostConstSharedPtr = std::shared_ptr<const VirtualHost>;
 } // namespace Router
 
 namespace Upstream {
@@ -36,63 +38,101 @@ using ClusterInfoConstSharedPtr = std::shared_ptr<const ClusterInfo>;
 
 namespace StreamInfo {
 
-enum ResponseFlag {
+enum CoreResponseFlag : uint16_t {
   // Local server healthcheck failed.
-  FailedLocalHealthCheck = 0x1,
+  FailedLocalHealthCheck,
   // No healthy upstream.
-  NoHealthyUpstream = 0x2,
+  NoHealthyUpstream,
   // Request timeout on upstream.
-  UpstreamRequestTimeout = 0x4,
+  UpstreamRequestTimeout,
   // Local codec level reset was sent on the stream.
-  LocalReset = 0x8,
+  LocalReset,
   // Remote codec level reset was received on the stream.
-  UpstreamRemoteReset = 0x10,
+  UpstreamRemoteReset,
   // Local reset by a connection pool due to an initial connection failure.
-  UpstreamConnectionFailure = 0x20,
+  UpstreamConnectionFailure,
   // If the stream was locally reset due to connection termination.
-  UpstreamConnectionTermination = 0x40,
+  UpstreamConnectionTermination,
   // The stream was reset because of a resource overflow.
-  UpstreamOverflow = 0x80,
+  UpstreamOverflow,
   // No route found for a given request.
-  NoRouteFound = 0x100,
+  NoRouteFound,
   // Request was delayed before proxying.
-  DelayInjected = 0x200,
+  DelayInjected,
   // Abort with error code was injected.
-  FaultInjected = 0x400,
+  FaultInjected,
   // Request was ratelimited locally by rate limit filter.
-  RateLimited = 0x800,
+  RateLimited,
   // Request was unauthorized by external authorization service.
-  UnauthorizedExternalService = 0x1000,
+  UnauthorizedExternalService,
   // Unable to call Ratelimit service.
-  RateLimitServiceError = 0x2000,
+  RateLimitServiceError,
   // If the stream was reset due to a downstream connection termination.
-  DownstreamConnectionTermination = 0x4000,
+  DownstreamConnectionTermination,
   // Exceeded upstream retry limit.
-  UpstreamRetryLimitExceeded = 0x8000,
+  UpstreamRetryLimitExceeded,
   // Request hit the stream idle timeout, triggering a 408.
-  StreamIdleTimeout = 0x10000,
+  StreamIdleTimeout,
   // Request specified x-envoy-* header values that failed strict header checks.
-  InvalidEnvoyRequestHeaders = 0x20000,
+  InvalidEnvoyRequestHeaders,
   // Downstream request had an HTTP protocol error
-  DownstreamProtocolError = 0x40000,
+  DownstreamProtocolError,
   // Upstream request reached to user defined max stream duration.
-  UpstreamMaxStreamDurationReached = 0x80000,
+  UpstreamMaxStreamDurationReached,
   // True if the response was served from an Envoy cache filter.
-  ResponseFromCacheFilter = 0x100000,
+  ResponseFromCacheFilter,
   // Filter config was not received within the permitted warming deadline.
-  NoFilterConfigFound = 0x200000,
+  NoFilterConfigFound,
   // Request or connection exceeded the downstream connection duration.
-  DurationTimeout = 0x400000,
+  DurationTimeout,
   // Upstream response had an HTTP protocol error
-  UpstreamProtocolError = 0x800000,
+  UpstreamProtocolError,
   // No cluster found for a given request.
-  NoClusterFound = 0x1000000,
+  NoClusterFound,
   // Overload Manager terminated the stream.
-  OverloadManager = 0x2000000,
+  OverloadManager,
   // DNS resolution failed.
-  DnsResolutionFailed = 0x4000000,
+  DnsResolutionFailed,
+  // Drop certain percentage of overloaded traffic.
+  DropOverLoad,
+  // Downstream remote codec level reset was received on the stream.
+  DownstreamRemoteReset,
+  // Unconditionally drop all traffic due to drop_overload is set to 100%.
+  UnconditionalDropOverload,
   // ATTENTION: MAKE SURE THIS REMAINS EQUAL TO THE LAST FLAG.
-  LastFlag = DnsResolutionFailed,
+  LastFlag = UnconditionalDropOverload,
+};
+
+class ResponseFlagUtils;
+
+class ResponseFlag {
+public:
+  constexpr ResponseFlag() = default;
+
+  /**
+   * Construct a response flag from the core response flag enum. The integer
+   * value of the enum is used as the raw integer value of the flag.
+   * @param flag the core response flag enum.
+   */
+  constexpr ResponseFlag(CoreResponseFlag flag) : value_(flag) {}
+
+  /**
+   * Get the raw integer value of the flag.
+   * @return uint16_t the raw integer value.
+   */
+  uint16_t value() const { return value_; }
+
+  bool operator==(const ResponseFlag& other) const { return value_ == other.value_; }
+
+private:
+  friend class ResponseFlagUtils;
+
+  // This private constructor is used to create extended response flags from
+  // uint16_t values. This can only be used by ResponseFlagUtils to ensure
+  // only validated values are used.
+  ResponseFlag(uint16_t value) : value_(value) {}
+
+  uint16_t value_{};
 };
 
 /**
@@ -135,6 +175,8 @@ struct ResponseCodeDetailValues {
   const std::string InvalidEnvoyRequestHeaders = "request_headers_failed_strict_check";
   // The request was rejected due to a missing Path or :path header field.
   const std::string MissingPath = "missing_path_rejected";
+  // The request was rejected due to an invalid Path or :path header field.
+  const std::string InvalidPath = "invalid_path";
   // The request was rejected due to using an absolute path on a route not supporting them.
   const std::string AbsolutePath = "absolute_path_rejected";
   // The request was rejected because path normalization was configured on and failed, probably due
@@ -142,6 +184,8 @@ struct ResponseCodeDetailValues {
   const std::string PathNormalizationFailed = "path_normalization_failed";
   // The request was rejected because it attempted an unsupported upgrade.
   const std::string UpgradeFailed = "upgrade_failed";
+  // The websocket handshake is unsuccessful and only SwitchingProtocols is considering successful.
+  const std::string WebsocketHandshakeUnsuccessful = "websocket_handshake_unsuccessful";
 
   // The request was rejected by the HCM because there was no route configuration found.
   const std::string RouteConfigurationNotFound = "route_configuration_not_found";
@@ -154,6 +198,11 @@ struct ResponseCodeDetailValues {
   const std::string ClusterNotFound = "cluster_not_found";
   // The request was rejected by the router filter because the cluster was in maintenance mode.
   const std::string MaintenanceMode = "maintenance_mode";
+  // The request was rejected by the router filter because the DROP_OVERLOAD configuration.
+  const std::string DropOverload = "drop_overload";
+  // The request was rejected by the router filter because the DROP_OVERLOAD configuration is set to
+  // 100%.
+  const std::string UnconditionalDropOverload = "unconditional_drop_overload";
   // The request was rejected by the router filter because there was no healthy upstream found.
   const std::string NoHealthyUpstream = "no_healthy_upstream";
   // The request was forwarded upstream but the response timed out.
@@ -229,6 +278,8 @@ struct LocalCloseReasonValues {
       "closing_upstream_tcp_connection_due_to_downstream_remote_close";
   const std::string ClosingUpstreamTcpDueToDownstreamLocalClose =
       "closing_upstream_tcp_connection_due_to_downstream_local_close";
+  const std::string ClosingUpstreamTcpDueToDownstreamResetClose =
+      "closing_upstream_tcp_connection_due_to_downstream_reset_close";
   const std::string NonPooledTcpConnectionHostHealthFailure =
       "non_pooled_tcp_connection_host_health_failure";
 };
@@ -310,8 +361,7 @@ struct UpstreamTiming {
   absl::optional<MonotonicTime> upstream_handshake_complete_;
 };
 
-class DownstreamTiming {
-public:
+struct DownstreamTiming {
   void setValue(absl::string_view key, MonotonicTime value) { timings_[key] = value; }
 
   absl::optional<MonotonicTime> getValue(absl::string_view value) const {
@@ -337,6 +387,9 @@ public:
   absl::optional<MonotonicTime> lastDownstreamAckReceived() const {
     return last_downstream_ack_received_;
   }
+  absl::optional<MonotonicTime> lastDownstreamHeaderRxByteReceived() const {
+    return last_downstream_header_rx_byte_received_;
+  }
 
   void onLastDownstreamRxByteReceived(TimeSource& time_source) {
     ASSERT(!last_downstream_rx_byte_received_);
@@ -358,8 +411,11 @@ public:
     ASSERT(!last_downstream_ack_received_);
     last_downstream_ack_received_ = time_source.monotonicTime();
   }
+  void onLastDownstreamHeaderRxByteReceived(TimeSource& time_source) {
+    ASSERT(!last_downstream_header_rx_byte_received_);
+    last_downstream_header_rx_byte_received_ = time_source.monotonicTime();
+  }
 
-private:
   absl::flat_hash_map<std::string, MonotonicTime> timings_;
   // The time when the last byte of the request was received.
   absl::optional<MonotonicTime> last_downstream_rx_byte_received_;
@@ -371,24 +427,105 @@ private:
   absl::optional<MonotonicTime> downstream_handshake_complete_;
   // The time the final ack was received from the client.
   absl::optional<MonotonicTime> last_downstream_ack_received_;
+  // The time when the last header byte was received.
+  absl::optional<MonotonicTime> last_downstream_header_rx_byte_received_;
 };
 
 // Measure the number of bytes sent and received for a stream.
 struct BytesMeter {
+  BytesMeter() = default;
   uint64_t wireBytesSent() const { return wire_bytes_sent_; }
   uint64_t wireBytesReceived() const { return wire_bytes_received_; }
   uint64_t headerBytesSent() const { return header_bytes_sent_; }
   uint64_t headerBytesReceived() const { return header_bytes_received_; }
+  uint64_t decompressedHeaderBytesSent() const { return decompressed_header_bytes_sent_; }
+  uint64_t decompressedHeaderBytesReceived() const { return decompressed_header_bytes_received_; }
+
   void addHeaderBytesSent(uint64_t added_bytes) { header_bytes_sent_ += added_bytes; }
   void addHeaderBytesReceived(uint64_t added_bytes) { header_bytes_received_ += added_bytes; }
+  void addDecompressedHeaderBytesSent(uint64_t added_bytes) {
+    decompressed_header_bytes_sent_ += added_bytes;
+  }
+  void addDecompressedHeaderBytesReceived(uint64_t added_bytes) {
+    decompressed_header_bytes_received_ += added_bytes;
+  }
   void addWireBytesSent(uint64_t added_bytes) { wire_bytes_sent_ += added_bytes; }
   void addWireBytesReceived(uint64_t added_bytes) { wire_bytes_received_ += added_bytes; }
+
+  struct BytesSnapshot {
+    SystemTime snapshot_time;
+    uint64_t header_bytes_sent{};
+    uint64_t header_bytes_received{};
+    uint64_t decompressed_header_bytes_sent{};
+    uint64_t decompressed_header_bytes_received{};
+    uint64_t wire_bytes_sent{};
+    uint64_t wire_bytes_received{};
+  };
+  void takeDownstreamPeriodicLoggingSnapshot(const SystemTime& snapshot_time) {
+    downstream_periodic_logging_bytes_snapshot_ = std::make_unique<BytesSnapshot>();
+
+    downstream_periodic_logging_bytes_snapshot_->snapshot_time = snapshot_time;
+    downstream_periodic_logging_bytes_snapshot_->header_bytes_sent = header_bytes_sent_;
+    downstream_periodic_logging_bytes_snapshot_->header_bytes_received = header_bytes_received_;
+    downstream_periodic_logging_bytes_snapshot_->decompressed_header_bytes_sent =
+        decompressed_header_bytes_sent_;
+    downstream_periodic_logging_bytes_snapshot_->decompressed_header_bytes_received =
+        decompressed_header_bytes_received_;
+    downstream_periodic_logging_bytes_snapshot_->wire_bytes_sent = wire_bytes_sent_;
+    downstream_periodic_logging_bytes_snapshot_->wire_bytes_received = wire_bytes_received_;
+  }
+  void takeUpstreamPeriodicLoggingSnapshot(const SystemTime& snapshot_time) {
+    upstream_periodic_logging_bytes_snapshot_ = std::make_unique<BytesSnapshot>();
+
+    upstream_periodic_logging_bytes_snapshot_->snapshot_time = snapshot_time;
+    upstream_periodic_logging_bytes_snapshot_->header_bytes_sent = header_bytes_sent_;
+    upstream_periodic_logging_bytes_snapshot_->header_bytes_received = header_bytes_received_;
+    upstream_periodic_logging_bytes_snapshot_->decompressed_header_bytes_sent =
+        decompressed_header_bytes_sent_;
+    upstream_periodic_logging_bytes_snapshot_->decompressed_header_bytes_received =
+        decompressed_header_bytes_received_;
+    upstream_periodic_logging_bytes_snapshot_->wire_bytes_sent = wire_bytes_sent_;
+    upstream_periodic_logging_bytes_snapshot_->wire_bytes_received = wire_bytes_received_;
+  }
+  const BytesSnapshot* bytesAtLastDownstreamPeriodicLog() const {
+    return downstream_periodic_logging_bytes_snapshot_.get();
+  }
+  const BytesSnapshot* bytesAtLastUpstreamPeriodicLog() const {
+    return upstream_periodic_logging_bytes_snapshot_.get();
+  }
+  // Adds the bytes from `existing` to `this`.
+  // Additionally, captures the snapshots on `existing` and adds them to `this`.
+  void captureExistingBytesMeter(BytesMeter& existing) {
+    // Add bytes accumulated on `this` to the pre-existing periodic bytes collectors.
+    if (existing.downstream_periodic_logging_bytes_snapshot_) {
+      downstream_periodic_logging_bytes_snapshot_ =
+          std::move(existing.downstream_periodic_logging_bytes_snapshot_);
+      existing.downstream_periodic_logging_bytes_snapshot_ = nullptr;
+    }
+    if (existing.upstream_periodic_logging_bytes_snapshot_) {
+      upstream_periodic_logging_bytes_snapshot_ =
+          std::move(existing.upstream_periodic_logging_bytes_snapshot_);
+      existing.upstream_periodic_logging_bytes_snapshot_ = nullptr;
+    }
+
+    // Accumulate existing bytes.
+    header_bytes_sent_ += existing.header_bytes_sent_;
+    header_bytes_received_ += existing.header_bytes_received_;
+    decompressed_header_bytes_sent_ += existing.decompressed_header_bytes_sent_;
+    decompressed_header_bytes_received_ += existing.decompressed_header_bytes_received_;
+    wire_bytes_sent_ += existing.wire_bytes_sent_;
+    wire_bytes_received_ += existing.wire_bytes_received_;
+  }
 
 private:
   uint64_t header_bytes_sent_{};
   uint64_t header_bytes_received_{};
+  uint64_t decompressed_header_bytes_sent_{};
+  uint64_t decompressed_header_bytes_received_{};
   uint64_t wire_bytes_sent_{};
   uint64_t wire_bytes_received_{};
+  std::unique_ptr<BytesSnapshot> downstream_periodic_logging_bytes_snapshot_;
+  std::unique_ptr<BytesSnapshot> upstream_periodic_logging_bytes_snapshot_;
 };
 
 using BytesMeterSharedPtr = std::shared_ptr<BytesMeter>;
@@ -543,20 +680,18 @@ public:
   virtual void
   setConnectionTerminationDetails(absl::string_view connection_termination_details) PURE;
 
-  /**
-   * @param response_flags the response_flags to intersect with.
-   * @return true if the intersection of the response_flags argument and the currently set response
-   * flags is non-empty.
+  /*
+   * @param short string type flag to indicate the noteworthy event of this stream. Mutliple flags
+   * could be added and will be concatenated with comma. It should not contain any empty or space
+   * characters (' ', '\t', '\f', '\v', '\n', '\r').
+   *
+   * The short string should not duplicate with the any registered response flags.
    */
-  virtual bool intersectResponseFlags(uint64_t response_flags) const PURE;
+  virtual void addCustomFlag(absl::string_view) PURE;
 
   /**
-   * @param std::string name denotes the name of the route.
-   */
-  virtual void setRouteName(absl::string_view name) PURE;
-
-  /**
-   * @return std::string& the name of the route.
+   * @return std::string& the name of the route. The name is get from the route() and it is
+   *         empty if there is no route.
    */
   virtual const std::string& getRouteName() const PURE;
 
@@ -637,6 +772,11 @@ public:
   virtual MonotonicTime startTimeMonotonic() const PURE;
 
   /**
+   * @return returns the time source.
+   */
+  virtual TimeSource& timeSource() const PURE;
+
+  /**
    * Sets the upstream information for this stream.
    */
   virtual void setUpstreamInfo(std::shared_ptr<UpstreamInfo>) PURE;
@@ -691,9 +831,20 @@ public:
   virtual bool hasAnyResponseFlag() const PURE;
 
   /**
-   * @return response flags encoded as an integer.
+   * @return all response flags that are set.
    */
-  virtual uint64_t responseFlags() const PURE;
+  virtual absl::Span<const ResponseFlag> responseFlags() const PURE;
+
+  /**
+   * @return response flags encoded as an integer. Every bit of the integer is used to represent a
+   * flag. Only flags that are declared in the enum CoreResponseFlag type are supported.
+   */
+  virtual uint64_t legacyResponseFlags() const PURE;
+
+  /**
+   * @return all stream flags that are added.
+   */
+  virtual absl::string_view customFlags() const PURE;
 
   /**
    * @return whether the request is a health check request or not.
@@ -716,6 +867,12 @@ public:
   virtual Router::RouteConstSharedPtr route() const PURE;
 
   /**
+   * @return const Router::VirtualHostConstSharedPtr& Get the virtual host selected for this
+   * request.
+   */
+  virtual const Router::VirtualHostConstSharedPtr& virtualHost() const PURE;
+
+  /**
    * @return const envoy::config::core::v3::Metadata& the dynamic metadata associated with this
    * request
    */
@@ -728,7 +885,14 @@ public:
    * @param value the struct to set on the namespace. A merge will be performed with new values for
    * the same key overriding existing.
    */
-  virtual void setDynamicMetadata(const std::string& name, const ProtobufWkt::Struct& value) PURE;
+  virtual void setDynamicMetadata(const std::string& name, const Protobuf::Struct& value) PURE;
+
+  /**
+   * @param name the namespace used in the metadata in reverse DNS format, for example:
+   * envoy.test.my_filter.
+   * @param value of type protobuf any to set on the namespace.
+   */
+  virtual void setDynamicTypedMetadata(const std::string& name, const Protobuf::Any& value) PURE;
 
   /**
    * Object on which filters can share data on a per-request basis. For singleton data objects, only
@@ -781,16 +945,6 @@ public:
    * @return the trace reason for the stream.
    */
   virtual Tracing::Reason traceReason() const PURE;
-
-  /**
-   * @param filter_chain_name Network filter chain name of the downstream connection.
-   */
-  virtual void setFilterChainName(absl::string_view filter_chain_name) PURE;
-
-  /**
-   * @return Network filter chain name of the downstream connection.
-   */
-  virtual const std::string& filterChainName() const PURE;
 
   /**
    * @param attempt_count, the number of times the request was attempted upstream.
@@ -851,6 +1005,51 @@ public:
    * @param failure_reason the downstream transport failure reason.
    */
   virtual void setDownstreamTransportFailureReason(absl::string_view failure_reason) PURE;
+
+  /**
+   * Checked by routing filters before forwarding a request upstream.
+   * @return to override the scheme header to match the upstream transport
+   * protocol at routing filters.
+   */
+  virtual bool shouldSchemeMatchUpstream() const PURE;
+
+  /**
+   * Called if a filter decides that the scheme should match the upstream transport protocol
+   * @param should_match_upstream true to hint to routing filters to override the scheme header
+   * to match the upstream transport protocol.
+   */
+  virtual void setShouldSchemeMatchUpstream(bool should_match_upstream) PURE;
+
+  /**
+   * Checked by streams after finishing serving the request.
+   * @return bool true if the connection should be drained once this stream has
+   * finished sending and receiving.
+   */
+  virtual bool shouldDrainConnectionUponCompletion() const PURE;
+
+  /**
+   * Set the parent for this StreamInfo. This is used to associate the
+   * stream info of an async client with the stream info of the downstream
+   * connection.
+   */
+  virtual void setParentStreamInfo(const StreamInfo& parent_stream_info) PURE;
+
+  /**
+   * Get the parent for this StreamInfo, if available.
+   */
+  virtual OptRef<const StreamInfo> parentStreamInfo() const PURE;
+
+  /**
+   * Clear the parent for this StreamInfo.
+   */
+  virtual void clearParentStreamInfo() PURE;
+
+  /**
+   * Called if the connection decides to drain itself after serving this request.
+   * @param should_drain true to close the connection once this stream has
+   * finished sending and receiving.
+   */
+  virtual void setShouldDrainConnectionUponCompletion(bool should_drain) PURE;
 };
 
 // An enum representation of the Proxy-Status error space.

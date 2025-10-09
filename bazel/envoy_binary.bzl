@@ -18,6 +18,8 @@ def envoy_cc_binary(
         data = [],
         testonly = 0,
         visibility = None,
+        rbe_pool = None,
+        exec_properties = {},
         external_deps = [],
         repository = "",
         stamp = 1,
@@ -25,7 +27,12 @@ def envoy_cc_binary(
         deps = [],
         linkopts = [],
         tags = [],
-        features = []):
+        features = [],
+        linkstatic = True):
+    exec_properties = exec_properties | select({
+        repository + "//bazel:engflow_rbe_x86_64": {"Pool": rbe_pool} if rbe_pool else {},
+        "//conditions:default": {},
+    })
     linker_inputs = envoy_exported_symbols_input()
 
     if not linkopts:
@@ -41,9 +48,10 @@ def envoy_cc_binary(
         data = data,
         additional_linker_inputs = linker_inputs,
         copts = envoy_copts(repository),
+        exec_properties = exec_properties,
         linkopts = linkopts,
         testonly = testonly,
-        linkstatic = 1,
+        linkstatic = linkstatic,
         visibility = visibility,
         malloc = tcmalloc_external_dep(repository),
         stamp = stamp,

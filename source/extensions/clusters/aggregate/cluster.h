@@ -39,21 +39,27 @@ using ClusterSetConstSharedPtr = std::shared_ptr<const ClusterSet>;
 
 class Cluster : public Upstream::ClusterImplBase {
 public:
-  Cluster(const envoy::config::cluster::v3::Cluster& cluster,
-          const envoy::extensions::clusters::aggregate::v3::ClusterConfig& config,
-          Upstream::ClusterFactoryContext& context);
-
   // Upstream::Cluster
   Upstream::Cluster::InitializePhase initializePhase() const override {
     return Upstream::Cluster::InitializePhase::Secondary;
   }
 
+  // Getters that return the values from ClusterImplBase.
+  Runtime::Loader& runtime() const { return runtime_; }
+  Random::RandomGenerator& random() const { return random_; }
+
   Upstream::ClusterManager& cluster_manager_;
-  Runtime::Loader& runtime_;
-  Random::RandomGenerator& random_;
   const ClusterSetConstSharedPtr clusters_;
 
+protected:
+  Cluster(const envoy::config::cluster::v3::Cluster& cluster,
+          const envoy::extensions::clusters::aggregate::v3::ClusterConfig& config,
+          Upstream::ClusterFactoryContext& context, absl::Status& creation_status);
+
 private:
+  friend class ClusterFactory;
+  friend class AggregateClusterTest;
+
   // Upstream::ClusterImplBase
   void startPreInit() override { onPreInitComplete(); }
 };
@@ -64,17 +70,19 @@ class AggregateClusterLoadBalancer : public Upstream::LoadBalancer,
                                      Upstream::ClusterUpdateCallbacks,
                                      Logger::Loggable<Logger::Id::upstream> {
 public:
+  friend class AggregateLoadBalancerFactory;
   AggregateClusterLoadBalancer(const Upstream::ClusterInfoConstSharedPtr& parent_info,
                                Upstream::ClusterManager& cluster_manager, Runtime::Loader& runtime,
                                Random::RandomGenerator& random,
                                const ClusterSetConstSharedPtr& clusters);
 
   // Upstream::ClusterUpdateCallbacks
-  void onClusterAddOrUpdate(Upstream::ThreadLocalCluster& cluster) override;
+  void onClusterAddOrUpdate(absl::string_view cluster_name,
+                            Upstream::ThreadLocalClusterCommand& get_cluster) override;
   void onClusterRemoval(const std::string& cluster_name) override;
 
   // Upstream::LoadBalancer
-  Upstream::HostConstSharedPtr chooseHost(Upstream::LoadBalancerContext* context) override;
+  Upstream::HostSelectionResponse chooseHost(Upstream::LoadBalancerContext* context) override;
   Upstream::HostConstSharedPtr peekAnotherHost(Upstream::LoadBalancerContext*) override;
   absl::optional<Upstream::SelectedPoolAndConnection>
   selectExistingConnection(Upstream::LoadBalancerContext* /*context*/,
@@ -96,7 +104,7 @@ private:
           priority_context_(priority_context) {}
 
     // Upstream::LoadBalancer
-    Upstream::HostConstSharedPtr chooseHost(Upstream::LoadBalancerContext* context) override;
+    Upstream::HostSelectionResponse chooseHost(Upstream::LoadBalancerContext* context) override;
     // Preconnecting not yet implemented for extensions.
     Upstream::HostConstSharedPtr peekAnotherHost(Upstream::LoadBalancerContext*) override {
       return nullptr;
@@ -136,15 +144,15 @@ private:
 
 // Load balancer factory created by the main thread and will be called in each worker thread to
 // create the thread local load balancer.
-struct AggregateLoadBalancerFactory : public Upstream::LoadBalancerFactory {
+class AggregateLoadBalancerFactory : public Upstream::LoadBalancerFactory {
+public:
   AggregateLoadBalancerFactory(const Cluster& cluster) : cluster_(cluster) {}
   // Upstream::LoadBalancerFactory
-  Upstream::LoadBalancerPtr create() override {
+  Upstream::LoadBalancerPtr create(Upstream::LoadBalancerParams) override {
     return std::make_unique<AggregateClusterLoadBalancer>(
-        cluster_.info(), cluster_.cluster_manager_, cluster_.runtime_, cluster_.random_,
+        cluster_.info(), cluster_.cluster_manager_, cluster_.runtime(), cluster_.random(),
         cluster_.clusters_);
   }
-  Upstream::LoadBalancerPtr create(Upstream::LoadBalancerParams) override { return create(); }
 
   const Cluster& cluster_;
 };
@@ -156,7 +164,7 @@ struct AggregateThreadAwareLoadBalancer : public Upstream::ThreadAwareLoadBalanc
 
   // Upstream::ThreadAwareLoadBalancer
   Upstream::LoadBalancerFactorySharedPtr factory() override { return factory_; }
-  void initialize() override {}
+  absl::Status initialize() override { return absl::OkStatus(); }
 
   std::shared_ptr<AggregateLoadBalancerFactory> factory_;
 };
@@ -167,7 +175,8 @@ public:
   ClusterFactory() : ConfigurableClusterFactoryBase("envoy.clusters.aggregate") {}
 
 private:
-  std::pair<Upstream::ClusterImplBaseSharedPtr, Upstream::ThreadAwareLoadBalancerPtr>
+  absl::StatusOr<
+      std::pair<Upstream::ClusterImplBaseSharedPtr, Upstream::ThreadAwareLoadBalancerPtr>>
   createClusterWithConfig(
       const envoy::config::cluster::v3::Cluster& cluster,
       const envoy::extensions::clusters::aggregate::v3::ClusterConfig& proto_config,
